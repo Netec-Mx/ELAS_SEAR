@@ -1,1083 +1,448 @@
-# Crear templates, mappings y un data stream para logs de aplicaciones
+# Laboratorio 3: Crear índices y ajustar mapeos para logs
 
-## Metadatos
+- **Capítulo:** 3. Índices, shards y mapeos avanzados
 
-| Elemento | Valor |
-|---|---|
-| Duración | 70 minutos |
-| Complejidad | Media |
-| Nivel de Bloom | Crear |
+- **Duración:** 54 min
 
-## Descripción general
+- **Entorno:** Elastic Cloud Hosted (cuenta propia), Elasticsearch 9.x, Kibana Dev Tools
 
-En esta práctica se construirá una estructura reutilizable para almacenar logs de una API mediante un *data stream* de Elasticsearch 9.3.0. Se crearán dos *component templates*: uno para la configuración de shards y réplicas, y otro para mappings ECS mínimos y reglas dinámicas controladas para etiquetas.
+- **Dependencias:** Laboratorio 2 (índice `lab02-weblogs` con 6 documentos). No requiere los índices del Laboratorio 1.
 
-Finalmente, se creará el *composable index template* para el patrón `logs-acme.api-*`, se indexarán eventos de ejemplo y se verificará el índice de respaldo, el destino lógico de escritura, los mappings resultantes y la distribución de shards.
+## Objetivo
 
-## Objetivos de aprendizaje
+Partir del índice `lab02-weblogs`, creado con mapeo dinámico, y construir el modelo definitivo para los logs del curso: un mapping explícito con multi-fields, un analyzer personalizado, templates reutilizables, un índice con alias y un data stream de prueba. Al terminar, el participante podrá:
 
-Al finalizar la práctica, podrá:
+- Identificar los problemas de un mapeo dinámico y decidir el tipo correcto de cada campo.
 
-- [ ] Crear *component templates* reutilizables para settings y mappings.
-- [ ] Definir un *composable index template* habilitado para un *data stream*.
-- [ ] Aplicar mappings explícitos para campos ECS habituales de logs.
-- [ ] Limitar el mapeo dinámico de etiquetas para reducir el riesgo de *mapping explosion*.
-- [ ] Crear e inspeccionar el data stream `logs-acme.api-default` y su índice de respaldo.
+- Comparar analyzers con la API `_analyze` y definir un analyzer personalizado.
 
-## Prerrequisitos
+- Crear component templates e index templates y comprobar su efecto con `_simulate_index`.
 
-### Conocimientos
+- Crear un índice a partir de un template, asignarle un alias y poblarlo con `_reindex`.
 
-- Comprensión básica de documentos JSON y solicitudes REST.
-- Conocimiento conceptual de índices, aliases, data streams, shards y réplicas.
-- Diferencia entre los tipos `text`, `keyword`, `date`, `integer`, `boolean` y `object`.
-- Comprensión básica del Elastic Common Schema (ECS).
+- Crear un data stream y observar sus backing indices.
 
-### Acceso y estado requerido
+- Dejar listo el índice `weblogs-v1` (alias `weblogs`) y los templates que usan los laboratorios 4 y 5.
 
-- Las prácticas 1 y 2 deben estar completadas.
-- Elasticsearch 9.3.0 debe estar disponible en `https://localhost:9201`.
-- El contenedor obligatorio `es930-lab` debe estar en ejecución.
-- Debe existir el archivo `/opt/elastic-labs/.env` con permisos `0600`.
-- El usuario de laboratorio es `elastic`.
-- La contraseña se obtiene desde el archivo `.env`; no la escriba directamente en comandos ni la reutilice fuera del laboratorio.
+## Requisitos
 
-## Entorno de laboratorio
+- `lab02-weblogs` con 6 documentos. Verificar con `GET lab02-weblogs/_count`; debe devolver `count: 6`.
 
-| Componente | Valor requerido |
-|---|---|
-| Directorio raíz | `/opt/elastic-labs` |
-| Directorio de trabajo | `/opt/elastic-labs/work` |
-| Elasticsearch objetivo | Elasticsearch 9.3.0 |
-| Contenedor Elasticsearch | `es930-lab` |
-| Cluster | `es930-lab-cluster` |
-| Nodo | `es930-node-1` |
-| URL de Elasticsearch | `https://localhost:9201` |
-| Red Docker | `elastic-lab-net` |
-| Volumen persistente | `es930-data` |
-| Data stream de esta práctica | `logs-acme.api-default` |
+- Usuario `elastic` en Kibana Dev Tools (Console).
 
-> **Importante:** esta práctica utiliza exclusivamente Elasticsearch 9.3.0 en el puerto `9201`. No ejecute operaciones contra Elasticsearch 7.17.29 en el puerto `9200`.
+## Distribución del tiempo
 
-### Preparación de la terminal
+| **Parte** | **Contenido**                        | **Tiempo** |
+|-----------|--------------------------------------|------------|
+| Parte A   | Analizar el mapping dinámico         | 8 min      |
+| Parte B   | Comparar analyzers con `_analyze`    | 12 min     |
+| Parte C   | Component templates e index template | 14 min     |
+| Parte D   | Índice, alias y reindex              | 12 min     |
+| Parte E   | Data stream de prueba                | 8 min      |
 
-1. Abra una terminal y acceda al directorio obligatorio del laboratorio.
+## Convenciones
 
-   ```bash
-   cd /opt/elastic-labs
-   ```
+- Todos los comandos se ejecutan en Kibana Dev Tools (Console).
 
-2. Verifique que el archivo de variables existe, que tiene permisos restrictivos y que el contenedor de Elasticsearch 9.3.0 está activo.
+- Cada comando va seguido de lo que hace y del significado de sus parámetros.
 
-   ```bash
-   ls -l /opt/elastic-labs/.env
-   docker ps --filter "name=es930-lab"
-   ```
+- Los nombres siguen el prefijo `weblogs-`; los que se conservan para otros laboratorios se indican en la tabla final.
 
-3. Exporte la contraseña desde el archivo `.env` sin mostrarla en pantalla.
+## Parte A: analizar el mapping dinámico (8 min)
 
-   ```bash
-   export ELASTIC_PASSWORD="$(sed -n 's/^ELASTIC_PASSWORD=//p' /opt/elastic-labs/.env | tail -n 1)"
-   test -n "$ELASTIC_PASSWORD" && echo "Contraseña de laboratorio cargada."
-   ```
+### Paso A1. Revisar el índice de partida
 
-4. Defina variables y una función auxiliar para las llamadas a la API.
+``` console
+GET _cat/indices/lab02-weblogs?v&h=index,health,pri,rep,docs.count,store.size
 
-   ```bash
-   export ES_URL="https://localhost:9201"
-
-   api() {
-     curl -ksS --fail-with-body \
-       -u "elastic:${ELASTIC_PASSWORD}" \
-       "$@"
-   }
-   ```
-
-5. Compruebe la conectividad y el estado del cluster.
-
-   ```bash
-   api "${ES_URL}/_cluster/health?pretty"
-   ```
-
-**Resultado esperado**
-
-La respuesta debe indicar el nombre del cluster `es930-lab-cluster`. Antes de crear datos, el estado puede ser `green` o `yellow`, según el estado previo del laboratorio. Después de crear el data stream con cero réplicas, los shards primarios de esta práctica deben quedar en estado `green`.
-
-**Verificación**
-
-Ejecute:
-
-```bash
-api "${ES_URL}/_cat/nodes?v"
+GET lab02-weblogs/_mapping
 ```
 
-Debe aparecer un nodo llamado `es930-node-1`.
+**Qué hace:** muestra el tamaño del índice y el mapping que Elasticsearch generó automáticamente al indexar el primer documento.
 
----
+### Paso A2. Decidir el tipo de cada campo
 
-## Procedimiento paso a paso
+Completar la columna de decisión y comparar con la propuesta:
 
-### Paso 1. Crear el directorio de trabajo y validar recursos previos
+| **Campo**          | **Mapping dinámico** | **Propuesta**                             | **Motivo**                                                           |
+|--------------------|----------------------|-------------------------------------------|----------------------------------------------------------------------|
+| `@timestamp`       | `date`               | `date`                                    | Correcto.                                                            |
+| `service`          | `text` + `.keyword`  | `keyword`                                 | Solo se filtra y agrega por valor exacto.                            |
+| `client_ip`        | `text` + `.keyword`  | `ip`                                      | Permite búsquedas por rango y por CIDR.                              |
+| `method`           | `text` + `.keyword`  | `keyword`                                 | Valor exacto de pocos valores.                                       |
+| `url`              | `text` + `.keyword`  | `keyword` + subcampo `.path` (text)       | Exacto para agregar; analyzer de ruta para buscar por prefijo.       |
+| `status`           | `long`               | `short`                                   | Rango 100 a 599; ahorra espacio y permite rangos.                    |
+| `bytes`            | `long`               | `integer` con `index: false`              | Se agrega y se suma; consultar por valor es posible, pero más lento. |
+| `response_time_ms` | `float`              | `float`                                   | Correcto.                                                            |
+| `message`          | `text` + `.keyword`  | `text` + `.keyword` (`ignore_above: 512`) | Búsqueda de texto completo y valor exacto.                           |
 
-**Objetivo:** preparar archivos JSON reproducibles y comprobar si existen recursos de una ejecución anterior.
+## Parte B: comparar analyzers con \_analyze (12 min)
 
-**Instrucciones**
+### Paso B1. Analyzer standard
 
-1. Cree el directorio de trabajo si no existe.
-
-   ```bash
-   mkdir -p /opt/elastic-labs/work
-   cd /opt/elastic-labs/work
-   ```
-
-2. Consulte los templates existentes relacionados con el laboratorio.
-
-   ```bash
-   api "${ES_URL}/_component_template/ct-logs-acme-*?pretty"
-   ```
-
-3. Consulte si ya existe el composable template principal.
-
-   ```bash
-   api "${ES_URL}/_index_template/logs-acme-api-template?pretty" || true
-   ```
-
-4. Consulte si el data stream ya fue creado anteriormente.
-
-   ```bash
-   api "${ES_URL}/_data_stream/logs-acme.api-default?pretty" || true
-   ```
-
-**Resultado esperado**
-
-En una ejecución inicial, las consultas de recursos inexistentes pueden devolver un error `404`. Si los recursos existen por una repetición de la práctica, se mostrarán sus definiciones actuales.
-
-**Verificación**
-
-No elimine recursos existentes todavía. Los comandos `PUT` de los pasos siguientes actualizan los templates de forma idempotente. Si el data stream ya existe, podrá reutilizarlo para las validaciones, siempre que su configuración coincida con la de esta guía.
-
----
-
-### Paso 2. Crear el component template de settings
-
-**Objetivo:** definir una configuración reutilizable para los índices de respaldo del data stream, adecuada para un cluster de un solo nodo.
-
-**Instrucciones**
-
-1. Cree el archivo `ct-logs-acme-settings.json`.
-
-   ```bash
-   cat > /opt/elastic-labs/work/ct-logs-acme-settings.json <<'JSON'
-   {
-     "template": {
-       "settings": {
-         "index.number_of_shards": 1,
-         "index.number_of_replicas": 0,
-         "index.refresh_interval": "5s"
-       }
-     },
-     "_meta": {
-       "description": "Settings reutilizables para logs de ACME en el laboratorio",
-       "lab_id": "03-00-01",
-       "managed_by": "elastic-labs"
-     }
-   }
-   JSON
-   ```
-
-2. Cree el *component template* en Elasticsearch.
-
-   ```bash
-   api -X PUT "${ES_URL}/_component_template/ct-logs-acme-settings" \
-     -H "Content-Type: application/json" \
-     --data-binary @/opt/elastic-labs/work/ct-logs-acme-settings.json | jq
-   ```
-
-3. Consulte el recurso creado.
-
-   ```bash
-   api "${ES_URL}/_component_template/ct-logs-acme-settings?pretty"
-   ```
-
-**Resultado esperado**
-
-La creación debe devolver una respuesta similar a:
-
-```json
+``` console
+GET _analyze
 {
-  "acknowledged": true
+  "analyzer": "standard",
+  "text": "GET /api/products/9999 404 product not found"
 }
 ```
 
-La consulta posterior debe mostrar:
+**Qué hace:** muestra los tokens que genera un analyzer para un texto, sin necesidad de indexarlo.
 
-- `index.number_of_shards` con valor `1`.
-- `index.number_of_replicas` con valor `0`.
-- `index.refresh_interval` con valor `5s`.
+- `analyzer`: analyzer a probar (`standard` es el predeterminado de los campos `text`).
 
-**Verificación**
+- `text`: cadena de entrada.
 
-Ejecute:
+**Resultado esperado:** los tokens `get`, `api`, `products`, `9999`, `404`, `product`, `not`, `found`. El analyzer divide en las barras, quita la puntuación y pasa a minúsculas; la ruta original deja de existir como unidad.
 
-```bash
-api "${ES_URL}/_component_template/ct-logs-acme-settings" \
-  | jq '.component_templates[0].component_template.template.settings'
-```
+### Paso B2. Analyzer keyword y tokenizer path_hierarchy
 
-Confirme que el número de réplicas es `0`. Este valor evita shards réplica no asignados en el cluster de un solo nodo del laboratorio.
-
----
-
-### Paso 3. Crear el component template de mappings ECS mínimos
-
-**Objetivo:** definir mappings explícitos para los campos de log frecuentes y controlar las etiquetas dinámicas.
-
-**Instrucciones**
-
-1. Cree el archivo de mappings.
-
-   ```bash
-   cat > /opt/elastic-labs/work/ct-logs-acme-mappings.json <<'JSON'
-   {
-     "template": {
-       "mappings": {
-         "dynamic": false,
-         "dynamic_templates": [
-           {
-             "labels_flat_keywords": {
-               "path_match": "labels.*",
-               "path_unmatch": "labels.*.*",
-               "match_mapping_type": "string",
-               "mapping": {
-                 "type": "keyword",
-                 "ignore_above": 256
-               }
-             }
-           }
-         ],
-         "properties": {
-           "@timestamp": {
-             "type": "date"
-           },
-           "message": {
-             "type": "text",
-             "fields": {
-               "keyword": {
-                 "type": "keyword",
-                 "ignore_above": 1024
-               }
-             }
-           },
-           "log": {
-             "properties": {
-               "level": {
-                 "type": "keyword"
-               }
-             }
-           },
-           "service": {
-             "properties": {
-               "name": {
-                 "type": "keyword"
-               },
-               "environment": {
-                 "type": "keyword"
-               }
-             }
-           },
-           "event": {
-             "properties": {
-               "dataset": {
-                 "type": "keyword"
-               }
-             }
-           },
-           "host": {
-             "properties": {
-               "name": {
-                 "type": "keyword"
-               }
-             }
-           },
-           "http": {
-             "properties": {
-               "response": {
-                 "properties": {
-                   "status_code": {
-                     "type": "integer"
-                   }
-                 }
-               }
-             }
-           },
-           "error": {
-             "properties": {
-               "message": {
-                 "type": "text",
-                 "fields": {
-                   "keyword": {
-                     "type": "keyword",
-                     "ignore_above": 1024
-                   }
-                 }
-               }
-             }
-           },
-           "labels": {
-             "type": "object",
-             "dynamic": "strict"
-           }
-         }
-       }
-     },
-     "_meta": {
-       "description": "Mappings ECS mínimos y etiquetas planas controladas",
-       "lab_id": "03-00-01",
-       "dynamic_mapping_policy": "Campos no definidos se conservan en _source pero no se agregan al mapping; labels solo admite cadenas planas"
-     }
-   }
-   JSON
-   ```
-
-2. Cree el component template.
-
-   ```bash
-   api -X PUT "${ES_URL}/_component_template/ct-logs-acme-mappings" \
-     -H "Content-Type: application/json" \
-     --data-binary @/opt/elastic-labs/work/ct-logs-acme-mappings.json | jq
-   ```
-
-3. Consulte el template y visualice sus propiedades principales.
-
-   ```bash
-   api "${ES_URL}/_component_template/ct-logs-acme-mappings" \
-     | jq '.component_templates[0].component_template.template.mappings'
-   ```
-
-**Resultado esperado**
-
-Debe obtener una confirmación con `"acknowledged": true`.
-
-El mapping debe incluir:
-
-- `@timestamp` como `date`.
-- `message` como `text` y el subcampo `message.keyword`.
-- `log.level`, `service.name`, `service.environment`, `event.dataset` y `host.name` como `keyword`.
-- `http.response.status_code` como `integer`.
-- `error.message` como `text`.
-- `labels` como objeto con comportamiento dinámico estricto.
-
-**Verificación**
-
-Observe dos controles complementarios:
-
-1. El mapping raíz tiene `"dynamic": false`. Por ello, campos no definidos, como objetos de depuración arbitrarios, no se incorporan automáticamente al mapping.
-2. El objeto `labels` admite únicamente nuevas etiquetas planas de tipo cadena mediante el *dynamic template*. Valores complejos, como objetos anidados, deben ser rechazados.
-
-> **Nota técnica:** el contenido de un campo no mapeado puede permanecer en `_source`, pero Elasticsearch no lo indexará como campo consultable. Esto permite conservar evidencia original sin crear campos ilimitados en el mapping.
-
----
-
-### Paso 4. Crear el composable index template para el data stream
-
-**Objetivo:** combinar settings y mappings en un template aplicable al patrón `logs-acme.api-*`.
-
-**Instrucciones**
-
-1. Cree el archivo del composable index template.
-
-   ```bash
-   cat > /opt/elastic-labs/work/logs-acme-api-template.json <<'JSON'
-   {
-     "index_patterns": [
-       "logs-acme.api-*"
-     ],
-     "data_stream": {},
-     "composed_of": [
-       "ct-logs-acme-settings",
-       "ct-logs-acme-mappings"
-     ],
-     "priority": 350,
-     "_meta": {
-       "description": "Template composable para el data stream de logs de la API ACME",
-       "lab_id": "03-00-01",
-       "owner": "equipo-plataforma"
-     }
-   }
-   JSON
-   ```
-
-2. Cree el template.
-
-   ```bash
-   api -X PUT "${ES_URL}/_index_template/logs-acme-api-template" \
-     -H "Content-Type: application/json" \
-     --data-binary @/opt/elastic-labs/work/logs-acme-api-template.json | jq
-   ```
-
-3. Consulte su definición.
-
-   ```bash
-   api "${ES_URL}/_index_template/logs-acme-api-template?pretty"
-   ```
-
-4. Simule la aplicación del template sobre el nombre del futuro data stream.
-
-   ```bash
-   api -X POST "${ES_URL}/_index_template/_simulate_index/logs-acme.api-default" \
-     | jq '{
-       template_settings: .template.settings,
-       template_mappings: .template.mappings,
-       overlapping_templates: .overlapping
-     }'
-   ```
-
-**Resultado esperado**
-
-La simulación debe mostrar:
-
-- Un shard primario.
-- Cero réplicas.
-- El mapping explícito de `@timestamp`, `message`, `log`, `service`, `event`, `host`, `http`, `error` y `labels`.
-- La aplicación del template `logs-acme-api-template`.
-
-**Verificación**
-
-Ejecute la siguiente consulta focalizada:
-
-```bash
-api -X POST "${ES_URL}/_index_template/_simulate_index/logs-acme.api-default" \
-  | jq '{
-    shards: .template.settings["index.number_of_shards"],
-    replicas: .template.settings["index.number_of_replicas"],
-    timestamp_type: .template.mappings.properties["@timestamp"].type,
-    log_level_type: .template.mappings.properties.log.properties.level.type,
-    status_code_type: .template.mappings.properties.http.properties.response.properties.status_code.type
-  }'
-```
-
-Debe mostrar los valores `1`, `0`, `date`, `keyword` e `integer`.
-
----
-
-### Paso 5. Crear el data stream mediante una operación create
-
-**Objetivo:** crear automáticamente el data stream `logs-acme.api-default` y su primer índice de respaldo.
-
-**Instrucciones**
-
-1. Cree el primer evento de aplicación. La operación `/_create/` impone semántica de solo creación y permite la creación automática del data stream cuando existe un template compatible.
-
-   ```bash
-   cat > /opt/elastic-labs/work/log-app-0001.json <<'JSON'
-   {
-     "@timestamp": "2026-08-25T09:00:00Z",
-     "message": "Solicitud procesada correctamente",
-     "log": {
-       "level": "INFO"
-     },
-     "service": {
-       "name": "acme-api",
-       "environment": "production"
-     },
-     "event": {
-       "dataset": "acme.api"
-     },
-     "host": {
-       "name": "api-01"
-     },
-     "http": {
-       "response": {
-         "status_code": 200
-       }
-     },
-     "labels": {
-       "release": "2026.08.25",
-       "region": "eu-west-1"
-     }
-   }
-   JSON
-   ```
-
-2. Envíe el documento al nombre lógico del data stream.
-
-   ```bash
-   api -X PUT "${ES_URL}/logs-acme.api-default/_create/app-0001" \
-     -H "Content-Type: application/json" \
-     --data-binary @/opt/elastic-labs/work/log-app-0001.json | jq
-   ```
-
-3. Consulte el data stream creado.
-
-   ```bash
-   api "${ES_URL}/_data_stream/logs-acme.api-default?pretty"
-   ```
-
-**Resultado esperado**
-
-La respuesta de indexación debe incluir:
-
-```json
+``` console
+GET _analyze
 {
-  "result": "created"
+  "analyzer": "keyword",
+  "text": "/api/products/9999"
+}
+
+GET _analyze
+{
+  "tokenizer": "path_hierarchy",
+  "text": "/api/products/9999"
 }
 ```
 
-El atributo `_index` debe contener un nombre similar a:
+**Qué hace:** compara dos formas de tratar una ruta.
 
-```text
-.ds-logs-acme.api-default-2026.08.25-000001
+- `keyword`: devuelve un solo token con el texto completo.
+
+- `tokenizer`: en lugar de un analyzer completo, prueba un tokenizer directamente.
+
+- `path_hierarchy`: genera un token por cada nivel de la ruta.
+
+**Resultado esperado:** `keyword` devuelve `/api/products/9999`. `path_hierarchy` devuelve tres tokens: `/api`, `/api/products` y `/api/products/9999`.
+
+### Paso B3. Cadena de filtros para texto en español
+
+``` console
+GET _analyze
+{
+  "tokenizer": "standard",
+  "char_filter": ["html_strip"],
+  "filter": ["lowercase", "asciifolding"],
+  "text": "<b>Teléfono</b> PAGO Rechazado"
+}
 ```
 
-La fecha concreta del nombre físico puede variar según el entorno. El sufijo inicial de generación debe ser `000001`.
+**Qué hace:** arma un analyzer temporal con sus tres etapas.
 
-**Verificación**
+- `char_filter`: transforma el texto antes de dividirlo. `html_strip` elimina las etiquetas HTML.
 
-Extraiga el nombre del primer índice de respaldo:
+- `tokenizer`: divide el texto en tokens.
 
-```bash
-export BACKING_INDEX="$(
-  api "${ES_URL}/_data_stream/logs-acme.api-default" \
-  | jq -r '.data_streams[0].indices[-1].index_name'
-)"
+- `filter` (token filters): transforman los tokens. `lowercase` pasa a minúsculas y `asciifolding` quita acentos.
 
-echo "$BACKING_INDEX"
+**Resultado esperado:** `telefono`, `pago`, `rechazado`.
+
+## Parte C: component templates e index template (14 min)
+
+### Paso C1. Component template de settings
+
+``` console
+PUT _component_template/weblogs-settings
+{
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 1,
+      "analysis": {
+        "analyzer": {
+          "url_path_analyzer": {
+            "type": "custom",
+            "tokenizer": "path_hierarchy",
+            "filter": ["lowercase"]
+          }
+        }
+      }
+    }
+  }
+}
 ```
 
-El valor debe comenzar por:
+**Qué hace:** guarda un bloque reutilizable de settings. Un component template no se aplica por sí solo; se compone dentro de un index template.
 
-```text
-.ds-logs-acme.api-default-
+- `number_of_shards` y `number_of_replicas`: un primary y una réplica, suficiente para el volumen del curso.
+
+- `analysis.analyzer`: define el analyzer `url_path_analyzer` con el tokenizer `path_hierarchy` y un filtro `lowercase`. Los analyzers personalizados se definen en los settings del índice.
+
+### Paso C2. Component template de mappings
+
+``` console
+PUT _component_template/weblogs-mappings
+{
+  "template": {
+    "mappings": {
+      "properties": {
+        "@timestamp":       { "type": "date" },
+        "service":          { "type": "keyword" },
+        "client_ip":        { "type": "ip" },
+        "method":           { "type": "keyword" },
+        "url": {
+          "type": "keyword",
+          "ignore_above": 512,
+          "fields": {
+            "path": { "type": "text", "analyzer": "url_path_analyzer" }
+          }
+        },
+        "status":           { "type": "short" },
+        "bytes":            { "type": "integer", "index": false },
+        "response_time_ms": { "type": "float" },
+        "message": {
+          "type": "text",
+          "fields": {
+            "keyword": { "type": "keyword", "ignore_above": 512 }
+          }
+        }
+      }
+    }
+  }
+}
 ```
 
-> **Importante:** los productores deben escribir en `logs-acme.api-default`, no directamente en `$BACKING_INDEX`. El data stream utiliza el índice de respaldo actual como destino interno de escritura.
+**Qué hace:** define el mapping explícito de los logs.
 
----
+- `fields`: multi-field; el mismo valor se indexa de más de una forma. `url` es `keyword` y `url.path` es `text` con el analyzer de ruta.
 
-### Paso 6. Indexar eventos adicionales y comprobar mappings dinámicos controlados
+- `ignore_above: 512`: los valores más largos no se indexan como `keyword` (siguen en `_source`).
 
-**Objetivo:** añadir logs representativos y demostrar el comportamiento de campos explícitos, etiquetas controladas y campos no mapeados.
+- `index: false` en `bytes`: no crea la estructura de búsqueda rápida. El campo sigue guardando `doc_values`, de modo que se puede agregar y ordenar. En los tipos numéricos también se puede consultar con `term` o `range`, pero recorriendo los valores, más lento que con el índice.
 
-**Instrucciones**
+- `status` como `short` y `client_ip` como `ip`: tipos más compactos y más precisos que los generados dinámicamente.
 
-1. Cree un evento de error HTTP.
+### Paso C3. Index template
 
-   ```bash
-   cat > /opt/elastic-labs/work/log-app-0002.json <<'JSON'
-   {
-     "@timestamp": "2026-08-25T09:02:14Z",
-     "message": "No fue posible validar el token de acceso",
-     "log": {
-       "level": "ERROR"
-     },
-     "service": {
-       "name": "acme-api",
-       "environment": "production"
-     },
-     "event": {
-       "dataset": "acme.api"
-     },
-     "host": {
-       "name": "api-02"
-     },
-     "http": {
-       "response": {
-         "status_code": 401
-       }
-     },
-     "error": {
-       "message": "JWT expired"
-     },
-     "labels": {
-       "release": "2026.08.25",
-       "component": "authentication"
-     }
-   }
-   JSON
-   ```
-
-2. Cree un evento de advertencia que incluya un objeto de diagnóstico no definido en el mapping raíz.
-
-   ```bash
-   cat > /opt/elastic-labs/work/log-app-0003.json <<'JSON'
-   {
-     "@timestamp": "2026-08-25T09:05:45Z",
-     "message": "Latencia elevada durante la consulta de clientes",
-     "log": {
-       "level": "WARN"
-     },
-     "service": {
-       "name": "acme-api",
-       "environment": "production"
-     },
-     "event": {
-       "dataset": "acme.api"
-     },
-     "host": {
-       "name": "api-01"
-     },
-     "http": {
-       "response": {
-         "status_code": 200
-       }
-     },
-     "labels": {
-       "release": "2026.08.25",
-       "component": "customers"
-     },
-     "debug_context": {
-       "query_time_ms": 847,
-       "temporary_trace": "trace-4f9a"
-     }
-   }
-   JSON
-   ```
-
-3. Indexe ambos documentos con IDs únicos.
-
-   ```bash
-   api -X PUT "${ES_URL}/logs-acme.api-default/_create/app-0002" \
-     -H "Content-Type: application/json" \
-     --data-binary @/opt/elastic-labs/work/log-app-0002.json | jq
-
-   api -X PUT "${ES_URL}/logs-acme.api-default/_create/app-0003" \
-     -H "Content-Type: application/json" \
-     --data-binary @/opt/elastic-labs/work/log-app-0003.json | jq
-   ```
-
-4. Fuerce una actualización de búsqueda para hacer visibles los documentos inmediatamente.
-
-   ```bash
-   api -X POST "${ES_URL}/logs-acme.api-default/_refresh" | jq
-   ```
-
-5. Consulte el documento con el objeto no mapeado.
-
-   ```bash
-   api "${ES_URL}/logs-acme.api-default/_doc/app-0003?pretty"
-   ```
-
-**Resultado esperado**
-
-Los documentos `app-0002` y `app-0003` deben crearse correctamente.
-
-El campo `debug_context` debe aparecer dentro de `_source` del documento `app-0003`, pero no debe convertirse en un campo indexado del mapping, debido a `"dynamic": false` en la raíz.
-
-**Verificación**
-
-1. Compruebe que una etiqueta dinámica plana quedó como `keyword`.
-
-   ```bash
-   api "${ES_URL}/logs-acme.api-default/_field_caps?fields=labels.release,labels.component" \
-     | jq '.fields'
-   ```
-
-   Debe aparecer el tipo `keyword`.
-
-2. Consulte los tipos de campos principales.
-
-   ```bash
-   api "${ES_URL}/logs-acme.api-default/_field_caps?fields=@timestamp,message,message.keyword,log.level,service.name,http.response.status_code,error.message" \
-     | jq '.fields'
-   ```
-
-3. Revise el mapping completo relevante.
-
-   ```bash
-   api "${ES_URL}/logs-acme.api-default/_mapping" \
-     | jq '.[].mappings.properties | {
-       "@timestamp": .["@timestamp"],
-       message: .message,
-       log: .log,
-       service: .service,
-       http: .http,
-       error: .error,
-       labels: .labels
-     }'
-   ```
-
----
-
-### Paso 7. Validar la restricción de etiquetas complejas
-
-**Objetivo:** comprobar que el objeto `labels` rechaza estructuras no permitidas y protege el mapping ante una expansión no controlada.
-
-**Instrucciones**
-
-1. Cree un documento intencionalmente inválido: `labels.release` contiene un objeto cuando solo debe ser una cadena plana.
-
-   ```bash
-   cat > /opt/elastic-labs/work/log-app-invalid.json <<'JSON'
-   {
-     "@timestamp": "2026-08-25T09:10:00Z",
-     "message": "Evento de prueba con etiqueta no permitida",
-     "log": {
-       "level": "WARN"
-     },
-     "service": {
-       "name": "acme-api",
-       "environment": "production"
-     },
-     "event": {
-       "dataset": "acme.api"
-     },
-     "labels": {
-       "release": {
-         "major": 2026,
-         "minor": 8
-       }
-     }
-   }
-   JSON
-   ```
-
-2. Envíe la solicitud sin usar la función `api`, ya que se espera una respuesta HTTP `400`.
-
-   ```bash
-   curl -ksS \
-     -o /opt/elastic-labs/work/invalid-label-response.json \
-     -w "HTTP %{http_code}\n" \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     -X PUT "${ES_URL}/logs-acme.api-default/_create/app-invalid" \
-     -H "Content-Type: application/json" \
-     --data-binary @/opt/elastic-labs/work/log-app-invalid.json
-   ```
-
-3. Examine el detalle del error.
-
-   ```bash
-   jq . /opt/elastic-labs/work/invalid-label-response.json
-   ```
-
-**Resultado esperado**
-
-La salida debe indicar:
-
-```text
-HTTP 400
+``` console
+PUT _index_template/weblogs-template
+{
+  "index_patterns": ["weblogs-v*"],
+  "priority": 200,
+  "composed_of": ["weblogs-settings", "weblogs-mappings"],
+  "_meta": { "description": "Logs de acceso web del curso" }
+}
 ```
 
-La respuesta debe contener un error de parsing o mapping relacionado con el comportamiento `strict` de `labels`.
+**Qué hace:** asocia los dos component templates a todos los índices cuyo nombre empiece con `weblogs-v`.
 
-**Verificación**
+- `index_patterns`: patrones de nombre a los que aplica. Solo actúa al crear el índice; no modifica índices existentes.
 
-Confirme que el documento inválido no fue creado:
+- `priority`: si un índice coincide con más de un template, gana el de mayor prioridad. Dos templates con patrones solapados no pueden tener la misma prioridad.
 
-```bash
-api "${ES_URL}/logs-acme.api-default/_doc/app-invalid?pretty" || true
+- `composed_of`: lista ordenada de component templates. Si hay conflicto, el último prevalece.
+
+- `_meta`: información libre para documentar el template.
+
+### Paso C4. Comprobar el resultado sin crear el índice
+
+``` console
+POST _index_template/_simulate_index/weblogs-v1
 ```
 
-Debe devolver un error `404`.
+**Qué hace:** devuelve los settings, mappings y aliases que recibiría un índice llamado `weblogs-v1`, sin crearlo.
 
----
+**Resultado esperado:** aparecen `number_of_shards: "1"`, el analyzer `url_path_analyzer` y todos los campos del mapping. En `overlapping` no debe figurar ningún otro template.
 
-### Paso 8. Inspeccionar el índice de respaldo, el destino de escritura y los shards
+## Parte D: índice, alias y reindex (12 min)
 
-**Objetivo:** verificar que el data stream administra un backing index y que su configuración coincide con la definida por los templates.
+### Paso D1. Crear el índice con su alias
 
-**Instrucciones**
-
-1. Muestre la estructura del data stream.
-
-   ```bash
-   api "${ES_URL}/_data_stream/logs-acme.api-default" \
-     | jq '.data_streams[0] | {
-       name,
-       timestamp_field,
-       generation,
-       indices
-     }'
-   ```
-
-2. Actualice la variable con el índice de respaldo de escritura actual.
-
-   ```bash
-   export BACKING_INDEX="$(
-     api "${ES_URL}/_data_stream/logs-acme.api-default" \
-     | jq -r '.data_streams[0].indices[-1].index_name'
-   )"
-
-   echo "Índice de respaldo actual: ${BACKING_INDEX}"
-   ```
-
-3. Consulte los settings aplicados al índice de respaldo.
-
-   ```bash
-   api "${ES_URL}/${BACKING_INDEX}/_settings?filter_path=*.settings.index.number_of_shards,*.settings.index.number_of_replicas,*.settings.index.refresh_interval" \
-     | jq
-   ```
-
-4. Consulte los shards del índice de respaldo.
-
-   ```bash
-   api "${ES_URL}/_cat/shards/${BACKING_INDEX}?v"
-   ```
-
-5. Verifique el destino lógico de escritura creando un cuarto documento.
-
-   ```bash
-   cat > /opt/elastic-labs/work/log-app-0004.json <<'JSON'
-   {
-     "@timestamp": "2026-08-25T09:15:00Z",
-     "message": "Comprobación del destino lógico de escritura",
-     "log": {
-       "level": "INFO"
-     },
-     "service": {
-       "name": "acme-api",
-       "environment": "production"
-     },
-     "event": {
-       "dataset": "acme.api"
-     },
-     "host": {
-       "name": "api-01"
-     },
-     "http": {
-       "response": {
-         "status_code": 201
-       }
-     },
-     "labels": {
-       "release": "2026.08.25",
-       "test_case": "write-target"
-     }
-   }
-   JSON
-
-   api -X PUT "${ES_URL}/logs-acme.api-default/_create/app-0004" \
-     -H "Content-Type: application/json" \
-     --data-binary @/opt/elastic-labs/work/log-app-0004.json | jq
-   ```
-
-**Resultado esperado**
-
-Debe observar:
-
-- Un índice de respaldo cuyo nombre comienza por `.ds-logs-acme.api-default-`.
-- Un único shard primario (`p`) en estado `STARTED`.
-- Cero shards réplica para este índice.
-- `index.number_of_shards: 1`.
-- `index.number_of_replicas: 0`.
-- El documento `app-0004` creado en el backing index actual.
-
-**Verificación**
-
-Ejecute:
-
-```bash
-api "${ES_URL}/logs-acme.api-default/_search?size=10&sort=@timestamp:asc" \
-  | jq '{
-    total: .hits.total.value,
-    documents: [.hits.hits[] | {
-      id: ._id,
-      index: ._index,
-      timestamp: ._source["@timestamp"],
-      level: ._source.log.level,
-      status: ._source.http.response.status_code
-    }]
-  }'
+``` console
+PUT weblogs-v1
+{
+  "aliases": {
+    "weblogs": {}
+  }
+}
 ```
 
-Los documentos deben mostrar como `_index` el índice físico `.ds-logs-acme.api-default-...`.
+**Qué hace:** crea `weblogs-v1`. El cuerpo no incluye settings ni mappings: los toma del template. Además crea el alias `weblogs`.
 
-> **Aclaración:** un data stream ofrece un nombre lógico de escritura, pero no equivale a un alias convencional configurado manualmente con `is_write_index: true`. Elasticsearch administra internamente cuál es el backing index de escritura. En esta práctica, al existir una única generación, el índice `.ds-...-000001` es el destino de escritura.
+- `aliases`: nombres alternativos del índice. Las aplicaciones usan `weblogs`; el índice físico puede cambiar de versión (`weblogs-v2`) sin que los clientes lo noten. Este patrón se usa en el capítulo 9.
 
-## Validación y pruebas
+``` console
+GET weblogs-v1/_mapping/field/client_ip
 
-Ejecute la siguiente secuencia para confirmar que la configuración y los datos cumplen los requisitos de la práctica.
+GET weblogs-v1/_settings?filter_path=*.settings.index.number_of_shards,*.settings.index.analysis
+```
 
-1. Compruebe la existencia de los dos component templates y del composable index template.
+**Qué hace:** confirma que el índice heredó el mapping y los settings. `filter_path` limita la respuesta a las rutas indicadas.
 
-   ```bash
-   api "${ES_URL}/_component_template/ct-logs-acme-settings,ct-logs-acme-mappings" \
-     | jq '.component_templates[].name'
+### Paso D2. Poblar el índice con \_reindex
 
-   api "${ES_URL}/_index_template/logs-acme-api-template" \
-     | jq '.index_templates[].name'
-   ```
+``` console
+POST _reindex?refresh=true
+{
+  "source": { "index": "lab02-weblogs" },
+  "dest":   { "index": "weblogs-v1" }
+}
+```
 
-2. Compruebe que el data stream existe y tiene al menos un backing index.
+**Qué hace:** copia los documentos de un índice a otro. Como el destino tiene un mapping distinto, cada campo se convierte al tipo nuevo. La API se estudia a detalle en el capítulo 4.
 
-   ```bash
-   api "${ES_URL}/_data_stream/logs-acme.api-default" \
-     | jq '{
-       name: .data_streams[0].name,
-       generation: .data_streams[0].generation,
-       backing_indices: [.data_streams[0].indices[].index_name]
-     }'
-   ```
+- `source.index`: índice de origen.
 
-3. Compruebe que se han indexado cuatro documentos válidos.
+- `dest.index`: índice de destino.
 
-   ```bash
-   api "${ES_URL}/logs-acme.api-default/_count" | jq
-   ```
+- `refresh=true`: refresca el destino al terminar, para consultar de inmediato.
 
-   El valor esperado de `count` es `4`.
+- Los `_id` se conservan. Esto permite repetir la operación más adelante sobre los mismos documentos.
 
-4. Busque eventos con nivel `ERROR`.
+**Resultado esperado:** `total: 6`, `created: 6`, `failures: []`.
 
-   ```bash
-   api -X POST "${ES_URL}/logs-acme.api-default/_search" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "query": {
-         "term": {
-           "log.level": "ERROR"
-         }
-       }
-     }' | jq '{
-       total: .hits.total.value,
-       hits: [.hits.hits[] | {
-         id: ._id,
-         message: ._source.message,
-         error: ._source.error.message
-       }]
-     }'
-   ```
+### Paso D3. Comprobar el efecto de los tipos y del analyzer
 
-   Debe recuperar el documento `app-0002`.
+``` console
+GET weblogs/_search
+{
+  "query": { "term": { "client_ip": "187.141.0.0/16" } }
+}
 
-5. Busque eventos mediante una etiqueta dinámica controlada.
+GET weblogs/_search
+{
+  "query": { "term": { "url.path": "/api/products" } }
+}
 
-   ```bash
-   api -X POST "${ES_URL}/logs-acme.api-default/_search" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "query": {
-         "term": {
-           "labels.component": "authentication"
-         }
-       }
-     }' | jq '{
-       total: .hits.total.value,
-       ids: [.hits.hits[]._id]
-     }'
-   ```
+GET weblogs-v1/_analyze
+{
+  "field": "url.path",
+  "text": "/API/Cart/Items"
+}
+```
 
-   Debe recuperar el documento `app-0002`.
+**Qué hace:** tres comprobaciones.
 
-6. Verifique que `debug_context` no se añadió al mapping indexado.
+- Búsqueda por CIDR sobre `client_ip`. Solo es posible con el tipo `ip`.
 
-   ```bash
-   api "${ES_URL}/logs-acme.api-default/_mapping" \
-     | jq '[.[].mappings.properties | has("debug_context")]'
-   ```
+- `term` sobre `url.path`: encuentra todas las rutas que cuelgan de `/api/products`, porque el analyzer indexó cada nivel como token.
 
-   El resultado esperado es:
+- `_analyze` con `field`: usa el analyzer configurado en ese campo del índice.
 
-   ```json
-   [
-     false
-   ]
-   ```
+**Resultado esperado:** la primera búsqueda devuelve 2 documentos (la IP `187.141.22.10`); la segunda devuelve 2 (`/api/products` y `/api/products/9999`); `_analyze` devuelve `/api`, `/api/cart` y `/api/cart/items`.
 
-## Resolución de problemas
+## Parte E: data stream de prueba (8 min)
 
-### Problema 1: El data stream no se crea y Elasticsearch devuelve un error relacionado con template o índice
+### Paso E1. Crear el template del data stream
 
-**Síntoma**
+``` console
+PUT _index_template/weblogs-ds-template
+{
+  "index_patterns": ["weblogs-ds-*"],
+  "data_stream": {},
+  "priority": 200,
+  "composed_of": ["weblogs-settings", "weblogs-mappings"]
+}
+```
 
-Al enviar el primer documento a `logs-acme.api-default`, Elasticsearch devuelve un error `404`, `400` o indica que no existe un template de data stream aplicable.
+**Qué hace:** reutiliza los mismos component templates para un data stream.
 
-**Causa**
+- `data_stream: {}`: convierte el patrón en data streams. Es obligatorio y exige un campo `@timestamp`, que el mapping ya define.
 
-El composable index template no existe, no contiene `"data_stream": {}`, o su patrón no coincide exactamente con `logs-acme.api-default`. También puede ocurrir si se usó una operación de indexación incompatible en vez de `/_create/`.
+- El patrón `weblogs-ds-*` no se solapa con `weblogs-v*`. No usar nombres `logs-*-*`: ese patrón lo reservan los templates integrados de Elastic.
 
-**Solución**
+### Paso E2. Crear el data stream indexando un documento
 
-1. Compruebe el template:
+``` console
+POST weblogs-ds-test/_doc
+{
+  "@timestamp": "2026-10-14T10:00:00Z",
+  "service": "checkout",
+  "client_ip": "187.141.22.10",
+  "method": "GET",
+  "url": "/api/cart",
+  "status": 200,
+  "bytes": 900,
+  "response_time_ms": 35.0,
+  "message": "GET /api/cart 200 35ms"
+}
 
-   ```bash
-   api "${ES_URL}/_index_template/logs-acme-api-template?pretty"
-   ```
+GET _data_stream/weblogs-ds-test
+```
 
-2. Confirme que contiene:
+**Qué hace:** al indexar en un nombre que coincide con un template de data stream, Elasticsearch crea el data stream y su primer backing index.
 
-   ```json
-   "index_patterns": ["logs-acme.api-*"],
-   "data_stream": {}
-   ```
+Campos a revisar en la respuesta de `_data_stream`:
 
-3. Simule el nombre objetivo:
+- `indices[].index_name`: backing index, con el formato `.ds-weblogs-ds-test-<fecha UTC>-000001`.
 
-   ```bash
-   api -X POST "${ES_URL}/_index_template/_simulate_index/logs-acme.api-default" | jq
-   ```
+- `generation`: 1.
 
-4. Repita la creación usando una operación `PUT` con `/_create/` y un documento que incluya `@timestamp`.
+- `timestamp_field`: `@timestamp`.
 
-### Problema 2: Un documento es rechazado con `strict_dynamic_mapping_exception` en `labels`
+- `template`: `weblogs-ds-template`.
 
-**Síntoma**
+### Paso E3. Comprobar las restricciones y hacer un rollover
 
-La indexación devuelve HTTP `400` y el error menciona `strict_dynamic_mapping_exception`, `labels` o un campo no permitido.
+``` console
+PUT weblogs-ds-test/_doc/1
+{ "@timestamp": "2026-10-14T10:05:00Z", "service": "checkout" }
 
-**Causa**
+POST weblogs-ds-test/_rollover
 
-El objeto `labels` fue diseñado para admitir únicamente etiquetas planas de texto, por ejemplo `"region": "eu-west-1"`. Un valor objeto, un arreglo o una estructura anidada no cumple la política definida por el dynamic template y por `"dynamic": "strict"`.
+GET _data_stream/weblogs-ds-test
 
-**Solución**
+GET weblogs-ds-test/_search?size=0
+```
 
-1. Revise el documento JSON.
-2. Transforme la etiqueta a un valor de texto plano:
+**Qué hace:** la primera petición intenta indexar con `PUT` e identificador; la segunda crea un nuevo backing index.
 
-   ```json
-   "labels": {
-     "release": "2026.08"
-   }
-   ```
+- Primera petición: `400 Bad Request`. Los data streams solo admiten escrituras `create` (solo agregar). Sirven para datos que no se modifican.
 
-3. No use estructuras como la siguiente:
+- `_rollover`: crea el backing index `...-000002`. Las escrituras nuevas van a él; las búsquedas abarcan todos.
 
-   ```json
-   "labels": {
-     "release": {
-       "major": 2026
-     }
-   }
-   ```
+- Después del rollover, `generation` pasa a 2 y la búsqueda sigue devolviendo 1 documento.
 
-4. Si necesita almacenar información estructurada adicional, defina explícitamente un campo con mapping controlado en una futura revisión del component template, en lugar de permitir objetos dinámicos ilimitados.
+## Limpieza y estado final
 
-## Limpieza
+``` console
+DELETE _data_stream/weblogs-ds-test
 
-Los datos generados en esta práctica serán utilizados y ampliados por prácticas posteriores. Por tanto, **no elimine** el data stream, los templates, los volúmenes ni los contenedores.
+DELETE _index_template/weblogs-ds-template
+```
 
-1. Conserve los archivos de evidencia y configuración en el directorio de trabajo:
+**Qué hace:** elimina el data stream (y sus backing indices) y su template. Se vuelven a crear con ILM en el laboratorio 10.
 
-   ```bash
-   ls -lh /opt/elastic-labs/work
-   ```
+| **Elemento**                                                | **Se conserva** | **Lo reutiliza**                     |
+|-------------------------------------------------------------|-----------------|--------------------------------------|
+| `weblogs-v1` (alias `weblogs`) con 6 documentos             | Sí              | Laboratorios 4, 5 y 6                |
+| `weblogs-settings`, `weblogs-mappings` y `weblogs-template` | Sí              | Laboratorios 4, 6 y 9                |
+| `lab02-weblogs`                                             | Sí              | Laboratorio 4 (reindex con pipeline) |
+| `weblogs-ds-test` y `weblogs-ds-template`                   | No              | Solo para practicar                  |
 
-2. Si desea guardar una evidencia de estado para el informe técnico, exporte la información del data stream:
+Verificación final:
 
-   ```bash
-   api "${ES_URL}/_data_stream/logs-acme.api-default?pretty" \
-     > /opt/elastic-labs/work/evidencia-data-stream-logs-acme-api.json
+``` console
+GET _cat/indices/weblogs-*,lab02-*?v&h=index,health,pri,rep,docs.count
 
-   api "${ES_URL}/logs-acme.api-default/_mapping?pretty" \
-     > /opt/elastic-labs/work/evidencia-mapping-logs-acme-api.json
-   ```
+GET _alias/weblogs
 
-3. No ejecute el siguiente comando:
+GET _index_template/weblogs-template?filter_path=index_templates.name,index_templates.index_template.composed_of
+```
 
-   ```bash
-   docker compose down -v
-   ```
+Debe verse `weblogs-v1` con 6 documentos, el alias `weblogs` y el template compuesto por los dos component templates.
 
-   Este comando eliminaría volúmenes persistentes y rompería la continuidad requerida entre prácticas.
+## Preguntas de discusión
 
-## Resumen
+- ¿Qué ventaja tiene guardar `url` como `keyword` con un subcampo `text` en lugar de un solo `text`?
 
-En esta práctica se creó una arquitectura de ingesta para logs de aplicaciones basada en un data stream de Elasticsearch 9.3.0:
+- ¿Qué ocurre si más adelante se necesita cambiar `client_ip` a otro tipo? ¿Por qué no basta con modificar el mapping?
 
-- Se creó el component template `ct-logs-acme-settings` con un shard primario y cero réplicas.
-- Se creó el component template `ct-logs-acme-mappings` con campos ECS mínimos y controles contra *mapping explosion*.
-- Se creó el composable index template `logs-acme-api-template` con prioridad `350` y patrón `logs-acme.api-*`.
-- Se creó automáticamente el data stream `logs-acme.api-default` mediante una operación `create`.
-- Se verificó el backing index `.ds-logs-acme.api-default-...`, el destino lógico de escritura, los shards y los mappings.
-- Se validó que las etiquetas planas se mapean como `keyword`, mientras que objetos arbitrarios en `labels` se rechazan.
+- ¿Qué cambia para `bytes` al poner `index: false`? ¿Qué se conserva y qué se vuelve más lento?
 
-Los documentos generados permanecerán disponibles para su procesamiento mediante pipelines en la siguiente práctica y para consultas con Query DSL, KQL y ES|QL en prácticas posteriores.
+- ¿Qué ventajas tiene que las aplicaciones usen el alias `weblogs` en lugar del nombre del índice?
+
+- ¿Por qué un data stream rechaza `PUT` con identificador? ¿Para qué tipo de datos es adecuado?
+
+## Resultado final
+
+Al terminar el laboratorio, el entorno debe quedar como se muestra en la imagen: lo que se conserva, cómo verificarlo y lo que se elimina.
+
+![Resultado final del laboratorio 3: Crear índices y ajustar mapeos para logs](imagenes/lab03_resultado_final.png)

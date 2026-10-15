@@ -1,1109 +1,418 @@
-# Validar versión, licenciamiento, conectividad y salud de deployments 7.17 y 9.3
+# Laboratorio 2: Desplegar y comprobar un clúster en la nube
 
-## Metadatos
+- **Capítulo:** 2. Instalación, versiones y despliegue en la nube
 
-| Campo | Valor |
-|---|---|
-| Duración | 45 minutos |
-| Complejidad | Media |
-| Nivel de Bloom | Aplicar |
+- **Duración:** 50 min
 
-## Descripción general
+- **Entorno:** Elastic Cloud Hosted (cuenta de prueba propia), Elasticsearch 9.x, Kibana Dev Tools y una terminal con `curl`
 
-En esta práctica se construirá una línea base operacional para los deployments Elasticsearch 7.17.29 y 9.3.0 creados en la práctica anterior. Se validarán versiones, builds, distribución, licencia, salud de clúster, APIs disponibles y conectividad desde el host, Kibana y la red Docker.
+- **Dependencias:** Guía previa de cuenta y deployment (el deployment ya existe y tiene su ficha iniciada). No requiere los índices del Laboratorio 1.
 
-El resultado será un conjunto de evidencias reproducibles y una matriz de compatibilidad inicial. Esta información permitirá distinguir entre conectividad básica y compatibilidad funcional, especialmente antes de crear recursos de datos o plantear una migración entre generaciones.
+## Objetivo
 
-## Objetivos de aprendizaje
+Comprobar el estado del deployment propio, crear un índice e insertar y consultar documentos, revisar el mapping que Elasticsearch genera automáticamente y crear una API Key con privilegios limitados para usarla en una consulta externa. Al terminar, el participante podrá:
 
-Al finalizar la práctica, podrá:
+- Identificar versión, nodos, endpoints y zonas de un deployment desde la API y desde la consola.
 
-- [ ] Consultar y registrar la versión, build, distribución y características básicas de Elasticsearch 7.17.29 y 9.3.0.
-- [ ] Comparar el estado de licencia y las capacidades reportadas por las APIs `_license` y `_xpack`.
-- [ ] Verificar conectividad HTTP autenticada desde `curl`, Kibana Dev Tools y un contenedor conectado a `elastic-lab-net`.
-- [ ] Confirmar que cada instancia Kibana está conectada exclusivamente al deployment Elasticsearch de su misma generación.
-- [ ] Elaborar un inventario de endpoints y una matriz inicial de compatibilidad para APIs, clientes y agentes.
+- Interpretar los códigos de respuesta HTTP más frecuentes de Elasticsearch (200, 201, 400, 401, 403, 404 y 409).
 
-## Requisitos previos
+- Explicar qué tipos de campo genera el mapeo dinámico y qué problemas introduce.
 
-### Conocimientos necesarios
+- Crear, usar y revocar una API Key restringida a un índice.
 
-- Comprensión básica de JSON, códigos HTTP y cabeceras HTTP.
-- Uso básico de `curl`, `jq` y comandos Docker.
-- Conocimiento de los conceptos de clúster, nodo, licencia, API REST y autenticación básica.
-- Comprensión de que una respuesta HTTP `200` confirma conectividad y autorización para una API, pero no garantiza compatibilidad funcional completa.
+- Dejar cargado el índice `lab02-weblogs`, que el laboratorio 3.4 reutiliza.
 
-### Accesos y estado requerido
+## Requisitos
 
-- La práctica 1 debe estar completada.
-- Deben existir y estar en ejecución los contenedores:
-  - `es717-lab`
-  - `kibana717-lab`
-  - `es930-lab`
-  - `kibana930-lab`
-- Debe disponer de acceso local a:
-  - Elasticsearch 7.17.29: `http://localhost:9200`
-  - Kibana 7.17.29: `http://localhost:5601`
-  - Elasticsearch 9.3.0: `http://localhost:9201`
-  - Kibana 9.3.0: `http://localhost:5602`
-- Deben estar instalados `curl`, `jq`, Docker Engine y Docker Compose.
-- El archivo `/opt/elastic-labs/.env` debe contener las credenciales de laboratorio y tener permisos `0600`.
+- Deployment Hosted 9.x disponible, con la contraseña del usuario `elastic` guardada.
 
-> **Importante:** No ejecute `docker compose down -v`. La opción `-v` eliminaría los volúmenes persistentes requeridos para la continuidad del curso.
+- Ficha del deployment de la guía previa.
 
-## Entorno de laboratorio
+- Terminal con `curl`. En Windows, usar `curl.exe` (en PowerShell, `curl` es un alias de otro comando). Si no se dispone de terminal, se puede usar un cliente HTTP como Postman con el mismo encabezado.
 
-### Componentes validados
+## Distribución del tiempo
 
-| Componente | Nombre fijo | Versión objetivo | Acceso |
-|---|---|---:|---|
-| Elasticsearch legado | `es717-lab` | 7.17.29 | `http://localhost:9200` |
-| Kibana legado | `kibana717-lab` | 7.17.29 | `http://localhost:5601` |
-| Elasticsearch actual | `es930-lab` | 9.3.0 | `http://localhost:9201` |
-| Kibana actual | `kibana930-lab` | 9.3.0 | `http://localhost:5602` |
-| Red Docker | `elastic-lab-net` | No aplica | Resolución DNS interna |
-| Directorio raíz | `/opt/elastic-labs` | No aplica | Archivos del laboratorio |
-| Directorio de evidencias | `/opt/elastic-labs/work` | No aplica | JSON, cabeceras y matriz |
+| **Parte** | **Contenido**                                      | **Tiempo** |
+|-----------|----------------------------------------------------|------------|
+| Parte A   | Comprobar el deployment                            | 8 min      |
+| Parte B   | Índice, documentos, mapping y códigos de respuesta | 17 min     |
+| Parte C   | API Key restringida                                | 25 min     |
 
-### Variables y convenciones
+## Convenciones
 
-| Variable | Valor esperado |
-|---|---|
-| Usuario | `elastic` |
-| Contraseña de laboratorio | Declarada en `/opt/elastic-labs/.env` |
-| Clúster 7.17 | `es717-lab-cluster` |
-| Nodo 7.17 | `es717-node-1` |
-| Clúster 9.3 | `es930-lab-cluster` |
-| Nodo 9.3 | `es930-node-1` |
-| Tipo de descubrimiento | `single-node` |
+- Los comandos en bloques con `GET`, `PUT`, `POST` o `DELETE` se ejecutan en Kibana Dev Tools (Console).
 
-### Preparación inicial
+- Los comandos que empiezan con `curl` se ejecutan en la terminal del equipo.
 
-Ejecute los siguientes comandos desde una terminal Linux:
+- Los valores entre ángulos, como `<ES_URL>` o `<ENCODED_KEY>`, se sustituyen por los datos propios.
 
-```bash
-cd /opt/elastic-labs
+- La respuesta de Dev Tools muestra el código HTTP en la parte superior del panel de resultados.
 
-sudo chmod 600 .env
-sudo mkdir -p /opt/elastic-labs/work/lab-02-00-01
-sudo chmod 700 /opt/elastic-labs/work/lab-02-00-01
+## Parte A: comprobar el deployment (8 min)
 
-set -a
-source /opt/elastic-labs/.env
-set +a
+### Paso A1. Versión y salud del clúster
 
-docker compose ps
-docker network inspect elastic-lab-net --format '{{.Name}}'
+``` console
+GET /
+
+GET _cluster/health
 ```
 
-Compruebe que la variable de contraseña existe sin imprimir su valor:
+**Qué hace:** devuelve la información del clúster y su estado de salud, como en el Laboratorio 1.
 
-```bash
-test -n "${ELASTIC_PASSWORD}" && echo "ELASTIC_PASSWORD cargada correctamente"
+Campos a registrar:
+
+- `version.number`: versión exacta de Elasticsearch.
+
+- `version.lucene_version`: versión de Lucene. En 9.x corresponde a Lucene 10.
+
+- `cluster_name`: nombre interno del clúster.
+
+- `status`, `number_of_nodes` y `number_of_data_nodes`: salud y tamaño del clúster.
+
+### Paso A2. Nodos y roles
+
+``` console
+GET _cat/nodes?v&h=name,node.role,master,heap.percent,disk.used_percent
 ```
 
-Si el nombre de variable utilizado en su archivo `.env` es distinto, ajuste los comandos de esta práctica. No incluya la contraseña literal en los archivos de evidencia ni en capturas de pantalla.
+**Qué hace:** lista los nodos con sus roles. Con 2 zonas de disponibilidad debe verse, además de los nodos de datos, un nodo de voto (rol `v`) que actúa como tiebreaker.
 
----
+### Paso A3. Datos de la consola de Elastic Cloud
 
-## Procedimiento paso a paso
+En la consola de Elastic Cloud, abrir el deployment y localizar en la página principal la sección de aplicaciones:
 
-### Paso 1. Confirmar el estado de los contenedores y los puertos publicados
+- **Elasticsearch endpoint:** URL HTTPS del clúster. Usar la opción para copiarla; se necesitará en la Parte C como `<ES_URL>`.
 
-**Objetivo:** Verificar que los cuatro componentes requeridos están en ejecución, usan los nombres esperados y publican los puertos locales correctos.
+- **Kibana endpoint:** URL de acceso a Kibana.
 
-**Instrucciones:**
+- **Cloud ID:** identificador compacto que usan Beats, Logstash y los clientes oficiales para conectarse. Se usará en el capítulo 4.
 
-1. Sitúese en el directorio de trabajo y cargue las variables de entorno si aún no lo ha hecho.
+Ampliar la ficha del deployment de la guía previa con estos datos:
 
-   ```bash
-   cd /opt/elastic-labs
-   set -a
-   source .env
-   set +a
-   ```
+| **Dato**                            | **Valor** |
+|-------------------------------------|-----------|
+| Elasticsearch endpoint (`<ES_URL>`) |           |
+| Kibana endpoint                     |           |
+| Cloud ID                            |           |
+| Versión confirmada con `GET /`      |           |
+| Nodos de datos y nodo tiebreaker    |           |
 
-2. Consulte el estado de los servicios Compose.
+## Parte B: índice, documentos, mapping y códigos de respuesta (17 min)
 
-   ```bash
-   docker compose ps
-   ```
+Se trabaja con registros de acceso de una aplicación web. Este es el dataset base que se retoma en el capítulo 3.
 
-3. Obtenga una vista resumida de los contenedores y sus puertos.
+### Paso B1. Insertar un documento con identificador propio
 
-   ```bash
-   docker ps \
-     --filter "name=es717-lab" \
-     --filter "name=kibana717-lab" \
-     --filter "name=es930-lab" \
-     --filter "name=kibana930-lab" \
-     --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
-   ```
-
-4. Verifique que los contenedores Elasticsearch están conectados a la red Docker requerida.
-
-   ```bash
-   docker network inspect elastic-lab-net \
-     --format '{{range $id, $c := .Containers}}{{println $c.Name}}{{end}}' \
-     | sort
-   ```
-
-5. Guarde la evidencia del estado de servicios.
-
-   ```bash
-   docker compose ps > work/lab-02-00-01/01-compose-ps.txt
-   docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" \
-     > work/lab-02-00-01/01-docker-ps.txt
-   ```
-
-**Resultado esperado:**
-
-- Los cuatro contenedores aparecen con estado `Up` o equivalente.
-- `es717-lab` publica el puerto `9200`.
-- `kibana717-lab` publica el puerto `5601`.
-- `es930-lab` publica el puerto `9201`.
-- `kibana930-lab` publica el puerto `5602`.
-- Los contenedores Elasticsearch y Kibana aparecen en `elastic-lab-net`.
-
-**Verificación:**
-
-Ejecute:
-
-```bash
-docker compose ps --status running
+``` console
+PUT lab02-weblogs/_doc/1?refresh=wait_for
+{
+  "@timestamp": "2026-10-14T09:15:02Z",
+  "service": "checkout",
+  "client_ip": "187.141.22.10",
+  "method": "GET",
+  "url": "/api/cart",
+  "status": 200,
+  "bytes": 1532,
+  "response_time_ms": 42.5,
+  "message": "GET /api/cart 200 42ms"
+}
 ```
 
-Debe observar los cuatro servicios requeridos. Si falta alguno o tiene estado distinto de ejecución, resuelva el problema antes de continuar.
+**Qué hace:** indexa el documento con `_id` igual a 1. Como el índice no existe, Elasticsearch lo crea automáticamente y genera el mapping a partir de los campos del documento.
 
----
+Parámetros:
 
-### Paso 2. Validar conectividad HTTP, cabeceras y API raíz desde el host
+- `PUT` con `_id` en la ruta: el cliente decide el identificador. Si el documento ya existe, se reemplaza.
 
-**Objetivo:** Comprobar que ambos endpoints Elasticsearch responden desde el host y registrar versión, número de build, distribución y nombre de clúster.
+- `refresh=wait_for`: la respuesta espera al siguiente refresh, de modo que el documento ya aparece en las búsquedas siguientes.
 
-**Instrucciones:**
+**Resultado esperado:** código `201 Created`, `result: created`, `_version: 1`.
 
-1. Consulte las cabeceras HTTP del deployment 7.17.29.
+### Paso B2. Reemplazar el documento y recuperarlo
 
-   ```bash
-   curl -sS -D work/lab-02-00-01/02-es717-headers.txt \
-     -o /dev/null \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     -H "Accept: application/json" \
-     http://localhost:9200/
-   ```
+Ejecutar de nuevo exactamente la petición del paso B1 y luego recuperar el documento:
 
-2. Consulte la API raíz de Elasticsearch 7.17.29 y guarde la respuesta JSON.
-
-   ```bash
-   curl -sS \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     -H "Accept: application/json" \
-     http://localhost:9200/ \
-     | tee work/lab-02-00-01/02-es717-root.json \
-     | jq '{
-         name,
-         cluster_name,
-         cluster_uuid,
-         version: {
-           number,
-           build_flavor,
-           build_type,
-           build_hash,
-           build_date,
-           lucene_version,
-           minimum_wire_compatibility_version,
-           minimum_index_compatibility_version
-         },
-         tagline
-       }'
-   ```
-
-3. Consulte las cabeceras HTTP del deployment 9.3.0.
-
-   ```bash
-   curl -sS -D work/lab-02-00-01/02-es930-headers.txt \
-     -o /dev/null \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     -H "Accept: application/json" \
-     http://localhost:9201/
-   ```
-
-4. Consulte la API raíz de Elasticsearch 9.3.0 y guarde la respuesta JSON.
-
-   ```bash
-   curl -sS \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     -H "Accept: application/json" \
-     http://localhost:9201/ \
-     | tee work/lab-02-00-01/02-es930-root.json \
-     | jq '{
-         name,
-         cluster_name,
-         cluster_uuid,
-         version: {
-           number,
-           build_flavor,
-           build_type,
-           build_hash,
-           build_date,
-           lucene_version,
-           minimum_wire_compatibility_version,
-           minimum_index_compatibility_version
-         },
-         tagline
-       }'
-   ```
-
-5. Extraiga una comparación resumida sin asumir que todos los campos existen en ambas generaciones.
-
-   ```bash
-   jq -r '
-     [
-       .name,
-       .cluster_name,
-       .version.number,
-       (.version.build_flavor // "campo_no_disponible"),
-       .version.build_type,
-       .version.build_hash,
-       .version.build_date,
-       .version.lucene_version,
-       .version.minimum_wire_compatibility_version,
-       .version.minimum_index_compatibility_version
-     ] | @tsv
-   ' work/lab-02-00-01/02-es717-root.json \
-     > work/lab-02-00-01/02-versiones.tsv
-
-   jq -r '
-     [
-       .name,
-       .cluster_name,
-       .version.number,
-       (.version.build_flavor // "campo_no_disponible"),
-       .version.build_type,
-       .version.build_hash,
-       .version.build_date,
-       .version.lucene_version,
-       .version.minimum_wire_compatibility_version,
-       .version.minimum_index_compatibility_version
-     ] | @tsv
-   ' work/lab-02-00-01/02-es930-root.json \
-     >> work/lab-02-00-01/02-versiones.tsv
-
-   column -t -s $'\t' work/lab-02-00-01/02-versiones.tsv
-   ```
-
-**Resultado esperado:**
-
-- Ambas solicitudes devuelven HTTP `200 OK`.
-- La cabecera `X-Elastic-Product: Elasticsearch` puede estar presente en la respuesta, según la versión y configuración.
-- El endpoint en `9200` informa versión `7.17.29`, nombre de nodo `es717-node-1` y clúster `es717-lab-cluster`.
-- El endpoint en `9201` informa versión `9.3.0`, nombre de nodo `es930-node-1` y clúster `es930-lab-cluster`.
-- Algunos campos del objeto `version`, por ejemplo `build_flavor`, pueden no estar presentes o cambiar de comportamiento entre generaciones.
-
-**Verificación:**
-
-Ejecute:
-
-```bash
-jq -r '.version.number + " | " + .cluster_name + " | " + .name' \
-  work/lab-02-00-01/02-es717-root.json \
-  work/lab-02-00-01/02-es930-root.json
+``` console
+GET lab02-weblogs/_doc/1
 ```
 
-La salida debe contener exactamente las combinaciones de versión, clúster y nodo definidas para el laboratorio.
+**Resultado esperado:** la repetición del `PUT` devuelve código `200 OK`, `result: updated` y `_version: 2`. El `GET` devuelve `found: true` y el contenido en `_source`.
 
-> **Interpretación:** La API raíz confirma la identidad del servidor que responde. No confirma por sí sola que todos los clientes, agentes, consultas, snapshots o funcionalidades de administración sean compatibles con otra generación.
+### Paso B3. Provocar un conflicto
 
----
-
-### Paso 3. Validar salud del clúster y topología de nodo único
-
-**Objetivo:** Confirmar que ambos clústeres tienen salud operativa y que su topología corresponde a un deployment de un solo nodo con `discovery.type=single-node`.
-
-**Instrucciones:**
-
-1. Consulte el estado de salud del clúster 7.17.29.
-
-   ```bash
-   curl -sS \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     -H "Accept: application/json" \
-     "http://localhost:9200/_cluster/health?pretty" \
-     | tee work/lab-02-00-01/03-es717-cluster-health.json \
-     | jq '{
-         cluster_name,
-         status,
-         number_of_nodes,
-         number_of_data_nodes,
-         active_primary_shards,
-         active_shards,
-         relocating_shards,
-         initializing_shards,
-         unassigned_shards,
-         timed_out
-       }'
-   ```
-
-2. Consulte el estado de salud del clúster 9.3.0.
-
-   ```bash
-   curl -sS \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     -H "Accept: application/json" \
-     "http://localhost:9201/_cluster/health?pretty" \
-     | tee work/lab-02-00-01/03-es930-cluster-health.json \
-     | jq '{
-         cluster_name,
-         status,
-         number_of_nodes,
-         number_of_data_nodes,
-         active_primary_shards,
-         active_shards,
-         relocating_shards,
-         initializing_shards,
-         unassigned_shards,
-         timed_out
-       }'
-   ```
-
-3. Consulte la configuración efectiva de descubrimiento en cada nodo.
-
-   ```bash
-   curl -sS \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9200/_nodes/settings?filter_path=nodes.*.name,nodes.*.settings.discovery.type" \
-     | tee work/lab-02-00-01/03-es717-node-settings.json \
-     | jq .
-
-   curl -sS \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_nodes/settings?filter_path=nodes.*.name,nodes.*.settings.discovery.type" \
-     | tee work/lab-02-00-01/03-es930-node-settings.json \
-     | jq .
-   ```
-
-4. Obtenga una vista legible de salud para evidencias rápidas.
-
-   ```bash
-   curl -sS \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9200/_cat/health?v" \
-     | tee work/lab-02-00-01/03-es717-cat-health.txt
-
-   curl -sS \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_cat/health?v" \
-     | tee work/lab-02-00-01/03-es930-cat-health.txt
-   ```
-
-**Resultado esperado:**
-
-- Cada clúster reporta `number_of_nodes: 1`.
-- Cada clúster reporta `number_of_data_nodes: 1` si el nodo tiene rol de datos.
-- El estado puede ser `green` si no hay réplicas no asignadas.
-- En un deployment de un solo nodo es frecuente observar estado `yellow` si existen índices configurados con réplicas, porque no hay un segundo nodo donde asignarlas.
-- `discovery.type` debe indicar `single-node`.
-
-**Verificación:**
-
-Compruebe que no existen shards en inicialización o reubicación:
-
-```bash
-jq '{cluster_name, status, number_of_nodes, initializing_shards, relocating_shards, unassigned_shards}' \
-  work/lab-02-00-01/03-es717-cluster-health.json \
-  work/lab-02-00-01/03-es930-cluster-health.json
+``` console
+PUT lab02-weblogs/_create/1
+{
+  "@timestamp": "2026-10-14T09:15:02Z",
+  "service": "checkout"
+}
 ```
 
-Registre si el estado es `yellow`. En este laboratorio, `yellow` no implica necesariamente una interrupción; debe justificarse con el número de réplicas no asignadas y la topología de nodo único.
+**Qué hace:** `_create` solo indexa si el identificador no existe.
 
----
+**Resultado esperado:** código `409 Conflict` con `version_conflict_engine_exception`.
 
-### Paso 4. Consultar y comparar licencia y capacidades X-Pack
+### Paso B4. Cargar más documentos con la Bulk API
 
-**Objetivo:** Identificar el tipo, estado y fecha de expiración de la licencia en ambos deployments, y observar diferencias de disponibilidad de APIs entre generaciones.
-
-**Instrucciones:**
-
-1. Consulte la License API en Elasticsearch 7.17.29.
-
-   ```bash
-   curl -sS \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     -H "Accept: application/json" \
-     "http://localhost:9200/_license?pretty" \
-     | tee work/lab-02-00-01/04-es717-license.json \
-     | jq '.license | {
-         uid,
-         type,
-         status,
-         issued_to,
-         issuer,
-         start_date_in_millis,
-         expiry_date_in_millis,
-         max_nodes,
-         max_resource_units
-       }'
-   ```
-
-2. Consulte la License API en Elasticsearch 9.3.0.
-
-   ```bash
-   curl -sS \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     -H "Accept: application/json" \
-     "http://localhost:9201/_license?pretty" \
-     | tee work/lab-02-00-01/04-es930-license.json \
-     | jq '.license | {
-         uid,
-         type,
-         status,
-         issued_to,
-         issuer,
-         start_date_in_millis,
-         expiry_date_in_millis,
-         max_nodes,
-         max_resource_units
-       }'
-   ```
-
-3. Consulte la API `_xpack` en Elasticsearch 7.17.29.
-
-   ```bash
-   curl -sS \
-     -o work/lab-02-00-01/04-es717-xpack.json \
-     -w "HTTP %{http_code}\n" \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     -H "Accept: application/json" \
-     "http://localhost:9200/_xpack"
-   ```
-
-4. Revise las categorías principales disponibles en la respuesta 7.17.29.
-
-   ```bash
-   jq 'keys' work/lab-02-00-01/04-es717-xpack.json
-   jq '{
-     build,
-     license,
-     features: (
-       .features
-       | with_entries(.value |= {
-           available,
-           enabled
-         })
-     )
-   }' work/lab-02-00-01/04-es717-xpack.json
-   ```
-
-5. Consulte `_xpack` en Elasticsearch 9.3.0 y registre tanto la respuesta como el código HTTP.
-
-   ```bash
-   curl -sS \
-     -D work/lab-02-00-01/04-es930-xpack-headers.txt \
-     -o work/lab-02-00-01/04-es930-xpack-body.json \
-     -w "HTTP %{http_code}\n" \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     -H "Accept: application/json" \
-     "http://localhost:9201/_xpack"
-   ```
-
-6. Si la respuesta de 9.3.0 es JSON, muestre su contenido.
-
-   ```bash
-   jq . work/lab-02-00-01/04-es930-xpack-body.json
-   ```
-
-7. Genere una tabla de comparación de licencia.
-
-   ```bash
-   {
-     echo -e "deployment\tversion\tlicense_type\tlicense_status\tissued_to"
-     printf "es717\t"
-     jq -r '[.license.type, .license.status, .license.issued_to] | @tsv' \
-       work/lab-02-00-01/04-es717-license.json
-     printf "es930\t"
-     jq -r '[.license.type, .license.status, .license.issued_to] | @tsv' \
-       work/lab-02-00-01/04-es930-license.json
-   } > work/lab-02-00-01/04-license-comparison.tsv
-
-   column -t -s $'\t' work/lab-02-00-01/04-license-comparison.tsv
-   ```
-
-**Resultado esperado:**
-
-- Las dos llamadas a `GET /_license` devuelven HTTP `200`.
-- Cada respuesta contiene un objeto `license` con campos como `type` y `status`.
-- En un entorno de laboratorio, la licencia suele ser `basic` y su estado suele ser `active`, aunque debe registrar el valor realmente observado.
-- Elasticsearch 7.17.29 normalmente expone información X-Pack mediante `GET /_xpack`.
-- En generaciones modernas, `GET /_xpack` puede devolver un error HTTP `404` debido a cambios o retirada de la API. Este resultado es una diferencia de compatibilidad que debe registrarse, no corregirse forzando una API obsoleta.
-
-**Verificación:**
-
-Confirme que ambas licencias tienen estado activo:
-
-```bash
-jq -r '.license.status' \
-  work/lab-02-00-01/04-es717-license.json \
-  work/lab-02-00-01/04-es930-license.json
+``` console
+POST lab02-weblogs/_bulk?refresh=wait_for
+{ "index": {} }
+{ "@timestamp": "2026-10-14T09:15:07Z", "service": "checkout", "client_ip": "187.141.22.10", "method": "POST", "url": "/api/cart", "status": 201, "bytes": 310, "response_time_ms": 88.2, "message": "POST /api/cart 201 88ms" }
+{ "index": {} }
+{ "@timestamp": "2026-10-14T09:16:31Z", "service": "catalog", "client_ip": "201.103.7.55", "method": "GET", "url": "/api/products", "status": 200, "bytes": 20480, "response_time_ms": 120.4, "message": "GET /api/products 200 120ms" }
+{ "index": {} }
+{ "@timestamp": "2026-10-14T09:17:45Z", "service": "catalog", "client_ip": "201.103.7.55", "method": "GET", "url": "/api/products/9999", "status": 404, "bytes": 512, "response_time_ms": 15.1, "message": "GET /api/products/9999 404 15ms product not found" }
+{ "index": {} }
+{ "@timestamp": "2026-10-14T09:18:12Z", "service": "payments", "client_ip": "148.202.90.3", "method": "POST", "url": "/api/pay", "status": 500, "bytes": 740, "response_time_ms": 1503.9, "message": "POST /api/pay 500 1503ms upstream timeout" }
+{ "index": {} }
+{ "@timestamp": "2026-10-14T09:19:03Z", "service": "payments", "client_ip": "148.202.90.3", "method": "POST", "url": "/api/pay", "status": 200, "bytes": 655, "response_time_ms": 310.7, "message": "POST /api/pay 200 310ms" }
 ```
 
-Documente el código HTTP obtenido para `_xpack` en 9.3.0. Si no es `200`, clasifique esta API como “requiere validación previa” o “no recomendada para automatización multi-versión” en la matriz final.
+**Qué hace:** carga 5 documentos en una sola petición. La Bulk API se estudia a detalle en el capítulo 4.
 
-> **Interpretación operativa:** La disponibilidad de una función depende de la versión, licencia, configuración y privilegios del usuario. No debe inferirse que una funcionalidad está habilitada únicamente porque existe una API o porque otro producto compatible implementa un endpoint de nombre similar.
+- NDJSON: un objeto JSON por línea, alternando la línea de acción y la del documento.
 
----
+- `{ "index": {} }`: acción de indexar; el índice viene de la ruta y el `_id` se genera solo.
 
-### Paso 5. Inspeccionar HTTP, roles de nodo e índices existentes
+- Verificar en la respuesta que aparezca `"errors": false`.
 
-**Objetivo:** Identificar los datos HTTP expuestos por cada nodo, los roles asignados y el estado de los índices actuales.
+### Paso B5. Consultar los documentos
 
-**Instrucciones:**
+``` console
+GET lab02-weblogs/_count
 
-1. Consulte los metadatos HTTP del nodo 7.17.29.
+GET lab02-weblogs/_search
+{
+  "query": { "match": { "message": "timeout" } }
+}
 
-   ```bash
-   curl -sS \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     -H "Accept: application/json" \
-     "http://localhost:9200/_nodes/http?pretty" \
-     | tee work/lab-02-00-01/05-es717-nodes-http.json \
-     | jq '{
-         cluster_name,
-         nodes: [
-           .nodes[]
-           | {
-               name,
-               roles,
-               version,
-               http: {
-                 bound_address: .http.bound_address,
-                 publish_address: .http.publish_address,
-                 max_content_length_in_bytes: .http.max_content_length_in_bytes
-               }
-             }
-         ]
-       }'
-   ```
-
-2. Consulte los metadatos HTTP del nodo 9.3.0.
-
-   ```bash
-   curl -sS \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     -H "Accept: application/json" \
-     "http://localhost:9201/_nodes/http?pretty" \
-     | tee work/lab-02-00-01/05-es930-nodes-http.json \
-     | jq '{
-         cluster_name,
-         nodes: [
-           .nodes[]
-           | {
-               name,
-               roles,
-               version,
-               http: {
-                 bound_address: .http.bound_address,
-                 publish_address: .http.publish_address,
-                 max_content_length_in_bytes: .http.max_content_length_in_bytes
-               }
-             }
-         ]
-       }'
-   ```
-
-3. Liste los índices del clúster 7.17.29.
-
-   ```bash
-   curl -sS \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9200/_cat/indices?v&expand_wildcards=all" \
-     | tee work/lab-02-00-01/05-es717-cat-indices.txt
-   ```
-
-4. Liste los índices del clúster 9.3.0.
-
-   ```bash
-   curl -sS \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_cat/indices?v&expand_wildcards=all" \
-     | tee work/lab-02-00-01/05-es930-cat-indices.txt
-   ```
-
-5. Obtenga una salida estructurada alternativa para facilitar una comparación posterior.
-
-   ```bash
-   curl -sS \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9200/_cat/indices?format=json&expand_wildcards=all" \
-     | jq '.' \
-     > work/lab-02-00-01/05-es717-indices.json
-
-   curl -sS \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_cat/indices?format=json&expand_wildcards=all" \
-     | jq '.' \
-     > work/lab-02-00-01/05-es930-indices.json
-   ```
-
-**Resultado esperado:**
-
-- Cada respuesta `_nodes/http` contiene un único nodo.
-- Los roles pueden diferir entre versiones debido a cambios de roles predeterminados o a la configuración declarada en Compose.
-- Las direcciones publicadas dentro de Docker pueden utilizar nombres de contenedor, direcciones privadas de la red Docker o ambas.
-- `GET /_cat/indices?v` devuelve una tabla; puede contener índices del sistema, índices creados en la práctica anterior o no contener índices de usuario.
-- Es normal que existan índices internos cuyo nombre comience por punto, por ejemplo `.kibana*` o índices de características del sistema.
-
-**Verificación:**
-
-Valide el número de nodos devuelto por la API:
-
-```bash
-jq '.nodes | length' work/lab-02-00-01/05-es717-nodes-http.json
-jq '.nodes | length' work/lab-02-00-01/05-es930-nodes-http.json
+GET lab02-weblogs/_search
+{
+  "query": { "term": { "status": 404 } }
+}
 ```
 
-Ambos comandos deben devolver `1`.
+**Qué hace:** cuenta los documentos y ejecuta dos búsquedas: una de texto sobre `message` y otra por valor exacto sobre `status`.
 
-> **Nota de seguridad:** Los índices de sistema no deben modificarse manualmente durante esta práctica. El objetivo es inventariarlos, no administrar recursos internos de Kibana o Elasticsearch.
+Campos de la respuesta de `_search`:
 
----
+- `took`: milisegundos que tardó la búsqueda.
 
-### Paso 6. Probar conectividad desde la red Docker
+- `timed_out`: si se agotó el tiempo límite.
 
-**Objetivo:** Confirmar que los nombres DNS internos de los contenedores se resuelven en `elastic-lab-net` y que la autenticación funciona desde un cliente ubicado en la misma red.
+- `_shards`: shards consultados y su resultado.
 
-**Instrucciones:**
+- `hits.total.value`: coincidencias totales.
 
-1. Verifique que la red existe.
+- `hits.hits[]._score`: relevancia calculada para cada documento.
 
-   ```bash
-   docker network inspect elastic-lab-net --format '{{.Name}}'
-   ```
+**Resultado esperado:** `_count` devuelve 6. Cada búsqueda devuelve 1 documento (el de `upstream timeout` y el de estado 404).
 
-2. Ejecute una consulta al endpoint interno de Elasticsearch 7.17.29 desde un contenedor temporal.
+### Paso B6. Revisar el mapping generado
 
-   ```bash
-   docker run --rm \
-     --network elastic-lab-net \
-     -e ELASTIC_PASSWORD="${ELASTIC_PASSWORD}" \
-     curlimages/curl:8.12.1 \
-     -sS \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     -H "Accept: application/json" \
-     http://es717-lab:9200/
-   ```
-
-3. Ejecute una consulta al endpoint interno de Elasticsearch 9.3.0 desde un contenedor temporal.
-
-   ```bash
-   docker run --rm \
-     --network elastic-lab-net \
-     -e ELASTIC_PASSWORD="${ELASTIC_PASSWORD}" \
-     curlimages/curl:8.12.1 \
-     -sS \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     -H "Accept: application/json" \
-     http://es930-lab:9200/
-   ```
-
-4. Guarde una evidencia resumida de ambas pruebas usando `jq`.
-
-   ```bash
-   docker run --rm \
-     --network elastic-lab-net \
-     -e ELASTIC_PASSWORD="${ELASTIC_PASSWORD}" \
-     curlimages/curl:8.12.1 \
-     -sS \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     http://es717-lab:9200/ \
-     | jq '{name, cluster_name, version: .version.number}' \
-     > work/lab-02-00-01/06-docker-to-es717.json
-
-   docker run --rm \
-     --network elastic-lab-net \
-     -e ELASTIC_PASSWORD="${ELASTIC_PASSWORD}" \
-     curlimages/curl:8.12.1 \
-     -sS \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     http://es930-lab:9200/ \
-     | jq '{name, cluster_name, version: .version.number}' \
-     > work/lab-02-00-01/06-docker-to-es930.json
-   ```
-
-**Resultado esperado:**
-
-- El contenedor temporal puede resolver `es717-lab` y `es930-lab`.
-- Ambas respuestas contienen el nombre de nodo, nombre de clúster y versión correspondiente.
-- El acceso interno usa el puerto de contenedor `9200`; no usa los puertos publicados del host `9200` y `9201`.
-
-**Verificación:**
-
-```bash
-cat work/lab-02-00-01/06-docker-to-es717.json
-cat work/lab-02-00-01/06-docker-to-es930.json
+``` console
+GET lab02-weblogs/_mapping
 ```
 
-Confirme que el nombre de clúster de cada respuesta corresponde al deployment esperado. Si una prueba devuelve información del clúster incorrecto, detenga la práctica y revise la configuración de red y de hosts de Kibana.
+**Qué hace:** muestra el mapping que Elasticsearch creó a partir del primer documento (mapeo dinámico). Comparar con esta tabla:
 
-> **Concepto aplicado:** La conectividad interna de Docker comprueba DNS y segmentación de red del laboratorio. Esta validación es útil para inventariar clientes potenciales, como Kibana, Beats, Elastic Agent, Logstash o aplicaciones que se ejecuten en la misma red.
+| **Campo**                             | **Tipo generado**             | **Observación**                                                                    |
+|---------------------------------------|-------------------------------|------------------------------------------------------------------------------------|
+| `@timestamp`                          | `date`                        | La cadena en formato ISO 8601 se detecta como fecha.                               |
+| `service`, `method`, `url`, `message` | `text` con subcampo `keyword` | Toda cadena genera `text` más un subcampo `.keyword` con `ignore_above: 256`.      |
+| `client_ip`                           | `text` con subcampo `keyword` | Una dirección IP no se reconoce como tipo `ip`; se corrige en el capítulo 3.       |
+| `status`, `bytes`                     | `long`                        | Un entero genera `long`. Un código HTTP se suele modelar como `keyword` o `short`. |
+| `response_time_ms`                    | `float`                       | Un decimal genera `float`.                                                         |
 
----
+Anotar qué campos modelarías distinto. El laboratorio 3.4 parte de este índice para definir un mapping explícito.
 
-### Paso 7. Verificar Kibana y la asociación correcta con Elasticsearch
+### Paso B7. Provocar errores y leer los códigos
 
-**Objetivo:** Confirmar la versión exacta de cada interfaz Kibana y verificar que cada instancia se comunica exclusivamente con Elasticsearch de su misma generación.
+``` console
+GET lab02-noexiste/_search
 
-**Instrucciones:**
-
-1. Abra Kibana 7.17.29 en un navegador:
-
-   ```text
-   http://localhost:5601
-   ```
-
-2. Inicie sesión con el usuario `elastic` y la contraseña definida en `.env`.
-
-3. En Kibana 7.17.29, abra **Dev Tools** y ejecute:
-
-   ```http
-   GET /
-   ```
-
-4. Registre los valores de:
-
-   - `name`
-   - `cluster_name`
-   - `version.number`
-   - `version.build_hash`
-
-5. En la misma interfaz, identifique la versión de Kibana desde el pie de página, la pantalla **Stack Management** o la página **About**, según la interfaz disponible.
-
-6. Abra Kibana 9.3.0 en una segunda pestaña:
-
-   ```text
-   http://localhost:5602
-   ```
-
-7. Inicie sesión y abra **Dev Tools**.
-
-8. Ejecute la misma consulta:
-
-   ```http
-   GET /
-   ```
-
-9. Registre los valores devueltos y la versión mostrada por Kibana.
-
-10. Guarde una evidencia manual en el siguiente archivo. Sustituya los marcadores por los valores observados.
-
-   ```bash
-   cat > work/lab-02-00-01/07-kibana-versiones.md <<'EOF'
-   # Validación de Kibana y Elasticsearch
-
-   | Interfaz | URL Kibana | Versión Kibana observada | Clúster devuelto por Dev Tools | Nodo devuelto | Versión Elasticsearch |
-   |---|---|---|---|---|---|
-   | Kibana 7 | http://localhost:5601 | COMPLETAR | COMPLETAR | COMPLETAR | COMPLETAR |
-   | Kibana 9 | http://localhost:5602 | COMPLETAR | COMPLETAR | COMPLETAR | COMPLETAR |
-
-   ## Criterio de asociación correcta
-
-   - Kibana 7 debe devolver `es717-lab-cluster` y Elasticsearch `7.17.29`.
-   - Kibana 9 debe devolver `es930-lab-cluster` y Elasticsearch `9.3.0`.
-   EOF
-   ```
-
-11. Edite el archivo con el editor disponible, por ejemplo:
-
-   ```bash
-   nano work/lab-02-00-01/07-kibana-versiones.md
-   ```
-
-**Resultado esperado:**
-
-- Kibana en `5601` muestra versión 7.17.29 o la versión exacta configurada para la generación 7.
-- Su consola Dev Tools devuelve información de `es717-lab-cluster`.
-- Kibana en `5602` muestra versión 9.3.0 o la versión exacta configurada para la generación 9.
-- Su consola Dev Tools devuelve información de `es930-lab-cluster`.
-- No debe existir una asociación cruzada entre Kibana 7.17.29 y Elasticsearch 9.3.0.
-
-**Verificación:**
-
-Revise el archivo creado:
-
-```bash
-cat work/lab-02-00-01/07-kibana-versiones.md
+POST lab02-weblogs/_doc
+{
+  "@timestamp": "2026-10-14T09:20:00Z",
+  "status": "no-es-un-numero"
+}
 ```
 
-Debe contener las dos asociaciones correctas.
+**Qué hace:** la primera petición consulta un índice que no existe; la segunda intenta guardar texto en un campo ya mapeado como `long`.
 
-> **Práctica no recomendada:** No configure Kibana 7.17.29 contra Elasticsearch 9.3.0 para “probar” compatibilidad. Kibana y Elasticsearch deben mantenerse en versiones compatibles, normalmente de la misma versión principal y, para operación predecible, de la misma versión exacta. Una conexión aparente no equivale a soporte oficial.
+- Primera petición: `404 Not Found` con `index_not_found_exception`.
 
----
+- Segunda petición: `400 Bad Request` con `document_parsing_exception` (en versiones anteriores aparecía como `mapper_parsing_exception`). El mapping, una vez creado, rechaza valores incompatibles.
 
-### Paso 8. Construir el inventario de endpoints y matriz de compatibilidad
+## Parte C: API Key restringida (25 min)
 
-**Objetivo:** Transformar las observaciones técnicas en un inventario operacional que distinga APIs comunes, elementos que requieren pruebas previas y prácticas no recomendadas.
+Hasta aquí todas las peticiones se hicieron con el usuario `elastic`, que es superusuario. En producción ese usuario no se usa para aplicaciones: se crean API Keys con los privilegios mínimos necesarios.
 
-**Instrucciones:**
+### Paso C1. Comprobar la identidad actual
 
-1. Cree un inventario de endpoints validados.
-
-   ```bash
-   cat > work/lab-02-00-01/08-inventario-endpoints.md <<'EOF'
-   # Inventario de endpoints y clientes potenciales
-
-   | Recurso | 7.17.29 | 9.3.0 | Finalidad | Evidencia |
-   |---|---|---|---|---|
-   | `GET /` | Validado | Validado | Identidad, versión y build | `02-es717-root.json`, `02-es930-root.json` |
-   | `GET /_cluster/health` | Validado | Validado | Salud de clúster y shards | `03-*-cluster-health.json` |
-   | `GET /_license` | Validado | Validado | Tipo y estado de licencia | `04-*-license.json` |
-   | `GET /_xpack` | Completar | Completar | Información histórica de características | `04-*-xpack*` |
-   | `GET /_nodes/http` | Validado | Validado | HTTP, nodo y roles | `05-*-nodes-http.json` |
-   | `GET /_cat/indices?v` | Validado | Validado | Inventario de índices | `05-*-cat-indices.txt` |
-   | Kibana Dev Tools | Validado | Validado | Cliente interactivo y diagnóstico | `07-kibana-versiones.md` |
-   | Cliente Docker temporal | Validado | Validado | DNS y conectividad interna | `06-docker-to-*.json` |
-
-   ## Clientes y agentes potenciales
-
-   | Cliente o agente | Riesgo principal | Validación requerida antes de uso |
-   |---|---|---|
-   | Kibana | Compatibilidad estricta con Elasticsearch | Misma generación y versión compatible |
-   | Elastic Agent / Beats | Integraciones, data streams, TLS y versión | Prueba de ingesta y plantillas |
-   | Logstash | Plugins, pipelines, autenticación y salida Elasticsearch | Prueba de pipeline y manejo de errores |
-   | Aplicación con cliente Elasticsearch | API REST, versión de cliente, serialización y autenticación | Pruebas de indexación, búsqueda y errores |
-   | Servicio compatible de terceros | Compatibilidad parcial de API y diferencias de producto | Matriz funcional, seguridad, snapshots y soporte |
-   EOF
-   ```
-
-2. Cree la matriz de compatibilidad inicial.
-
-   ```bash
-   cat > work/lab-02-00-01/08-matriz-compatibilidad.md <<'EOF'
-   # Matriz inicial de compatibilidad 7.17.29 y 9.3.0
-
-   | Área o función | Clasificación | Justificación y acción requerida |
-   |---|---|---|
-   | `GET /` | API común | Validada en ambos deployments; usar para identificación de versión y build. |
-   | `GET /_cluster/health` | API común | Validada en ambos deployments; interpretar `yellow` según réplicas y topología. |
-   | `GET /_license` | API común | Validada en ambos deployments; revisar permisos y estado de licencia. |
-   | `GET /_nodes/http` | API común | Validada en ambos deployments; los campos y roles pueden variar. |
-   | `GET /_cat/indices?v` | API común | Validada en ambos deployments; adecuada para inspección humana, no como contrato estable de automatización. |
-   | `GET /_xpack` | Requiere validación previa | Puede estar disponible en 7.17 y cambiar o no existir en generaciones modernas. No usar sin control de versión. |
-   | Kibana 7.17.29 con Elasticsearch 7.17.29 | Compatible en el laboratorio | Asociación esperada y validada mediante Dev Tools. |
-   | Kibana 9.3.0 con Elasticsearch 9.3.0 | Compatible en el laboratorio | Asociación esperada y validada mediante Dev Tools. |
-   | Kibana 7.17.29 con Elasticsearch 9.3.0 | No recomendado | Incompatibilidad entre generaciones; no configurar ni usar en producción. |
-   | Restauración de snapshots entre generaciones | Requiere validación previa | Depende de compatibilidad de índices, versiones, repositorio y ruta de actualización soportada. |
-   | Clientes de aplicación existentes | Requiere validación previa | Un `200` en una API no garantiza soporte para todas las consultas, opciones y errores. |
-   | Servicio compatible de terceros | Requiere validación previa | Confirmar Query DSL, seguridad, ILM, snapshots, agentes, dashboards y soporte contractual. |
-   EOF
-   ```
-
-3. Complete la fila correspondiente a `_xpack` con el resultado real observado en el paso 4. Puede editar el archivo con:
-
-   ```bash
-   nano work/lab-02-00-01/08-inventario-endpoints.md
-   nano work/lab-02-00-01/08-matriz-compatibilidad.md
-   ```
-
-4. Cree una lista breve de riesgos operacionales basada en la lección sobre modelos de servicio.
-
-   ```bash
-   cat > work/lab-02-00-01/08-riesgos-operacionales.md <<'EOF'
-   # Riesgos operacionales identificados
-
-   1. La compatibilidad de una API REST aislada no garantiza equivalencia funcional entre productos o generaciones.
-   2. Un servicio compatible puede diferir en licenciamiento, Query DSL, seguridad, plugins, snapshots, dashboards y calendario de versiones.
-   3. En un modelo self-managed, el equipo es responsable de versiones, TLS, backups, capacidad, salud, actualizaciones y procedimientos de recuperación.
-   4. La asociación cruzada de Kibana y Elasticsearch de versiones no compatibles es una práctica no recomendada.
-   5. Un clúster de un solo nodo no ofrece alta disponibilidad; las réplicas pueden quedar sin asignar.
-   EOF
-   ```
-
-**Resultado esperado:**
-
-- Existen tres documentos de trabajo:
-  - `08-inventario-endpoints.md`
-  - `08-matriz-compatibilidad.md`
-  - `08-riesgos-operacionales.md`
-- La matriz separa explícitamente APIs comunes, funcionalidades sujetas a validación y prácticas no recomendadas.
-- La documentación indica que una plataforma compatible no equivale automáticamente a Elasticsearch oficial ni garantiza compatibilidad total con Elastic Stack.
-
-**Verificación:**
-
-```bash
-ls -lh work/lab-02-00-01/08-*.md
-grep -n "No recomendado\|Requiere validación previa\|API común" \
-  work/lab-02-00-01/08-matriz-compatibilidad.md
+``` console
+GET _security/_authenticate
 ```
 
-Debe encontrar las tres clasificaciones solicitadas.
+**Qué hace:** devuelve quién es el usuario autenticado y cómo se autenticó.
 
----
+- `username`: `elastic`.
 
-## Validación y pruebas finales
+- `roles`: contiene `superuser`.
 
-Ejecute el siguiente bloque para realizar una validación resumida. El bloque no modifica la configuración ni crea índices.
+- `authentication_type`: `realm` (usuario y contraseña).
 
-```bash
-cd /opt/elastic-labs
-set -a
-source .env
-set +a
+### Paso C2. Crear la API Key
 
-echo "=== Versiones y clusters ==="
-for endpoint in http://localhost:9200 http://localhost:9201; do
-  curl -sS \
-    -u "elastic:${ELASTIC_PASSWORD}" \
-    "${endpoint}/" \
-    | jq -r '"endpoint='"${endpoint}"' cluster=\(.cluster_name) node=\(.name) version=\(.version.number)"'
-done
-
-echo
-echo "=== Salud ==="
-for endpoint in http://localhost:9200 http://localhost:9201; do
-  curl -sS \
-    -u "elastic:${ELASTIC_PASSWORD}" \
-    "${endpoint}/_cluster/health" \
-    | jq -r '"cluster=\(.cluster_name) status=\(.status) nodes=\(.number_of_nodes) unassigned=\(.unassigned_shards)"'
-done
-
-echo
-echo "=== Licencias ==="
-for endpoint in http://localhost:9200 http://localhost:9201; do
-  curl -sS \
-    -u "elastic:${ELASTIC_PASSWORD}" \
-    "${endpoint}/_license" \
-    | jq -r '"type=\(.license.type) status=\(.license.status) issued_to=\(.license.issued_to)"'
-done
-
-echo
-echo "=== Evidencias generadas ==="
-find work/lab-02-00-01 -maxdepth 1 -type f -printf '%f\n' | sort
+``` console
+POST _security/api_key
+{
+  "name": "lab02-weblogs-readonly",
+  "expiration": "7d",
+  "role_descriptors": {
+    "weblogs_reader": {
+      "cluster": [],
+      "indices": [
+        {
+          "names": ["lab02-weblogs"],
+          "privileges": ["read", "view_index_metadata"]
+        }
+      ]
+    }
+  },
+  "metadata": { "lab": "02" }
+}
 ```
 
-### Criterios de aceptación
+**Qué hace:** crea una credencial que solo puede leer el índice `lab02-weblogs`.
 
-La práctica se considera completada cuando se cumplen todos los criterios:
+Parámetros:
 
-- [ ] Los cuatro contenedores obligatorios están en ejecución.
-- [ ] Elasticsearch 7.17.29 responde por `localhost:9200`.
-- [ ] Elasticsearch 9.3.0 responde por `localhost:9201`.
-- [ ] Se registraron las respuestas de `GET /`, `GET /_cluster/health`, `GET /_license`, `GET /_xpack`, `GET /_nodes/http` y `GET /_cat/indices?v`.
-- [ ] Se identificó y documentó el comportamiento real de `_xpack` en ambas generaciones.
-- [ ] Se comprobó conectividad desde un cliente temporal en `elastic-lab-net`.
-- [ ] Kibana 7 está asociado a `es717-lab-cluster`.
-- [ ] Kibana 9 está asociado a `es930-lab-cluster`.
-- [ ] Se creó una matriz que clasifica APIs comunes, validaciones previas y prácticas no recomendadas.
-- [ ] No se ejecutó `docker compose down -v` ni se eliminaron volúmenes persistentes.
+- `name`: nombre descriptivo de la clave.
 
-## Resolución de problemas
+- `expiration`: vigencia. Si se omite, la clave no expira nunca; en laboratorios y aplicaciones conviene siempre fijarla.
 
-### Problema 1: `curl` devuelve HTTP 401 o `missing authentication credentials`
+- `role_descriptors`: privilegios de la clave. Si se omite, la clave hereda los privilegios del usuario que la crea (aquí, un superusuario). Los privilegios efectivos nunca superan los del creador.
 
-**Síntomas:**
+- `cluster`: privilegios a nivel de clúster. Vacío: ninguno.
 
-- La solicitud a `http://localhost:9200/` o `http://localhost:9201/` devuelve `401 Unauthorized`.
-- Aparece el mensaje `missing authentication credentials for REST request`.
-- Los comandos con `-u "elastic:${ELASTIC_PASSWORD}"` no funcionan.
+- `indices[].names`: índices o patrones a los que aplica. Se pueden usar comodines, como `lab02-*`.
 
-**Causa probable:**
+- `indices[].privileges`: `read` permite buscar, contar y recuperar documentos; `view_index_metadata` permite ver mappings y settings.
 
-La variable `ELASTIC_PASSWORD` no fue cargada desde `/opt/elastic-labs/.env`, el archivo contiene un nombre de variable diferente o la contraseña no coincide con la configurada en los contenedores.
+- `metadata`: datos propios para identificar la clave; no afectan a los permisos.
 
-**Solución:**
+La respuesta contiene `id`, `name`, `expiration`, `api_key` y `encoded`.
 
-1. Verifique permisos y existencia del archivo:
+- `encoded`: es el valor que se envía en el encabezado `Authorization`. Es la codificación en base64 de `id:api_key`.
 
-   ```bash
-   ls -l /opt/elastic-labs/.env
-   ```
+- Copiar `encoded` y `id` de inmediato: el secreto de la clave solo se devuelve en la creación.
 
-2. Cargue las variables nuevamente:
+### Paso C3. Usar la API Key en una consulta
 
-   ```bash
-   cd /opt/elastic-labs
-   set -a
-   source .env
-   set +a
-   ```
+En la terminal del equipo, sustituir `<ES_URL>` por el endpoint de Elasticsearch de la ficha (sin barra final) y `<ENCODED_KEY>` por el valor `encoded`:
 
-3. Compruebe que la variable existe sin mostrar el secreto:
-
-   ```bash
-   test -n "${ELASTIC_PASSWORD}" && echo "Variable cargada"
-   ```
-
-4. Revise el nombre de variable definido en `.env`. Si el archivo usa otro nombre, adapte los comandos o exporte temporalmente la variable correcta.
-
-5. No cambie credenciales ni recree volúmenes durante esta práctica sin autorización del instructor.
-
-### Problema 2: El clúster aparece en estado `yellow` y existen shards sin asignar
-
-**Síntomas:**
-
-- `GET /_cluster/health` devuelve `"status": "yellow"`.
-- El campo `unassigned_shards` es mayor que cero.
-- `_cat/health?v` muestra shards no asignados.
-
-**Causa probable:**
-
-El laboratorio usa un clúster de un solo nodo. Si algún índice tiene al menos una réplica configurada, Elasticsearch no puede asignar esa réplica al mismo nodo donde se encuentra el shard primario.
-
-**Solución:**
-
-1. Confirme la topología de un solo nodo:
-
-   ```bash
-   curl -sS \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     http://localhost:9200/_cluster/health \
-     | jq '{cluster_name, number_of_nodes, status, unassigned_shards}'
-   ```
-
-2. Identifique los shards no asignados:
-
-   ```bash
-   curl -sS \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9200/_cat/shards?v"
-   ```
-
-3. Registre el estado como una limitación esperada de disponibilidad en un entorno de laboratorio de nodo único.
-
-4. No reduzca réplicas de índices de sistema ni cambie configuraciones globales durante esta práctica. La finalidad es diagnosticar y documentar la condición, no alterar la línea base.
-
-## Limpieza
-
-No elimine contenedores, redes ni volúmenes persistentes. La siguiente práctica reutilizará los deployments y las evidencias generadas.
-
-Puede cerrar las pestañas de Kibana y eliminar únicamente contenedores temporales si alguno quedó detenido:
-
-```bash
-docker container prune -f
+``` console
+curl.exe -i -H "Authorization: ApiKey <ENCODED_KEY>" "<ES_URL>/lab02-weblogs/_count?pretty"
 ```
 
-Compruebe que los servicios principales continúan en ejecución:
+Parámetros:
 
-```bash
-cd /opt/elastic-labs
-docker compose ps
+- `curl.exe`: en macOS y Linux se escribe `curl`.
+
+- `-i`: incluye en la salida la línea de estado y los encabezados HTTP.
+
+- `-H "Authorization: ApiKey ..."`: encabezado de autenticación con la clave.
+
+- `?pretty`: formatea el JSON de la respuesta.
+
+**Resultado esperado:** `HTTP/2 200` y `"count" : 6`.
+
+### Paso C4. Comprobar los límites de la clave
+
+``` console
+curl.exe -i -X DELETE -H "Authorization: ApiKey <ENCODED_KEY>" "<ES_URL>/lab02-weblogs/_doc/1"
+
+curl.exe -i -H "Authorization: ApiKey <ENCODED_KEY>" "<ES_URL>/lab01-demo/_count"
+
+curl.exe -i "<ES_URL>/"
 ```
 
-Conserve el directorio de evidencias:
+**Qué hace:** prueba tres situaciones que deben fallar.
 
-```text
-/opt/elastic-labs/work/lab-02-00-01
+- Borrar un documento: `403 Forbidden` con `security_exception`. La clave tiene lectura, no escritura.
+
+- Leer otro índice: `403 Forbidden`. La clave solo cubre `lab02-weblogs`. (Se obtiene el mismo resultado si el índice ya no existe.)
+
+- Petición sin credenciales: `401 Unauthorized`. No se envió ningún encabezado de autenticación.
+
+Regla para recordar: **401** significa que no se sabe quién eres; **403** significa que se sabe quién eres, pero no tienes permiso.
+
+### Paso C5. Verificar la identidad de la clave
+
+``` console
+curl.exe -H "Authorization: ApiKey <ENCODED_KEY>" "<ES_URL>/_security/_authenticate?pretty"
 ```
 
-## Resumen
+**Qué hace:** repite el paso C1, ahora con la clave.
 
-En esta práctica se validó la identidad técnica, conectividad, salud, licencia y exposición HTTP de Elasticsearch 7.17.29 y 9.3.0. También se comprobó que cada Kibana está asociado al deployment de su misma generación y se documentaron diferencias de comportamiento, particularmente en APIs que pueden cambiar o desaparecer entre versiones.
+**Resultado esperado:** `authentication_type` es `api_key` y aparece el nombre `lab02-weblogs-readonly` en `api_key.name`.
 
-La línea base obtenida permite tomar decisiones informadas antes de incorporar datos, agentes, clientes de aplicación, snapshots o procedimientos de actualización. El hallazgo principal es que conectividad HTTP satisfactoria no equivale a compatibilidad completa: versiones, licencias, APIs, seguridad, clientes, snapshots y operaciones deben evaluarse explícitamente.
+### Paso C6. Listar y revocar la clave
 
-### Recursos sugeridos
+``` console
+GET _security/api_key?name=lab02-weblogs-readonly
 
-- Documentación de Elasticsearch: API raíz, Cluster Health API, License API y Nodes Info API.
-- Documentación de compatibilidad entre Elasticsearch y Kibana.
-- Documentación de Elastic Cloud Hosted y modelo de responsabilidad compartida.
-- Documentación de migración y compatibilidad de snapshots antes de cualquier actualización entre versiones principales.
+DELETE _security/api_key
+{
+  "ids": ["<ID_DE_LA_CLAVE>"]
+}
+```
+
+**Qué hace:** la primera petición muestra los metadatos de la clave (`id`, `creation`, `expiration`, `invalidated`). La segunda la invalida.
+
+- `ids`: lista de identificadores a invalidar. Alternativamente, se puede usar `name` para invalidar por nombre.
+
+- La respuesta incluye `invalidated_api_keys` con los identificadores revocados.
+
+- Las claves también se administran desde Kibana: Stack Management, sección Security, **API keys**.
+
+Repetir el paso C3. **Resultado esperado:** `401 Unauthorized`. La clave ya no es válida.
+
+## Limpieza y estado final
+
+Este laboratorio no requiere borrar índices. La API Key de prueba quedó invalidada en el paso C6.
+
+| **Elemento**                                  | **Se conserva** | **Lo reutiliza**                                                 |
+|-----------------------------------------------|-----------------|------------------------------------------------------------------|
+| Deployment propio y ficha ampliada            | Sí              | Todos los laboratorios                                           |
+| `lab02-weblogs` con 6 documentos              | Sí              | Laboratorio 3.4 (comparar mapeo dinámico y explícito, analyzers) |
+| `orders-shared` y sus aliases (Laboratorio 1) | Sí              | Laboratorio 7.4                                                  |
+| API Key `lab02-weblogs-readonly`              | No (invalidada) | Solo se usó para practicar                                       |
+
+Verificación final:
+
+``` console
+GET _cat/indices/lab02-*,orders-*?v&h=index,health,pri,rep,docs.count
+```
+
+Debe verse `lab02-weblogs` con 6 documentos y `orders-shared` con los documentos del Laboratorio 1.
+
+## Preguntas de discusión
+
+- ¿Por qué conviene no usar el usuario `elastic` en aplicaciones y preferir API Keys?
+
+- ¿Qué privilegios tendría una API Key creada sin `role_descriptors` por un superusuario? ¿Es una buena práctica?
+
+- ¿Qué diferencia práctica hay entre recibir un 401 y un 403?
+
+- ¿Qué problemas esperas con `client_ip` como `text` y con `status` como `long`?
+
+- Si la prueba gratuita vence antes de terminar el curso, ¿qué se pierde y qué se puede recuperar?
+
+## Resultado final
+
+Al terminar el laboratorio, el entorno debe quedar como se muestra en la imagen: lo que se conserva, cómo verificarlo y lo que se elimina.
+
+![Resultado final del laboratorio 2: Desplegar y comprobar un clúster en la nube](imagenes/lab02_resultado_final.png)

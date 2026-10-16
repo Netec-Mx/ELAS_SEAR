@@ -1,1383 +1,612 @@
-# Ruta de actualización desde 7.17 hacia 8.19 y posteriormente hacia 9.x, utilizando 9.3 como versión objetivo
+# Laboratorio 9: Simular una migración y ejecutar un runbook
 
-## Metadatos
+- **Capítulo:** 9. Mantenimiento, migraciones y mejores prácticas operativas
 
-| Campo | Valor |
-|---|---|
-| Duración | 65 minutos |
-| Complejidad | Difícil |
-| Nivel de Bloom | Aplicar |
+- **Duración:** 54 min
 
-## Descripción general
+- **Entorno:** Elastic Cloud Hosted (cuenta propia), Elasticsearch 9.x, Kibana Dev Tools y una terminal
 
-En esta práctica se ensaya una migración paralela de datos desde Elasticsearch 7.17.29 hacia Elasticsearch 8.19.0 y, posteriormente, hacia Elasticsearch 9.3.0. La ruta utiliza snapshots verificables para los datos de Elasticsearch y exportación/importación controlada para los objetos guardados de Kibana.
+- **Dependencias:** Laboratorio 3 (`weblogs-v1`, alias `weblogs` y templates), Laboratorio 4 (`weblogs-pipeline`, 5006 documentos). Recomendado: Laboratorio 8 (dashboard y data view `weblogs`).
 
-El resultado será un runbook técnico con evidencias de estado, snapshots, restauraciones, validaciones funcionales, controles de seguridad y criterios de rollback. No se realiza una actualización binaria in-place: los clústeres de destino se crean en paralelo para reducir el riesgo y facilitar la recuperación.
+## Objetivo
 
-## Objetivos de aprendizaje
+Simular una migración sin tiempo de inactividad dentro de un clúster 9.x: un cambio de mapping que no se puede aplicar en el lugar se resuelve con un índice nuevo, `_reindex` y un cambio atómico de alias. Después se ejecuta un runbook de verificación diaria, se atiende un incidente inducido y se automatiza la comprobación con un script. Al terminar, el participante podrá:
 
-Al finalizar la práctica, podrá:
+- Revisar la preparación previa a un cambio: versión, salud, versión de creación de los índices, deprecaciones y snapshot.
 
-- [ ] Ejecutar la ruta compatible `7.17.29 → 8.19.0 → 9.3.0` mediante snapshots y restauraciones controladas.
-- [ ] Crear, verificar y documentar los snapshots `preupgrade-717-001` y `preupgrade-819-001`.
-- [ ] Validar índices, data streams, ILM, seguridad, consultas DSL, KQL y ES|QL después de cada transición.
-- [ ] Diferenciar la migración de datos de Elasticsearch de la migración de objetos guardados de Kibana.
-- [ ] Elaborar un runbook con decisiones operativas, criterios de aceptación y rollback.
+- Reconocer qué cambios de mapping exigen un reindex y cuáles no.
 
-## Prerrequisitos
+- Migrar con `_reindex` asíncrono, completar el delta con una segunda pasada y cambiar el alias de forma atómica, con ensayo de rollback.
 
-### Conocimientos requeridos
+- Ejecutar un runbook con pasos, resultado esperado y acción si falla.
 
-- Prácticas 6, 7 y 8 completadas.
-- Uso básico de Docker Compose, `curl`, `jq` y APIs REST de Elasticsearch.
-- Conocimientos de snapshots, repositorios `fs`, ILM, data streams y control de acceso basado en roles.
-- Comprensión de que un snapshot no equivale a una reversión binaria de una versión mayor.
+- Automatizar una comprobación de salud con un script y un código de salida.
 
-### Acceso y estado inicial requeridos
+Alcance: la ruta de actualización desde 7.17 se estudia de forma conceptual en el capítulo. Este laboratorio no usa 7.17; el mismo patrón de reindex y alias se aplica a índices antiguos que deben migrarse antes de pasar a 9.x.
 
-- Acceso con privilegios `sudo` al host Linux.
-- Directorio de trabajo obligatorio: `/opt/elastic-labs`.
-- Docker Engine y Docker Compose plugin operativos.
-- Al menos 30 GB adicionales disponibles antes de descargar las imágenes 8.19.0 y 9.3.0.
-- Datos disponibles en:
-  - `logs-app-lab-v1`
-  - `logs-ops-lab`
-- Política ILM disponible: `logs-ops-ilm-v1`.
-- Roles y consultas guardadas de prácticas anteriores documentados.
-- Puertos disponibles: `9200`, `9201`, `5601`, `5602` y `5603`.
+## Requisitos
 
-> **Importante:** No ejecute `docker compose down -v`. La opción `-v` eliminaría volúmenes y destruiría el estado necesario para la continuidad del laboratorio.
+- `GET _alias/weblogs` muestra `weblogs-v1`, y `GET weblogs/_count` devuelve 5006.
 
-## Entorno de laboratorio
+- Existen `weblogs-settings`, `weblogs-mappings`, `weblogs-template` y el pipeline `weblogs-pipeline`.
 
-### Recursos recomendados
+- Una terminal con `bash` (Linux, macOS o WSL) o con PowerShell (Windows) para la Parte E.
 
-| Recurso | Mínimo | Recomendado |
-|---|---:|---:|
-| CPU | 4 vCPU | 6 vCPU |
-| RAM | 16 GB | 24 GB |
-| Espacio SSD libre | 40 GB | 60 GB |
-| Sistema operativo | Ubuntu Server/Desktop compatible | Ubuntu 24.04 LTS |
-| `vm.max_map_count` | `262144` | `262144` |
+- La dirección de Elasticsearch (`<ES_URL>`) anotada en la ficha del deployment.
 
-### Componentes y puertos
+## Distribución del tiempo
 
-| Componente | Contenedor | Versión | Puerto host |
-|---|---|---:|---:|
-| Elasticsearch origen | `es717-lab` | 7.17.29 | `9200` |
-| Kibana origen | `kibana717-lab` | 7.17.29 | `5601` |
-| Elasticsearch intermedio | `es819-lab` | 8.19.0 | `9202` |
-| Kibana intermedio | `kibana819-lab` | 8.19.0 | `5603` |
-| Elasticsearch destino | `es930-lab` | 9.3.0 | `9201` |
-| Kibana destino | `kibana930-lab` | 9.3.0 | `5602` |
+| **Parte** | **Contenido**                                               | **Tiempo** |
+|-----------|-------------------------------------------------------------|------------|
+| Parte A   | Revisión previa: versión, índices, deprecaciones y snapshot | 8 min      |
+| Parte B   | El cambio que no se puede hacer en el lugar                 | 6 min      |
+| Parte C   | Migración con reindex y cambio de alias                     | 16 min     |
+| Parte D   | Runbook de verificación diaria e incidente inducido         | 14 min     |
+| Parte E   | Automatización con un script                                | 6 min      |
+| Parte F   | Documentar el runbook y limpiar                             | 4 min      |
 
-### Clústeres, red y volúmenes
+## Convenciones
 
-| Elemento | Valor |
-|---|---|
-| Red Docker | `elastic-lab-net` |
-| Clúster 7.17 | `es717-lab-cluster` |
-| Nodo 7.17 | `es717-node-1` |
-| Clúster 9.3 | `es930-lab-cluster` |
-| Nodo 9.3 | `es930-node-1` |
-| Volumen Elasticsearch 7.17 | `es717-data` |
-| Volumen Elasticsearch 9.3 | `es930-data` |
-| Volumen Kibana 7.17 | `kibana717-data` |
-| Volumen Kibana 9.3 | `kibana930-data` |
-| Directorio de evidencias | `/opt/elastic-labs/work` |
-| Snapshots de 7.17 | `/opt/elastic-labs/snapshots/717` |
-| Snapshots de 8.19 | `/opt/elastic-labs/snapshots/819` |
+- Los bloques con `GET`, `PUT`, `POST` o `DELETE` se ejecutan en Dev Tools. Los de la Parte E se ejecutan en la terminal.
 
-> **Nota de seguridad:** El laboratorio usa autenticación básica por HTTP local para simplificar las validaciones de migración. En producción, habilite TLS HTTP y TLS de transporte, gestione certificados válidos y no reutilice la contraseña del laboratorio.
+- Cada paso importante indica el resultado esperado. Si no coincide, no se continúa: se aplica el criterio de un runbook (detenerse y diagnosticar).
 
----
+- Los nombres `weblogs-v1` y `weblogs-v2` son versiones físicas; las aplicaciones usan siempre el alias `weblogs`.
 
-## Procedimiento paso a paso
+## Parte A: revisión previa (8 min)
 
-### Paso 1. Preparar el directorio, credenciales y Docker Compose
+### Paso A1. Versión, salud e índices
 
-**Objetivo:** Preparar una configuración reproducible para los tres entornos Elasticsearch y sus instancias Kibana asociadas.
+``` console
+GET /?filter_path=version.number,version.lucene_version
 
-**Instrucciones:**
+GET _cluster/health?filter_path=status,number_of_nodes,unassigned_shards
 
-1. Cree la estructura obligatoria de directorios y configure el parámetro del kernel requerido por Elasticsearch.
+GET _cat/indices/weblogs*?v&h=health,index,pri,rep,docs.count,store.size
 
-   ```bash
-   sudo mkdir -p /opt/elastic-labs/{work,snapshots/717,snapshots/819}
-   sudo chown -R "$USER":"$USER" /opt/elastic-labs
+GET _alias/weblogs
 
-   echo "vm.max_map_count=262144" | sudo tee /etc/sysctl.d/99-elastic-labs.conf
-   sudo sysctl --system
-   ```
-
-2. Confirme el valor aplicado y el espacio disponible.
-
-   ```bash
-   sysctl vm.max_map_count
-   df -h /opt
-   docker version --format '{{.Server.Version}}'
-   docker compose version
-   ```
-
-3. Cree el archivo de variables con permisos restrictivos.
-
-   ```bash
-   cat > /opt/elastic-labs/.env <<'EOF'
-   ELASTIC_PASSWORD=ElasticLab_2026!
-   KIBANA_SYSTEM_PASSWORD=KibanaSystemLab_2026!
-   EOF
-
-   chmod 0600 /opt/elastic-labs/.env
-   ```
-
-4. Cree el archivo `/opt/elastic-labs/compose.yaml`.
-
-   ```bash
-   cat > /opt/elastic-labs/compose.yaml <<'EOF'
-   services:
-     es717-lab:
-       image: docker.elastic.co/elasticsearch/elasticsearch:7.17.29
-       container_name: es717-lab
-       environment:
-         - node.name=es717-node-1
-         - cluster.name=es717-lab-cluster
-         - discovery.type=single-node
-         - ES_JAVA_OPTS=-Xms1g -Xmx1g
-         - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
-         - xpack.security.enabled=true
-         - xpack.security.http.ssl.enabled=false
-         - xpack.security.transport.ssl.enabled=false
-         - path.repo=/usr/share/elasticsearch/snapshots
-       ports:
-         - "9200:9200"
-       volumes:
-         - es717-data:/usr/share/elasticsearch/data
-         - /opt/elastic-labs/snapshots:/usr/share/elasticsearch/snapshots
-       networks:
-         - elastic-lab-net
-
-     kibana717-lab:
-       image: docker.elastic.co/kibana/kibana:7.17.29
-       container_name: kibana717-lab
-       depends_on:
-         - es717-lab
-       environment:
-         - ELASTICSEARCH_HOSTS=http://es717-lab:9200
-         - ELASTICSEARCH_USERNAME=kibana_system
-         - ELASTICSEARCH_PASSWORD=${KIBANA_SYSTEM_PASSWORD}
-       ports:
-         - "5601:5601"
-       volumes:
-         - kibana717-data:/usr/share/kibana/data
-       networks:
-         - elastic-lab-net
-
-     es819-lab:
-       image: docker.elastic.co/elasticsearch/elasticsearch:8.19.0
-       container_name: es819-lab
-       profiles: ["upgrade819"]
-       environment:
-         - node.name=es819-node-1
-         - cluster.name=es819-lab-cluster
-         - discovery.type=single-node
-         - ES_JAVA_OPTS=-Xms1g -Xmx1g
-         - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
-         - xpack.security.enabled=true
-         - xpack.security.http.ssl.enabled=false
-         - xpack.security.transport.ssl.enabled=false
-         - path.repo=/usr/share/elasticsearch/snapshots
-       ports:
-         - "9202:9200"
-       volumes:
-         - /opt/elastic-labs/snapshots:/usr/share/elasticsearch/snapshots
-       networks:
-         - elastic-lab-net
-
-     kibana819-lab:
-       image: docker.elastic.co/kibana/kibana:8.19.0
-       container_name: kibana819-lab
-       profiles: ["upgrade819"]
-       depends_on:
-         - es819-lab
-       environment:
-         - ELASTICSEARCH_HOSTS=http://es819-lab:9200
-         - ELASTICSEARCH_USERNAME=kibana_system
-         - ELASTICSEARCH_PASSWORD=${KIBANA_SYSTEM_PASSWORD}
-       ports:
-         - "5603:5601"
-       networks:
-         - elastic-lab-net
-
-     es930-lab:
-       image: docker.elastic.co/elasticsearch/elasticsearch:9.3.0
-       container_name: es930-lab
-       environment:
-         - node.name=es930-node-1
-         - cluster.name=es930-lab-cluster
-         - discovery.type=single-node
-         - ES_JAVA_OPTS=-Xms1g -Xmx1g
-         - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
-         - xpack.security.enabled=true
-         - xpack.security.http.ssl.enabled=false
-         - xpack.security.transport.ssl.enabled=false
-         - path.repo=/usr/share/elasticsearch/snapshots
-       ports:
-         - "9201:9200"
-       volumes:
-         - es930-data:/usr/share/elasticsearch/data
-         - /opt/elastic-labs/snapshots:/usr/share/elasticsearch/snapshots
-       networks:
-         - elastic-lab-net
-
-     kibana930-lab:
-       image: docker.elastic.co/kibana/kibana:9.3.0
-       container_name: kibana930-lab
-       depends_on:
-         - es930-lab
-       environment:
-         - ELASTICSEARCH_HOSTS=http://es930-lab:9200
-         - ELASTICSEARCH_USERNAME=kibana_system
-         - ELASTICSEARCH_PASSWORD=${KIBANA_SYSTEM_PASSWORD}
-       ports:
-         - "5602:5601"
-       volumes:
-         - kibana930-data:/usr/share/kibana/data
-       networks:
-         - elastic-lab-net
-
-   networks:
-     elastic-lab-net:
-       name: elastic-lab-net
-
-   volumes:
-     es717-data:
-       name: es717-data
-     es930-data:
-       name: es930-data
-     kibana717-data:
-       name: kibana717-data
-     kibana930-data:
-       name: kibana930-data
-   EOF
-   ```
-
-5. Descargue las imágenes y arranque únicamente el entorno de origen 7.17.
-
-   ```bash
-   cd /opt/elastic-labs
-   docker compose pull
-   docker compose up -d es717-lab kibana717-lab
-   ```
-
-6. Espere a que Elasticsearch 7.17 responda.
-
-   ```bash
-   source /opt/elastic-labs/.env
-
-   until curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     http://localhost:9200/_cluster/health | jq -e '.status' >/dev/null; do
-     echo "Esperando Elasticsearch 7.17..."
-     sleep 5
-   done
-   ```
-
-7. Establezca la contraseña del usuario de servicio de Kibana si todavía no está configurada.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -X POST "http://localhost:9200/_security/user/kibana_system/_password" \
-     -H 'Content-Type: application/json' \
-     -d "{\"password\":\"${KIBANA_SYSTEM_PASSWORD}\"}" | jq
-   ```
-
-8. Reinicie Kibana 7.17 para que vuelva a autenticarse.
-
-   ```bash
-   docker compose restart kibana717-lab
-   ```
-
-**Resultado esperado:**
-
-- `vm.max_map_count` muestra `262144`.
-- El archivo `.env` tiene permisos `-rw-------`.
-- Los contenedores `es717-lab` y `kibana717-lab` están en estado `Up`.
-- Elasticsearch 7.17 responde en `http://localhost:9200`.
-
-**Verificación:**
-
-```bash
-curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-  http://localhost:9200 | jq '{cluster_name, name, version: .version.number}'
-
-docker compose ps
+GET weblogs-v1/_settings?filter_path=*.settings.index.version.created,*.settings.index.creation_date
 ```
 
-La salida debe incluir:
+**Qué hace:** recoge el estado de partida: versión del clúster, salud, índices del curso, a qué índice apunta el alias y con qué versión se creó `weblogs-v1`.
 
-```json
+- `version.number`: versión de Elasticsearch (9.x). Anótala.
+
+- `unassigned_shards`: debe ser 0. Un clúster que no está sano no se toca.
+
+- `index.version.created`: identificador numérico de la versión con la que se creó el índice. Los dígitos son mayor, menor y parche; por ejemplo, `9000099` es 9.0.0. Un índice creado en 7.x no es compatible con 9.x y debe reindexarse, archivarse o eliminarse antes de actualizar.
+
+- `creation_date`: milisegundos desde 1970 (hora UTC).
+
+**Resultado esperado:** `status` `green`, el alias `weblogs` apuntando a `weblogs-v1` con 5006 documentos, y un `version.created` que empieza con 9.
+
+### Paso A2. Deprecaciones y Upgrade Assistant
+
+``` console
+GET _migration/deprecations
+
+GET _migration/system_features
+```
+
+**Qué hace:** la primera petición devuelve el informe de funciones obsoletas que usa el Upgrade Assistant: settings de clúster y de nodo, settings de índices, templates, entre otros. La segunda indica si los índices de sistema (Kibana, Fleet, seguridad) están listos para migrar.
+
+- `migration_status`: estado de cada característica del sistema. `NO_MIGRATION_NEEDED` es lo normal.
+
+- Cada deprecación incluye `level` (`warning` o `critical`), el mensaje, una URL a la documentación y los detalles.
+
+- Un deployment recién creado en 9.x suele devolver poco o nada. Lo importante del paso es saber leer el informe antes de un upgrade real: lo `critical` bloquea la actualización.
+
+1.  En Kibana, abrir **Stack Management** y luego **Upgrade Assistant**.
+
+2.  Revisar el resumen y las secciones de deprecaciones de Elasticsearch y de Kibana.
+
+3.  Anotar el estado: cuántos problemas críticos y cuántas advertencias hay.
+
+### Paso A3. Snapshot previo al cambio
+
+``` console
+PUT _snapshot/found-snapshots/lab09-pre-migracion?wait_for_completion=true
 {
-  "cluster_name": "es717-lab-cluster",
-  "name": "es717-node-1",
-  "version": "7.17.29"
+  "indices": ["weblogs-v1"],
+  "include_global_state": false,
+  "metadata": { "motivo": "antes de cambiar el mapping de response_time_ms" }
 }
 ```
 
----
+**Qué hace:** toma un snapshot manual de `weblogs-v1`. Es la red de seguridad de cualquier cambio: si algo sale mal, se puede restaurar (laboratorio 7). **Resultado esperado:** `"state": "SUCCESS"`.
 
-### Paso 2. Crear la línea base y revisar la preparación en Elasticsearch 7.17
+## Parte B: el cambio que no se puede hacer en el lugar (6 min)
 
-**Objetivo:** Confirmar que el entorno origen es estable, inventariar los datos de laboratorio y recopilar evidencias previas a la actualización.
+Situación: el equipo de plataforma quiere reducir el almacenamiento de `response_time_ms`. Los datos ya vienen con una sola cifra decimal, por lo que un `scaled_float` con factor 10 (precisión de 0,1 ms) guarda la misma información como un entero y evita las imprecisiones de `float` (un valor como 189.8 se guarda en `float` como 189.80000305…).
 
-**Instrucciones:**
+### Paso B1. Intentar el cambio en el lugar
 
-1. Defina funciones de acceso para reducir errores durante la práctica.
-
-   ```bash
-   cd /opt/elastic-labs
-   source .env
-
-   api717() {
-     curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-       -H 'Content-Type: application/json' "$@"
-   }
-
-   api819() {
-     curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-       -H 'Content-Type: application/json' "$@"
-   }
-
-   api930() {
-     curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-       -H 'Content-Type: application/json' "$@"
-   }
-   ```
-
-2. Recopile la línea base operativa del clúster 7.17.
-
-   ```bash
-   api717 "http://localhost:9200/_cluster/health?pretty" \
-     | tee work/717-cluster-health-pre.json
-
-   api717 "http://localhost:9200/_cat/nodes?v" \
-     | tee work/717-nodes-pre.txt
-
-   api717 "http://localhost:9200/_cat/indices?v&expand_wildcards=all" \
-     | tee work/717-indices-pre.txt
-
-   api717 "http://localhost:9200/_cat/shards?v" \
-     | tee work/717-shards-pre.txt
-
-   api717 "http://localhost:9200/_cat/allocation?v" \
-     | tee work/717-allocation-pre.txt
-
-   api717 "http://localhost:9200/_nodes/stats/jvm,fs,indices?pretty" \
-     | tee work/717-node-stats-pre.json
-   ```
-
-3. Verifique explícitamente que no existan shards no asignados.
-
-   ```bash
-   api717 "http://localhost:9200/_cat/shards?h=index,shard,prirep,state,unassigned.reason" \
-     | awk '$4 == "UNASSIGNED" {print}'
-   ```
-
-4. Revise los índices y data streams de laboratorio.
-
-   ```bash
-   api717 "http://localhost:9200/_cat/indices/logs-app-lab-v1?v"
-   api717 "http://localhost:9200/_data_stream/logs-ops-lab?pretty" \
-     | tee work/717-data-stream-pre.json
-
-   api717 "http://localhost:9200/logs-app-lab-v1/_count?pretty" \
-     | tee work/717-count-app-pre.json
-
-   api717 "http://localhost:9200/logs-ops-lab/_count?pretty" \
-     | tee work/717-count-ops-pre.json
-   ```
-
-5. Revise la política ILM y el estado del ciclo de vida del data stream.
-
-   ```bash
-   api717 "http://localhost:9200/_ilm/policy/logs-ops-ilm-v1?pretty" \
-     | tee work/717-ilm-policy.json
-
-   api717 "http://localhost:9200/logs-ops-lab/_ilm/explain?pretty" \
-     | tee work/717-ilm-explain.json
-   ```
-
-6. Revise la versión de creación de los índices de laboratorio. Los índices creados en 6.x o versiones anteriores requieren reindexación antes de una actualización mayor.
-
-   ```bash
-   api717 "http://localhost:9200/logs-app-lab-v1/_settings?filter_path=*.settings.index.version.created&pretty" \
-     | tee work/717-created-version-app.json
-
-   api717 "http://localhost:9200/.ds-logs-ops-lab-*/_settings?expand_wildcards=all&filter_path=*.settings.index.version.created&pretty" \
-     | tee work/717-created-version-ops.json
-   ```
-
-7. Consulte avisos de deprecación disponibles en 7.17.
-
-   ```bash
-   api717 "http://localhost:9200/_migration/deprecations?pretty" \
-     | tee work/717-deprecations.json
-   ```
-
-8. Abra Kibana 7.17 en `http://localhost:5601`, autentíquese con `elastic` y la contraseña de laboratorio, y revise **Stack Management → Upgrade Assistant**. Registre los avisos detectados en:
-
-   ```bash
-   nano work/717-upgrade-assistant-notes.md
-   ```
-
-   Incluya como mínimo:
-   - Avisos de índices.
-   - Avisos de configuración.
-   - Plantillas o pipelines obsoletos.
-   - Riesgos para la transición a 8.19.
-
-**Resultado esperado:**
-
-- La salud del clúster es `green`.
-- No se muestran líneas con estado `UNASSIGNED`.
-- Existen datos en `logs-app-lab-v1` y/o en `logs-ops-lab`.
-- La política `logs-ops-ilm-v1` está disponible.
-- No existen índices de laboratorio creados originalmente en 6.x o anteriores.
-
-**Verificación:**
-
-```bash
-jq -r '.status' work/717-cluster-health-pre.json
-jq -r '.count' work/717-count-app-pre.json
-jq -r '.count' work/717-count-ops-pre.json
+``` console
+PUT weblogs-v1/_mapping
+{
+  "properties": {
+    "response_time_ms": { "type": "scaled_float", "scaling_factor": 10 }
+  }
+}
 ```
 
-Documente los conteos obtenidos. Se utilizarán como referencia de integridad después de cada restauración.
+**Qué hace:** intenta cambiar el tipo del campo en el índice existente.
 
-> **Punto de decisión:** Si la salud no es `green`, existen shards no asignados o se detectan índices incompatibles, no continúe. Corrija el problema, reindexe los índices heredados si corresponde y repita la línea base.
+**Resultado esperado:** error 400 de tipo `illegal_argument_exception`, con un mensaje equivalente a `mapper [response_time_ms] cannot be changed from type [float] to [scaled_float]`. Esto es una restricción de Lucene: los segmentos ya escritos usan el tipo anterior.
 
----
+### Paso B2. Qué se puede cambiar sin reindexar
 
-### Paso 3. Exportar objetos de Kibana y crear el snapshot de 7.17
+| **Cambio en un mapping existente**                                         | **Se puede en el lugar**                                                                                               |
+|----------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------|
+| Agregar un campo nuevo                                                     | Sí                                                                                                                     |
+| Agregar un multi-field a un campo existente                                | Sí (afecta solo a los documentos nuevos o reindexados)                                                                 |
+| Cambiar `ignore_above` de un `keyword`                                     | Sí                                                                                                                     |
+| Cambiar el tipo de un campo (`float` a `scaled_float`, `text` a `keyword`) | No                                                                                                                     |
+| Cambiar el `analyzer` de un campo `text`                                   | No                                                                                                                     |
+| Cambiar parámetros estructurales (`doc_values`, `index`, `scaling_factor`) | No: se reindexa. Algunos parámetros pueden aceptarse; ante la duda, se comprueba con `_mapping` en un índice de prueba |
 
-**Objetivo:** Separar explícitamente la migración de datos de Elasticsearch de la migración de objetos guardados de Kibana, y generar un snapshot verificable antes de la transición a 8.19.
+Regla de diseño: cuando el cambio no se puede hacer en el lugar, el camino es crear un índice nuevo con el mapping correcto, copiar los datos y mover el alias. Es el patrón del resto del laboratorio.
 
-**Instrucciones:**
+## Parte C: migración con reindex y cambio de alias (16 min)
 
-1. Exporte los objetos guardados relevantes desde Kibana 7.17. La exportación incluye búsquedas, visualizaciones, dashboards y patrones de índice, junto con sus referencias.
+### Paso C1. Actualizar el component template
 
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -X POST "http://localhost:5601/api/saved_objects/_export" \
-     -H 'kbn-xsrf: true' \
-     -H 'Content-Type: application/json' \
-     -d '{
-       "type": ["dashboard", "visualization", "search", "index-pattern"],
-       "includeReferencesDeep": true
-     }' \
-     -o work/kibana-717-saved-objects.ndjson
-   ```
-
-2. Compruebe que el archivo no esté vacío y conserve una evidencia de su contenido sin modificarlo.
-
-   ```bash
-   wc -l work/kibana-717-saved-objects.ndjson
-   head -n 3 work/kibana-717-saved-objects.ndjson \
-     | tee work/kibana-717-saved-objects-preview.txt
-   ```
-
-3. Exporte la configuración que deberá recrearse en el entorno de destino. Los snapshots creados en esta práctica no restaurarán el estado global.
-
-   ```bash
-   api717 "http://localhost:9200/_index_template/logs-ops-lab*?pretty" \
-     | tee work/717-index-templates.json
-
-   api717 "http://localhost:9200/_component_template?pretty" \
-     | tee work/717-component-templates.json
-
-   api717 "http://localhost:9200/_security/role?pretty" \
-     | tee work/717-roles.json
-   ```
-
-4. Registre el repositorio de snapshots de 7.17. El contenedor ve el directorio del host como `/usr/share/elasticsearch/snapshots`.
-
-   ```bash
-   api717 -X PUT "http://localhost:9200/_snapshot/fs_lab_repo" \
-     -d '{
-       "type": "fs",
-       "settings": {
-         "location": "/usr/share/elasticsearch/snapshots/717",
-         "compress": true
-       }
-     }' | tee work/717-repository-create.json
-   ```
-
-5. Verifique el repositorio.
-
-   ```bash
-   api717 -X POST "http://localhost:9200/_snapshot/fs_lab_repo/_verify?pretty" \
-     | tee work/717-repository-verify.json
-   ```
-
-6. Cree el snapshot de preactualización. Se incluyen exclusivamente los índices y data streams de laboratorio; el estado global se excluye deliberadamente.
-
-   ```bash
-   api717 -X PUT \
-     "http://localhost:9200/_snapshot/fs_lab_repo/preupgrade-717-001?wait_for_completion=true" \
-     -d '{
-       "indices": "logs-app-lab-v1,logs-ops-lab",
-       "ignore_unavailable": false,
-       "include_global_state": false,
-       "partial": false
-     }' | tee work/717-snapshot-preupgrade.json
-   ```
-
-7. Consulte el snapshot y registre la lista exacta de índices incluidos.
-
-   ```bash
-   api717 "http://localhost:9200/_snapshot/fs_lab_repo/preupgrade-717-001?pretty" \
-     | tee work/717-snapshot-detail.json
-
-   jq -r '.snapshots[0] | {snapshot, state, start_time, end_time, indices}' \
-     work/717-snapshot-detail.json
-   ```
-
-**Resultado esperado:**
-
-- Existe el archivo `work/kibana-717-saved-objects.ndjson`.
-- El repositorio `fs_lab_repo` responde correctamente a `_verify`.
-- El snapshot `preupgrade-717-001` tiene estado `SUCCESS`.
-- La lista de índices incluye `logs-app-lab-v1` y los backing indices correspondientes a `logs-ops-lab`.
-
-**Verificación:**
-
-```bash
-jq -r '.snapshots[0].state' work/717-snapshot-detail.json
-find /opt/elastic-labs/snapshots/717 -maxdepth 2 -type f | head
+``` console
+PUT _component_template/weblogs-mappings
+{
+  "template": {
+    "mappings": {
+      "properties": {
+        "@timestamp":       { "type": "date" },
+        "service":          { "type": "keyword" },
+        "client_ip":        { "type": "ip" },
+        "method":           { "type": "keyword" },
+        "url": { "type": "keyword", "ignore_above": 512,
+                 "fields": { "path": { "type": "text", "analyzer": "url_path_analyzer" } } },
+        "status":           { "type": "short" },
+        "bytes":            { "type": "integer", "index": false },
+        "response_time_ms": { "type": "scaled_float", "scaling_factor": 10 },
+        "message": { "type": "text",
+                     "fields": { "keyword": { "type": "keyword", "ignore_above": 512 } } },
+        "http_version":     { "type": "keyword" },
+        "user_agent":       { "type": "keyword", "ignore_above": 256 },
+        "detail":           { "type": "keyword" },
+        "team":             { "type": "keyword" },
+        "tier":             { "type": "keyword" },
+        "tags":             { "type": "keyword" },
+        "raw_log":          { "type": "text", "index": false },
+        "error": { "properties": { "message": { "type": "text" } } }
+      }
+    }
+  }
+}
 ```
 
-El estado debe ser:
+**Qué hace:** reemplaza el component template con el mapping nuevo. Solo cambia `response_time_ms`. Un component template se reemplaza completo, por eso se envía el mapping entero.
 
-```text
-SUCCESS
+- `scaling_factor: 10`: el valor se guarda como un entero multiplicado por 10 (189.8 se guarda como 1898). Con un factor de 10 se conserva una cifra decimal.
+
+- El cambio no afecta a `weblogs-v1`. Solo lo recibirán los índices que se creen a partir de ahora con el patrón `weblogs-v*`.
+
+### Paso C2. Crear el índice nuevo y comprobar su mapping
+
+``` console
+PUT weblogs-v2
+
+GET weblogs-v2/_mapping/field/response_time_ms
+
+GET weblogs-v2/_settings?filter_path=*.settings.index.number_of_shards,*.settings.index.number_of_replicas,*.settings.index.default_pipeline
 ```
 
-> **Decisión de rollback para esta etapa:** Si la migración a 8.19 falla, no intente restaurar un snapshot generado por 8.19 sobre 7.17. Mantenga operativo el clúster 7.17 y restaure, si es necesario, `preupgrade-717-001` únicamente en un entorno compatible.
+**Qué hace:** crea `weblogs-v2` sin cuerpo (el template aporta settings y mappings) y lo verifica.
 
----
+**Resultado esperado:** `response_time_ms` de tipo `scaled_float` con `scaling_factor` 10; 1 shard y 1 réplica; **sin** `default_pipeline`. El pipeline se activa más adelante: al copiar documentos que ya fueron procesados no se deben volver a procesar.
 
-### Paso 4. Desplegar Elasticsearch 8.19, restaurar el snapshot y migrar objetos de Kibana
+### Paso C3. Primera pasada de reindex (asíncrona)
 
-**Objetivo:** Restaurar los datos de laboratorio en la versión intermedia 8.19.0, recrear configuraciones necesarias y migrar objetos guardados de Kibana de forma controlada.
-
-**Instrucciones:**
-
-1. Arranque Elasticsearch y Kibana 8.19 mediante el perfil temporal.
-
-   ```bash
-   cd /opt/elastic-labs
-   docker compose --profile upgrade819 up -d es819-lab kibana819-lab
-   ```
-
-2. Espere a que Elasticsearch 8.19 esté disponible.
-
-   ```bash
-   until curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     http://localhost:9202/_cluster/health | jq -e '.status' >/dev/null; do
-     echo "Esperando Elasticsearch 8.19..."
-     sleep 5
-   done
-   ```
-
-3. Configure la contraseña del usuario de servicio de Kibana 8.19 y reinicie Kibana.
-
-   ```bash
-   api819 -X POST \
-     "http://localhost:9202/_security/user/kibana_system/_password" \
-     -d "{\"password\":\"${KIBANA_SYSTEM_PASSWORD}\"}" | jq
-
-   docker compose restart kibana819-lab
-   ```
-
-4. Registre el mismo repositorio lógico, ahora apuntando al directorio de snapshots de 7.17.
-
-   ```bash
-   api819 -X PUT "http://localhost:9202/_snapshot/fs_lab_repo" \
-     -d '{
-       "type": "fs",
-       "settings": {
-         "location": "/usr/share/elasticsearch/snapshots/717",
-         "compress": true
-       }
-     }' | tee work/819-repository-create.json
-
-   api819 -X POST "http://localhost:9202/_snapshot/fs_lab_repo/_verify?pretty" \
-     | tee work/819-repository-verify.json
-   ```
-
-5. Inspeccione el snapshot antes de restaurarlo.
-
-   ```bash
-   api819 "http://localhost:9202/_snapshot/fs_lab_repo/preupgrade-717-001?pretty" \
-     | tee work/819-visible-717-snapshot.json
-   ```
-
-6. Restaure exclusivamente los índices y el data stream de laboratorio. Se ajusta el número de réplicas a cero porque el clúster tiene un único nodo.
-
-   ```bash
-   api819 -X POST \
-     "http://localhost:9202/_snapshot/fs_lab_repo/preupgrade-717-001/_restore?wait_for_completion=true" \
-     -d '{
-       "indices": "logs-app-lab-v1,logs-ops-lab",
-       "ignore_unavailable": false,
-       "include_global_state": false,
-       "include_aliases": true,
-       "index_settings": {
-         "index.number_of_replicas": 0
-       }
-     }' | tee work/819-restore-717.json
-   ```
-
-7. Reinstale o valide la política ILM. Extraiga únicamente el bloque `policy` capturado desde 7.17.
-
-   ```bash
-   jq '."logs-ops-ilm-v1".policy' work/717-ilm-policy.json \
-     > work/logs-ops-ilm-v1-policy-body.json
-
-   api819 -X PUT \
-     "http://localhost:9202/_ilm/policy/logs-ops-ilm-v1" \
-     --data-binary @work/logs-ops-ilm-v1-policy-body.json \
-     | tee work/819-ilm-policy-put.json
-   ```
-
-8. Si las prácticas previas utilizaron plantillas componibles específicas, recréelas desde los archivos exportados. Revise los nombres disponibles:
-
-   ```bash
-   jq -r '.index_templates[].name' work/717-index-templates.json
-   jq -r '.component_templates[].name' work/717-component-templates.json | head -n 20
-   ```
-
-   Para cada plantilla de laboratorio, aplique el cuerpo correspondiente. Sustituya `NOMBRE_PLANTILLA` por el nombre real documentado:
-
-   ```bash
-   jq '.index_templates[] | select(.name == "NOMBRE_PLANTILLA") | .index_template' \
-     work/717-index-templates.json > work/template-body.json
-
-   api819 -X PUT \
-     "http://localhost:9202/_index_template/NOMBRE_PLANTILLA" \
-     --data-binary @work/template-body.json
-   ```
-
-9. Cree un rol de mínimo privilegio de laboratorio para validar la autorización en 8.19.
-
-   ```bash
-   cat > work/role-logs-ops-reader.json <<'EOF'
-   {
-     "cluster": ["monitor"],
-     "indices": [
-       {
-         "names": ["logs-app-lab-v1", "logs-ops-lab", ".ds-logs-ops-lab-*"],
-         "privileges": ["read", "view_index_metadata"]
-       }
-     ],
-     "applications": [],
-     "run_as": [],
-     "metadata": {
-       "lab": "elastic-labs",
-       "purpose": "validacion-lectura-post-upgrade"
-     }
-   }
-   EOF
-
-   api819 -X PUT \
-     "http://localhost:9202/_security/role/logs_ops_lab_reader" \
-     --data-binary @work/role-logs-ops-reader.json \
-     | tee work/819-role-create.json
-   ```
-
-10. Importe los objetos guardados de Kibana 7.17 en Kibana 8.19.
-
-    ```bash
-    curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-      -X POST "http://localhost:5603/api/saved_objects/_import?overwrite=true" \
-      -H 'kbn-xsrf: true' \
-      --form file=@work/kibana-717-saved-objects.ndjson \
-      | tee work/819-kibana-import-result.json
-    ```
-
-11. Abra `http://localhost:5603` y compruebe en **Discover** que puede seleccionar el data view asociado a `logs-ops-lab` o crear uno con el patrón:
-
-    ```text
-    logs-ops-lab*
-    ```
-
-**Resultado esperado:**
-
-- Elasticsearch 8.19 responde en el puerto `9202`.
-- El snapshot de 7.17 es visible y se restaura sin errores.
-- Existen `logs-app-lab-v1` y `logs-ops-lab`.
-- La política `logs-ops-ilm-v1` existe en 8.19.
-- Los objetos guardados se importan con `success: true` o con conflictos conocidos y documentados.
-
-**Verificación:**
-
-```bash
-api819 "http://localhost:9202/_cluster/health?pretty"
-api819 "http://localhost:9202/_data_stream/logs-ops-lab?pretty"
-api819 "http://localhost:9202/logs-app-lab-v1/_count?pretty"
-api819 "http://localhost:9202/logs-ops-lab/_count?pretty"
-api819 "http://localhost:9202/_ilm/policy/logs-ops-ilm-v1?pretty"
+``` console
+POST _reindex?wait_for_completion=false
+{
+  "source": { "index": "weblogs-v1" },
+  "dest":   { "index": "weblogs-v2", "op_type": "create" }
+}
 ```
 
-Compare los conteos con los archivos:
+**Qué hace:** inicia el copiado y devuelve de inmediato el identificador de una tarea, sin esperar a que termine.
 
-```bash
-jq -r '.count' work/717-count-app-pre.json
-jq -r '.count' work/717-count-ops-pre.json
+- `wait_for_completion=false`: la operación corre en segundo plano. Es la forma segura para índices grandes, porque un cliente con timeout no interrumpe la migración.
+
+- `op_type: create`: solo crea documentos que no existen en el destino. Hace la operación repetible: una segunda ejecución no sobrescribe ni duplica.
+
+- Los `_id` de los documentos se conservan.
+
+Copia el valor de `task` (con el formato `nodo:número`) y consúltalo:
+
+``` console
+GET _tasks/<ID_DE_LA_TAREA>
+
+POST weblogs-v2/_refresh
+
+GET weblogs-v2/_count
 ```
 
----
+**Qué hace:** consulta el avance de la tarea, hace visibles los documentos copiados y los cuenta.
 
-### Paso 5. Validar 8.19 y crear el snapshot previo a 9.3
+- `completed`: `true` cuando termina. En la respuesta, `response` incluye `total`, `created`, `version_conflicts` y `failures`.
 
-**Objetivo:** Verificar que 8.19 es una plataforma intermedia estable y crear el snapshot compatible que se restaurará en Elasticsearch 9.3.
+- Para operaciones largas: `requests_per_second` limita la velocidad para no competir con las búsquedas, y `slices` reparte el trabajo en paralelo. Una tarea en curso se cancela con `POST _tasks/<id>/_cancel`.
 
-**Instrucciones:**
+**Resultado esperado:** `created: 5006`, `failures: []` y `count` de 5006.
 
-1. Consulte la salud, los shards y los avisos de deprecación en 8.19.
+### Paso C4. Simular que llegan datos durante la migración
 
-   ```bash
-   api819 "http://localhost:9202/_cluster/health?pretty" \
-     | tee work/819-cluster-health-pre.json
-
-   api819 "http://localhost:9202/_cat/shards?v" \
-     | tee work/819-shards-pre.txt
-
-   api819 "http://localhost:9202/_migration/deprecations?pretty" \
-     | tee work/819-deprecations.json
-   ```
-
-2. Ejecute una consulta Query DSL equivalente a una consulta operativa de logs.
-
-   ```bash
-   cat > work/query-errors-dsl.json <<'EOF'
-   {
-     "size": 0,
-     "query": {
-       "bool": {
-         "filter": [
-           {
-             "range": {
-               "@timestamp": {
-                 "gte": "now-7d"
-               }
-             }
-           }
-         ],
-         "should": [
-           { "match": { "log.level": "ERROR" } },
-           { "match": { "message": "error" } }
-         ],
-         "minimum_should_match": 1
-       }
-     },
-     "aggs": {
-       "por_servicio": {
-         "terms": {
-           "field": "service.name.keyword",
-           "size": 10
-         }
-       }
-     }
-   }
-   EOF
-
-   api819 -X POST \
-     "http://localhost:9202/logs-ops-lab/_search?pretty" \
-     --data-binary @work/query-errors-dsl.json \
-     | tee work/819-query-errors-dsl.json
-   ```
-
-3. En Kibana 8.19, en **Discover**, ejecute una consulta KQL equivalente. Si el campo existe en sus datos, use:
-
-   ```text
-   log.level : "ERROR" or message : *error*
-   ```
-
-   Guarde una captura o registre el número de resultados en:
-
-   ```bash
-   nano work/819-kql-validation.md
-   ```
-
-4. En **Dev Tools** de Kibana 8.19, ejecute una consulta ES|QL:
-
-   ```esql
-   FROM logs-ops-lab
-   | STATS eventos = COUNT(*) BY service.name, log.level
-   | SORT eventos DESC
-   | LIMIT 20
-   ```
-
-5. Cree un API key de lectura mínima para probar las autorizaciones posteriores a la migración. No almacene el secreto completo en el informe.
-
-   ```bash
-   api819 -X POST "http://localhost:9202/_security/api_key" \
-     -d '{
-       "name": "lab-819-read-validation",
-       "expiration": "1d",
-       "role_descriptors": {
-         "lab_logs_reader": {
-           "cluster": ["monitor"],
-           "index": [
-             {
-               "names": ["logs-app-lab-v1", "logs-ops-lab", ".ds-logs-ops-lab-*"],
-               "privileges": ["read", "view_index_metadata"]
-             }
-           ]
-         }
-       }
-     }' | tee work/819-api-key-response.json
-   ```
-
-6. Pruebe el API key y registre sólo su identificador.
-
-   ```bash
-   API_KEY_819=$(jq -r '.encoded' work/819-api-key-response.json)
-
-   curl -sS \
-     -H "Authorization: ApiKey ${API_KEY_819}" \
-     "http://localhost:9202/logs-ops-lab/_count?pretty" \
-     | tee work/819-api-key-count-test.json
-
-   jq '{id, name, expiration}' work/819-api-key-response.json \
-     | tee work/819-api-key-evidence.json
-   ```
-
-7. Registre el repositorio de snapshots de 8.19.
-
-   ```bash
-   api819 -X PUT "http://localhost:9202/_snapshot/fs_lab_repo_819" \
-     -d '{
-       "type": "fs",
-       "settings": {
-         "location": "/usr/share/elasticsearch/snapshots/819",
-         "compress": true
-       }
-     }' | tee work/819-repository-819-create.json
-   ```
-
-8. Cree el snapshot de preactualización para 9.3.
-
-   ```bash
-   api819 -X PUT \
-     "http://localhost:9202/_snapshot/fs_lab_repo_819/preupgrade-819-001?wait_for_completion=true" \
-     -d '{
-       "indices": "logs-app-lab-v1,logs-ops-lab",
-       "ignore_unavailable": false,
-       "include_global_state": false,
-       "partial": false
-     }' | tee work/819-snapshot-preupgrade.json
-
-   api819 "http://localhost:9202/_snapshot/fs_lab_repo_819/preupgrade-819-001?pretty" \
-     | tee work/819-snapshot-detail.json
-   ```
-
-9. Exporte los objetos guardados ya migrados por Kibana 8.19. Este archivo será el origen controlado para Kibana 9.3.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -X POST "http://localhost:5603/api/saved_objects/_export" \
-     -H 'kbn-xsrf: true' \
-     -H 'Content-Type: application/json' \
-     -d '{
-       "type": ["dashboard", "visualization", "search", "index-pattern"],
-       "includeReferencesDeep": true
-     }' \
-     -o work/kibana-819-saved-objects.ndjson
-   ```
-
-**Resultado esperado:**
-
-- La salud de 8.19 es `green`.
-- Las consultas DSL, KQL y ES|QL devuelven resultados coherentes con los datos restaurados.
-- El API key permite leer los índices autorizados.
-- `preupgrade-819-001` tiene estado `SUCCESS`.
-- Existe el archivo `work/kibana-819-saved-objects.ndjson`.
-
-**Verificación:**
-
-```bash
-jq -r '.snapshots[0].state' work/819-snapshot-detail.json
-jq -r '.count' work/819-api-key-count-test.json
-wc -l work/kibana-819-saved-objects.ndjson
+``` console
+PUT weblogs/_doc/late-1?refresh=wait_for
+{
+  "@timestamp": "2026-10-14T12:00:00Z",
+  "service": "search",
+  "client_ip": "187.10.20.30",
+  "method": "GET",
+  "url": "/api/search?q=teclado",
+  "status": 200,
+  "bytes": 410,
+  "response_time_ms": 120.5,
+  "message": "GET /api/search?q=teclado 200 120.5ms ok"
+}
 ```
 
-> **Punto de decisión:** No avance a 9.3 si existen errores funcionales relevantes en 8.19, deprecaciones críticas sin resolver, problemas de autenticación, ILM inoperante o diferencias injustificadas en los conteos de documentos.
+**Qué hace:** indexa un documento por el alias `weblogs`, que todavía apunta a `weblogs-v1`. En una migración real, la aplicación sigue escribiendo mientras se copia. Ese documento no está en `weblogs-v2`.
 
----
+**Resultado esperado:** `result: created`. El pipeline por defecto de `weblogs-v1` añade `team` y `tier`.
 
-### Paso 6. Restaurar en Elasticsearch 9.3 y validar la plataforma objetivo
+### Paso C5. Segunda pasada: copiar solo el delta
 
-**Objetivo:** Restaurar el snapshot compatible de 8.19 en Elasticsearch 9.3 y validar datos, ILM, seguridad y consultas operativas en la plataforma objetivo.
-
-**Instrucciones:**
-
-1. Arranque el entorno Elasticsearch y Kibana 9.3.
-
-   ```bash
-   cd /opt/elastic-labs
-   docker compose up -d es930-lab kibana930-lab
-   ```
-
-2. Espere a que Elasticsearch 9.3 responda.
-
-   ```bash
-   until curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     http://localhost:9201/_cluster/health | jq -e '.status' >/dev/null; do
-     echo "Esperando Elasticsearch 9.3..."
-     sleep 5
-   done
-   ```
-
-3. Configure la contraseña de `kibana_system` y reinicie Kibana 9.3.
-
-   ```bash
-   api930 -X POST \
-     "http://localhost:9201/_security/user/kibana_system/_password" \
-     -d "{\"password\":\"${KIBANA_SYSTEM_PASSWORD}\"}" | jq
-
-   docker compose restart kibana930-lab
-   ```
-
-4. Registre el repositorio que contiene el snapshot creado desde 8.19.
-
-   ```bash
-   api930 -X PUT "http://localhost:9201/_snapshot/fs_lab_repo_819" \
-     -d '{
-       "type": "fs",
-       "settings": {
-         "location": "/usr/share/elasticsearch/snapshots/819",
-         "compress": true
-       }
-     }' | tee work/930-repository-create.json
-
-   api930 -X POST "http://localhost:9201/_snapshot/fs_lab_repo_819/_verify?pretty" \
-     | tee work/930-repository-verify.json
-   ```
-
-5. Compruebe que el snapshot `preupgrade-819-001` sea visible.
-
-   ```bash
-   api930 "http://localhost:9201/_snapshot/fs_lab_repo_819/preupgrade-819-001?pretty" \
-     | tee work/930-visible-819-snapshot.json
-   ```
-
-6. Restaure los datos de laboratorio y ajuste las réplicas para un nodo único.
-
-   ```bash
-   api930 -X POST \
-     "http://localhost:9201/_snapshot/fs_lab_repo_819/preupgrade-819-001/_restore?wait_for_completion=true" \
-     -d '{
-       "indices": "logs-app-lab-v1,logs-ops-lab",
-       "ignore_unavailable": false,
-       "include_global_state": false,
-       "include_aliases": true,
-       "index_settings": {
-         "index.number_of_replicas": 0
-       }
-     }' | tee work/930-restore-819.json
-   ```
-
-7. Reinstale la política ILM en 9.3.
-
-   ```bash
-   api930 -X PUT \
-     "http://localhost:9201/_ilm/policy/logs-ops-ilm-v1" \
-     --data-binary @work/logs-ops-ilm-v1-policy-body.json \
-     | tee work/930-ilm-policy-put.json
-   ```
-
-8. Reinstale las plantillas de laboratorio requeridas, si fueron utilizadas en los ejercicios anteriores, aplicando el mismo procedimiento validado en 8.19.
-
-9. Cree el rol de lectura mínima en 9.3.
-
-   ```bash
-   api930 -X PUT \
-     "http://localhost:9201/_security/role/logs_ops_lab_reader" \
-     --data-binary @work/role-logs-ops-reader.json \
-     | tee work/930-role-create.json
-   ```
-
-10. Cree y pruebe un API key de lectura en 9.3.
-
-    ```bash
-    api930 -X POST "http://localhost:9201/_security/api_key" \
-      -d '{
-        "name": "lab-930-read-validation",
-        "expiration": "1d",
-        "role_descriptors": {
-          "lab_logs_reader": {
-            "cluster": ["monitor"],
-            "index": [
-              {
-                "names": ["logs-app-lab-v1", "logs-ops-lab", ".ds-logs-ops-lab-*"],
-                "privileges": ["read", "view_index_metadata"]
-              }
-            ]
-          }
-        }
-      }' | tee work/930-api-key-response.json
-
-    API_KEY_930=$(jq -r '.encoded' work/930-api-key-response.json)
-
-    curl -sS \
-      -H "Authorization: ApiKey ${API_KEY_930}" \
-      "http://localhost:9201/logs-ops-lab/_count?pretty" \
-      | tee work/930-api-key-count-test.json
-    ```
-
-11. Importe los objetos guardados exportados desde Kibana 8.19.
-
-    ```bash
-    curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-      -X POST "http://localhost:5602/api/saved_objects/_import?overwrite=true" \
-      -H 'kbn-xsrf: true' \
-      --form file=@work/kibana-819-saved-objects.ndjson \
-      | tee work/930-kibana-import-result.json
-    ```
-
-12. Abra Kibana 9.3 en `http://localhost:5602`. En **Discover**, cree o seleccione el data view para:
-
-    ```text
-    logs-ops-lab*
-    ```
-
-13. Ejecute la siguiente consulta KQL:
-
-    ```text
-    log.level : "ERROR" or message : *error*
-    ```
-
-14. En **Dev Tools**, ejecute la consulta ES|QL equivalente:
-
-    ```esql
-    FROM logs-ops-lab
-    | STATS eventos = COUNT(*) BY service.name, log.level
-    | SORT eventos DESC
-    | LIMIT 20
-    ```
-
-**Resultado esperado:**
-
-- Elasticsearch 9.3 responde en `http://localhost:9201`.
-- La restauración finaliza correctamente.
-- La salud del clúster es `green`.
-- `logs-app-lab-v1`, `logs-ops-lab` y la política `logs-ops-ilm-v1` están disponibles.
-- El API key permite consultar los datos autorizados.
-- Kibana 9.3 contiene los objetos migrados y puede ejecutar consultas sobre los datos restaurados.
-
-**Verificación:**
-
-```bash
-api930 "http://localhost:9201/_cluster/health?pretty" \
-  | tee work/930-cluster-health-final.json
-
-api930 "http://localhost:9201/_cat/indices?v&expand_wildcards=all" \
-  | tee work/930-indices-final.txt
-
-api930 "http://localhost:9201/_data_stream/logs-ops-lab?pretty" \
-  | tee work/930-data-stream-final.json
-
-api930 "http://localhost:9201/logs-app-lab-v1/_count?pretty" \
-  | tee work/930-count-app-final.json
-
-api930 "http://localhost:9201/logs-ops-lab/_count?pretty" \
-  | tee work/930-count-ops-final.json
-
-api930 "http://localhost:9201/logs-ops-lab/_ilm/explain?pretty" \
-  | tee work/930-ilm-explain-final.json
+``` console
+POST _reindex?refresh=true
+{
+  "conflicts": "proceed",
+  "source": { "index": "weblogs-v1" },
+  "dest":   { "index": "weblogs-v2", "op_type": "create" }
+}
 ```
 
----
+**Qué hace:** repite el reindex. Los 5006 documentos que ya existen en el destino producen conflictos y se omiten; solo se crea el nuevo.
 
-### Paso 7. Elaborar el runbook de actualización y rollback
+- `conflicts: proceed`: ante un conflicto de versión, la operación continúa en lugar de abortar. Los conflictos se cuentan en `version_conflicts`.
 
-**Objetivo:** Consolidar las evidencias técnicas en un procedimiento reutilizable para la transición controlada a la plataforma 9.3.
+- `refresh=true`: refresca el destino al terminar.
 
-**Instrucciones:**
+**Resultado esperado:** `created: 1` y `version_conflicts: 5006`.
 
-1. Cree el documento de runbook.
+### Paso C6. Validar antes del cambio
 
-   ```bash
-   cat > work/runbook-upgrade-717-819-930.md <<'EOF'
-   # Runbook de actualización Elasticsearch 7.17.29 → 8.19.0 → 9.3.0
-
-   ## Alcance
-   Migración paralela de índices y data streams de laboratorio mediante snapshots.
-   Los objetos de Kibana se migran por exportación e importación controlada.
-
-   ## Punto de partida
-   - Clúster origen: es717-lab-cluster
-   - Versión origen: 7.17.29
-   - Snapshot origen: preupgrade-717-001
-   - Clúster intermedio: es819-lab-cluster
-   - Snapshot intermedio: preupgrade-819-001
-   - Clúster destino: es930-lab-cluster
-
-   ## Controles previos obligatorios
-   1. Estado del clúster green.
-   2. Sin shards UNASSIGNED.
-   3. Espacio en disco suficiente para imágenes, volúmenes y snapshots.
-   4. Índices incompatibles reindexados antes del salto mayor.
-   5. Política ILM, templates, roles y consultas críticas inventariados.
-   6. Snapshot SUCCESS verificado y visible desde el clúster de destino.
-   7. Objetos guardados de Kibana exportados.
-
-   ## Ruta de ejecución
-   1. Validar 7.17 y crear preupgrade-717-001.
-   2. Restaurar datos en 8.19.
-   3. Recrear ILM, templates y controles de seguridad en 8.19.
-   4. Importar objetos Kibana 7.17 en Kibana 8.19.
-   5. Validar consultas DSL, KQL y ES|QL.
-   6. Crear preupgrade-819-001.
-   7. Restaurar datos en 9.3.
-   8. Recrear ILM, templates, roles y API keys en 9.3.
-   9. Importar objetos Kibana 8.19 en Kibana 9.3.
-   10. Ejecutar validación funcional y operativa final.
-
-   ## Criterios de aceptación
-   - Estado green en cada plataforma.
-   - Conteos de documentos equivalentes entre origen y destino.
-   - Data stream logs-ops-lab visible y consultable.
-   - Política logs-ops-ilm-v1 existente y sin errores de explain.
-   - Consultas DSL, KQL y ES|QL ejecutadas correctamente.
-   - API key de mínimo privilegio validada.
-   - Objetos guardados importados o conflictos documentados y resueltos.
-
-   ## Criterios de rollback
-   - Snapshot no SUCCESS.
-   - Conteos de documentos incoherentes.
-   - Error crítico de seguridad, ILM o acceso a datos.
-   - Falla de una consulta operativa crítica.
-   - Error de compatibilidad no resuelto en 8.19 o 9.3.
-
-   ## Procedimiento de rollback
-   1. Detener la promoción del nuevo entorno.
-   2. Mantener el clúster anterior intacto y disponible.
-   3. No restaurar snapshots de una versión posterior sobre una versión mayor anterior.
-   4. Restaurar el último snapshot compatible en un clúster de recuperación compatible.
-   5. Registrar causa, evidencias, impacto y acción correctiva antes de reintentar.
-   EOF
-   ```
-
-2. Añada los conteos y resultados reales obtenidos durante la práctica.
-
-   ```bash
-   {
-     echo
-     echo "## Evidencias de conteo"
-     echo
-     echo "### Elasticsearch 7.17"
-     jq '{indice: "logs-app-lab-v1", count}' work/717-count-app-pre.json
-     jq '{indice: "logs-ops-lab", count}' work/717-count-ops-pre.json
-     echo
-     echo "### Elasticsearch 9.3"
-     jq '{indice: "logs-app-lab-v1", count}' work/930-count-app-final.json
-     jq '{indice: "logs-ops-lab", count}' work/930-count-ops-final.json
-   } >> work/runbook-upgrade-717-819-930.md
-   ```
-
-3. Revise el documento y confirme que contiene snapshots, validaciones, decisiones y rollback.
-
-   ```bash
-   less work/runbook-upgrade-717-819-930.md
-   ```
-
-**Resultado esperado:**
-
-- Existe un runbook reutilizable en `work/runbook-upgrade-717-819-930.md`.
-- El documento diferencia claramente:
-  - Datos Elasticsearch: snapshots y restauración.
-  - Objetos Kibana: exportación e importación.
-  - Configuración de seguridad, ILM y templates: recreación o validación explícita.
-
-**Verificación:**
-
-```bash
-grep -E "preupgrade-717-001|preupgrade-819-001|rollback|Kibana|ILM" \
-  work/runbook-upgrade-717-819-930.md
+``` console
+GET weblogs-v1,weblogs-v2/_search?size=0
+{
+  "aggs": {
+    "por_indice": {
+      "terms": { "field": "_index" },
+      "aggs": {
+        "rt_prom": { "avg":   { "field": "response_time_ms" } },
+        "rt_max":  { "max":   { "field": "response_time_ms" } },
+        "servicios": { "terms": { "field": "service" } }
+      }
+    }
+  }
+}
 ```
 
----
+**Qué hace:** compara los dos índices con la misma agregación, separados por el campo especial `_index`.
 
-## Validación y pruebas
+**Resultado esperado:** ambos buckets con `doc_count` de 5007, los mismos conteos por servicio (payments 765, checkout 1499, search 931, catalog 1782) y promedio y máximo del tiempo de respuesta iguales hasta el primer decimal. En `weblogs-v1` pueden verse cifras como `3199.89990234375`, que es la imprecisión de `float`; en `weblogs-v2` el mismo valor aparece como `3199.9`.
 
-Ejecute la siguiente comparación final de conteos:
+### Paso C7. Activar el pipeline en el índice nuevo
 
-```bash
-printf "%-25s %-12s %-12s\n" "Índice o data stream" "7.17" "9.3"
-printf "%-25s %-12s %-12s\n" "logs-app-lab-v1" \
-  "$(jq -r '.count' work/717-count-app-pre.json)" \
-  "$(jq -r '.count' work/930-count-app-final.json)"
-printf "%-25s %-12s %-12s\n" "logs-ops-lab" \
-  "$(jq -r '.count' work/717-count-ops-pre.json)" \
-  "$(jq -r '.count' work/930-count-ops-final.json)"
+``` console
+PUT weblogs-v2/_settings
+{
+  "index.default_pipeline": "weblogs-pipeline"
+}
 ```
 
-Valide los criterios técnicos finales:
+**Qué hace:** a partir de ahora, todo documento nuevo que llegue a `weblogs-v2` pasa por `weblogs-pipeline`, igual que en `weblogs-v1`. Se hace después del copiado para no reprocesar documentos migrados.
 
-| Validación | Comando o prueba | Resultado esperado |
-|---|---|---|
-| Salud 9.3 | `jq -r '.status' work/930-cluster-health-final.json` | `green` |
-| Shards | `api930 "http://localhost:9201/_cat/shards?h=state" \| sort \| uniq -c` | Sin `UNASSIGNED` |
-| Snapshot 7.17 | `jq -r '.snapshots[0].state' work/717-snapshot-detail.json` | `SUCCESS` |
-| Snapshot 8.19 | `jq -r '.snapshots[0].state' work/819-snapshot-detail.json` | `SUCCESS` |
-| Data stream | `api930 "http://localhost:9201/_data_stream/logs-ops-lab"` | Visible |
-| ILM | `api930 "http://localhost:9201/_ilm/policy/logs-ops-ilm-v1"` | Política disponible |
-| Seguridad | API key en `work/930-api-key-count-test.json` | Conteo permitido |
-| Kibana 9.3 | Discover, KQL y ES\|QL | Consultas ejecutadas |
-| Objetos guardados | `work/930-kibana-import-result.json` | Importación correcta o conflictos documentados |
+### Paso C8. Cambio atómico del alias
 
-Ejecute una prueba DSL final en 9.3:
+``` console
+POST _aliases
+{
+  "actions": [
+    { "remove": { "index": "weblogs-v1", "alias": "weblogs" } },
+    { "add":    { "index": "weblogs-v2", "alias": "weblogs" } }
+  ]
+}
 
-```bash
-api930 -X POST \
-  "http://localhost:9201/logs-ops-lab/_search?pretty" \
-  --data-binary @work/query-errors-dsl.json \
-  | tee work/930-query-errors-dsl.json
+GET _alias/weblogs
+
+GET weblogs/_count
 ```
 
-La migración se considera aceptada si los conteos son coherentes, los índices y data streams están disponibles, ILM funciona, la seguridad autoriza sólo las operaciones previstas y las consultas operativas se ejecutan en Kibana 9.3.
+**Qué hace:** quita el alias de un índice y lo agrega al otro en una sola operación atómica: ningún cliente ve un instante sin alias ni con los dos.
 
-## Resolución de problemas
+- `actions`: lista de operaciones que se aplican juntas o no se aplica ninguna.
 
-### Problema 1: El repositorio `fs_lab_repo` no se verifica o muestra `repository_exception`
+- Las aplicaciones, el data view `weblogs` y el dashboard del laboratorio 8 siguen funcionando sin cambios.
 
-**Síntomas:**
+**Resultado esperado:** el alias apunta a `weblogs-v2` y `count` es 5007. Si abres el dashboard `Operación weblogs`, la métrica de peticiones muestra ahora **4977** (los 4976 de antes más el documento nuevo, que tiene `@timestamp`).
 
-- La llamada `POST /_snapshot/fs_lab_repo/_verify` falla.
-- Elasticsearch informa que la ubicación no es accesible o que `path.repo` no permite el directorio.
-- El snapshot no puede crearse o no es visible desde 8.19 o 9.3.
+### Paso C9. Ensayo de rollback
 
-**Causa:**
+``` console
+POST _aliases
+{
+  "actions": [
+    { "remove": { "index": "weblogs-v2", "alias": "weblogs" } },
+    { "add":    { "index": "weblogs-v1", "alias": "weblogs" } }
+  ]
+}
 
-El directorio del host no está montado en el contenedor, tiene permisos insuficientes o la configuración `path.repo` no coincide con la ruta interna del contenedor.
+GET weblogs/_search?size=1&filter_path=hits.hits._index
 
-**Solución:**
+POST _aliases
+{
+  "actions": [
+    { "remove": { "index": "weblogs-v1", "alias": "weblogs" } },
+    { "add":    { "index": "weblogs-v2", "alias": "weblogs" } }
+  ]
+}
 
-1. Compruebe la existencia y permisos de los directorios en el host:
+GET weblogs/_search?size=1&filter_path=hits.hits._index
+```
 
-   ```bash
-   ls -ld /opt/elastic-labs/snapshots \
-          /opt/elastic-labs/snapshots/717 \
-          /opt/elastic-labs/snapshots/819
-   ```
+**Qué hace:** vuelve al índice anterior, comprueba que las búsquedas llegan a `weblogs-v1`, y regresa a `weblogs-v2`. El rollback de un cambio de alias es una operación de un paso, y por eso el índice anterior se conserva durante una ventana de observación.
 
-2. Ajuste permisos para el entorno de laboratorio:
+**Resultado esperado:** primero `_index` igual a `weblogs-v1`, después `weblogs-v2`. Deja el alias en `weblogs-v2`.
 
-   ```bash
-   chmod -R 0777 /opt/elastic-labs/snapshots
-   ```
+### Paso C10. Proteger el índice anterior
 
-3. Confirme el montaje y `path.repo` dentro del contenedor:
+``` console
+PUT weblogs-v1/_settings
+{
+  "index.blocks.write": true
+}
+```
 
-   ```bash
-   docker exec es717-lab ls -ld /usr/share/elasticsearch/snapshots/717
-   docker exec es717-lab \
-     curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     http://localhost:9200/_nodes/settings?filter_path=nodes.*.settings.path.repo
-   ```
+**Qué hace:** bloquea las escrituras en `weblogs-v1`. Se conserva para un posible rollback, pero ya no debe recibir datos que `weblogs-v2` no tenga. En producción se elimina después de la ventana de observación (días o semanas); en el laboratorio se elimina en la Parte F.
 
-4. Reinicie el contenedor afectado y vuelva a registrar el repositorio:
+## Parte D: runbook de verificación diaria e incidente inducido (14 min)
 
-   ```bash
-   cd /opt/elastic-labs
-   docker compose restart es717-lab
-   ```
+### Paso D1. Ejecutar el runbook de verificación
 
-### Problema 2: La restauración termina, pero el clúster queda `yellow` o el data stream no aparece
+Ejecuta cada paso en orden. Si el resultado no coincide, se aplica la columna "Si falla".
 
-**Síntomas:**
+| **N.º** | **Comando**                                                                                                      | **Esperado**                             | **Si falla**                                                       |
+|---------|------------------------------------------------------------------------------------------------------------------|------------------------------------------|--------------------------------------------------------------------|
+| 1       | `GET _cluster/health?filter_path=status,number_of_nodes,unassigned_shards,initializing_shards,relocating_shards` | `green`, shards sin asignar 0            | `yellow` o `red`: ir al paso de diagnóstico (`allocation/explain`) |
+| 2       | `GET _cat/nodes?v&h=name,heap.percent,cpu,disk.used_percent`                                                     | Heap bajo 75 %, disco bajo 80 %          | Escalar o liberar disco; revisar el capítulo 6                     |
+| 3       | `GET _cat/indices?v&health=yellow` y luego `health=red`                                                          | Solo encabezado (sin índices)            | Diagnosticar cada índice con `allocation/explain`                  |
+| 4       | `GET _cat/thread_pool/write,search?v&h=node_name,name,rejected`                                                  | `rejected` sin crecer entre lecturas     | Revisar carga de indexación o consultas costosas                   |
+| 5       | `GET */_ilm/explain?only_errors=true`                                                                            | `"indices": {}`                          | Corregir la causa y `POST <índice>/_ilm/retry`                     |
+| 6       | `GET _slm/stats?filter_path=total_snapshots_taken,total_snapshots_failed`                                        | `total_snapshots_failed` sin crecer      | Revisar `last_failure` de la política                              |
+| 7       | `GET _security/api_key?active_only=true&filter_path=api_keys.name,api_keys.expiration`                           | Ninguna clave a punto de vencer sin plan | Rotar la clave                                                     |
+| 8       | `GET _license?filter_path=license.status,license.expiry_date_in_millis`                                          | `active`, con fecha lejana               | Renovar o contactar a Elastic                                      |
 
-- La restauración responde sin error, pero `/_cluster/health` muestra `yellow`.
-- Los backing indices de `.ds-logs-ops-lab-*` existen, pero `GET /_data_stream/logs-ops-lab` falla.
-- ILM o la plantilla del data stream no están presentes.
+Los pasos del 1 al 8 se ejecutan en Dev Tools, uno por uno (el comando del paso 3 son dos peticiones). Anota los resultados. **Resultado esperado:** todo en orden, con `status` `green`.
 
-**Causa:**
+- `health=yellow` o `health=red` en `_cat/indices`: filtra solo los índices con ese estado.
 
-En un clúster de un solo nodo pueden existir réplicas configuradas en `1`. Además, el snapshot se restauró con `include_global_state: false`, por lo que políticas ILM, templates y otros elementos de configuración deben recrearse por separado.
+- `*/_ilm/explain?only_errors=true`: muestra solo los índices con un error en su política de ILM.
 
-**Solución:**
+- `_slm/stats`: contadores de snapshots tomados y fallidos por las políticas SLM.
 
-1. Ajuste las réplicas de los índices restaurados a cero:
+- `api_key?active_only=true`: lista las claves vigentes con su caducidad.
 
-   ```bash
-   api930 -X PUT \
-     "http://localhost:9201/logs-app-lab-v1,.ds-logs-ops-lab-*/_settings" \
-     -d '{
-       "index.number_of_replicas": 0
-     }'
-   ```
+### Paso D2. Provocar el incidente
 
-2. Reinstale la política ILM:
+``` console
+PUT runbook-test
+{
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 5
+  }
+}
+```
 
-   ```bash
-   api930 -X PUT \
-     "http://localhost:9201/_ilm/policy/logs-ops-ilm-v1" \
-     --data-binary @work/logs-ops-ilm-v1-policy-body.json
-   ```
+**Qué hace:** crea un índice que pide 5 réplicas. El clúster no tiene tantos nodos de datos, de modo que no podrá asignarlas.
 
-3. Reinstale las plantillas componibles del data stream desde los archivos exportados.
+### Paso D3. Diagnosticar con el runbook
 
-4. Compruebe el estado de ILM y la salud:
+``` console
+GET _cluster/health?filter_path=status,unassigned_shards
 
-   ```bash
-   api930 "http://localhost:9201/logs-ops-lab/_ilm/explain?pretty"
-   api930 "http://localhost:9201/_cluster/health?pretty"
-   ```
+GET _cat/indices?v&health=yellow
 
-## Limpieza
+GET _cluster/allocation/explain
+{
+  "index": "runbook-test",
+  "shard": 0,
+  "primary": false
+}
+```
 
-La práctica deja los clústeres y volúmenes persistentes disponibles para la Práctica 10. No elimine los volúmenes.
+**Qué hace:** repite los pasos 1 y 3 del runbook y pregunta al clúster por qué una réplica no se asigna.
 
-1. Detenga únicamente el entorno temporal 8.19 después de confirmar que el snapshot `preupgrade-819-001` es `SUCCESS`.
+- `status`: ahora `yellow`, con varios shards sin asignar.
 
-   ```bash
-   cd /opt/elastic-labs
-   docker compose --profile upgrade819 stop es819-lab kibana819-lab
-   ```
+- `_cat/indices`: aparece `runbook-test` como `yellow` con `rep` igual a 5.
 
-2. Mantenga en ejecución el entorno objetivo 9.3 para la siguiente práctica.
+- `allocation/explain`: `can_allocate` en `no` y, en `node_allocation_decisions`, el decider `same_shard`: una copia de ese shard ya está en el nodo, y no puede haber dos copias en el mismo nodo.
 
-   ```bash
-   docker compose ps
-   ```
+**Causa:** el número de réplicas debe ser, como máximo, el de nodos de datos menos 1.
 
-3. Opcionalmente, archive las evidencias.
+### Paso D4. Resolver y verificar
 
-   ```bash
-   tar -czf /opt/elastic-labs/work/lab-09-evidencias.tar.gz \
-     -C /opt/elastic-labs/work \
-     .
-   ```
+``` console
+PUT runbook-test/_settings
+{
+  "index.number_of_replicas": 1
+}
 
-4. Si necesita detener todos los servicios al finalizar la sesión, use:
+GET _cluster/health?wait_for_status=green&timeout=60s&filter_path=status
+```
 
-   ```bash
-   docker compose stop
-   ```
+**Qué hace:** ajusta las réplicas a un valor que el clúster puede asignar y espera el estado `green`. **Resultado esperado:** `"status": "green"`. Un incidente no termina hasta verificar que el síntoma desapareció.
 
-> **No use:** `docker compose down -v`  
-> Esta operación eliminaría los volúmenes persistentes `es717-data`, `es930-data`, `kibana717-data` y `kibana930-data`.
+## Parte E: automatización con un script (6 min)
 
-## Resumen
+### Paso E1. Crear una API key de solo monitoreo
 
-En esta práctica se ejecutó una ruta de actualización compatible desde Elasticsearch 7.17.29 hacia 8.19.0 y finalmente hacia 9.3.0. Se verificó la estabilidad del entorno origen, se crearon snapshots antes de cada salto mayor, se restauraron datos de laboratorio en clústeres paralelos y se validaron índices, data streams, ILM, roles, API keys y consultas operativas.
+``` console
+POST _security/api_key
+{
+  "name": "lab09-monitor",
+  "expiration": "1d",
+  "role_descriptors": {
+    "solo-monitoreo": { "cluster": ["monitor"] }
+  }
+}
+```
 
-El punto clave es la separación de responsabilidades: los snapshots migran datos de Elasticsearch, mientras que los objetos guardados de Kibana requieren exportación e importación controlada. El clúster 9.3 y el runbook generado constituyen la base operativa para la Práctica 10.
+**Qué hace:** crea una credencial con el privilegio `monitor`, que permite leer el estado del clúster y nada más. Un script de verificación no necesita permisos de escritura. Copia el valor de `encoded`.
 
-### Recursos opcionales
+### Paso E2. El script
 
-- Elasticsearch Snapshot and Restore: `https://www.elastic.co/guide/en/elasticsearch/reference/current/snapshot-restore.html`
-- Elasticsearch Upgrade Guide: `https://www.elastic.co/guide/en/elasticsearch/reference/current/setup-upgrade.html`
-- Kibana Saved Objects API: `https://www.elastic.co/docs/api/doc/kibana/`
-- Elasticsearch ILM: `https://www.elastic.co/guide/en/elasticsearch/reference/current/index-lifecycle-management.html`
+Guarda el contenido que corresponda a tu sistema en un archivo.
+
+**bash** (archivo `salud.sh`):
+
+``` console
+#!/usr/bin/env bash
+ES_URL="$1"
+API_KEY="$2"
+estado=$(curl -s -H "Authorization: ApiKey $API_KEY" "$ES_URL/_cluster/health?filter_path=status" | sed -E 's/.*"status":"([a-z]+)".*/\1/')
+echo "Estado del clúster: $estado"
+[ "$estado" = "green" ] || exit 1
+```
+
+**PowerShell** (archivo `salud.ps1`):
+
+``` console
+param($EsUrl, $ApiKey)
+$salud = Invoke-RestMethod -Uri "$EsUrl/_cluster/health?filter_path=status" -Headers @{ Authorization = "ApiKey $ApiKey" }
+Write-Output "Estado del clúster: $($salud.status)"
+if ($salud.status -ne "green") { exit 1 }
+```
+
+**Qué hace:** consulta el estado del clúster con la API key, lo muestra y termina con código de salida 0 si es `green` y con 1 en cualquier otro caso.
+
+- `filter_path=status`: pide solo el campo `status`.
+
+- El código de salida es lo que usan los programadores de tareas (cron, CI/CD) para decidir si una ejecución falló y avisar.
+
+- `$1` y `$2` (bash) o `-EsUrl` y `-ApiKey` (PowerShell): parámetros, para que el script no contenga secretos.
+
+### Paso E3. Ejecutar con el clúster sano y con una falla
+
+``` console
+bash salud.sh "<ES_URL>" "<ENCODED_KEY>" ; echo "Código de salida: $?"
+
+./salud.ps1 -EsUrl "<ES_URL>" -ApiKey "<ENCODED_KEY>" ; echo "Código de salida: $LASTEXITCODE"
+```
+
+Ejecuta el comando de tu sistema. **Resultado esperado:** `Estado del clúster: green` y código de salida 0. Ahora provoca la falla otra vez:
+
+``` console
+PUT runbook-test/_settings
+{
+  "index.number_of_replicas": 5
+}
+```
+
+Espera unos segundos, vuelve a ejecutar el script. **Resultado esperado:** `Estado del clúster: yellow` y código de salida 1. Restaura el valor y confirma el regreso al estado `green`:
+
+``` console
+PUT runbook-test/_settings
+{
+  "index.number_of_replicas": 1
+}
+```
+
+## Parte F: documentar el runbook y limpiar (4 min)
+
+### Paso F1. Runbook del cambio de mapping
+
+Completa el siguiente runbook con los comandos que ejecutaste. Debe poder ejecutarlo otra persona sin ayuda.
+
+| **Sección**                     | **Contenido**                                                                  |
+|---------------------------------|--------------------------------------------------------------------------------|
+| Nombre y propósito              | Cambio de mapping incompatible con reindex y alias                             |
+| Cuándo usarlo                   |                                                                                |
+| Prerrequisitos                  | Clúster `green`; snapshot reciente; espacio en disco para una copia del índice |
+| Pasos                           | Numerados, con comando y resultado esperado en cada uno (partes A a C)         |
+| Verificación                    |                                                                                |
+| Rollback                        |                                                                                |
+| Escalamiento                    | A quién se avisa y cuándo                                                      |
+| Responsable y fecha de revisión |                                                                                |
+
+### Paso F2. Limpieza
+
+``` console
+DELETE weblogs-v1
+
+DELETE runbook-test
+
+DELETE _snapshot/found-snapshots/lab09-pre-migracion
+
+DELETE _security/api_key
+{ "name": "lab09-monitor" }
+```
+
+**Qué hace:** elimina el índice anterior (ya terminó la ventana de observación del laboratorio), el índice de prueba, el snapshot previo y la API key.
+
+- Con `weblogs-v1` eliminado, el alias `weblogs` apunta solo a `weblogs-v2` y sigue funcionando.
+
+- Antes de borrar un índice en producción, se confirma que el nuevo funciona y que el snapshot es restaurable.
+
+- Elimina también los archivos `salud.sh` o `salud.ps1` si contienen la clave.
+
+## Resumen de valores esperados
+
+| **Comprobación**                                    | **Resultado**                                         |
+|-----------------------------------------------------|-------------------------------------------------------|
+| `version.created` de `weblogs-v1`                   | Empieza con 9                                         |
+| Cambio de tipo en el lugar (B1)                     | Error 400 `illegal_argument_exception`                |
+| Reindex, primera pasada                             | created 5006                                          |
+| Reindex, segunda pasada                             | created 1, version_conflicts 5006                     |
+| `_count` de `weblogs-v1` y `weblogs-v2`             | 5007 y 5007                                           |
+| Conteos por servicio                                | payments 765, checkout 1499, search 931, catalog 1782 |
+| Alias `weblogs` tras el cambio                      | `weblogs-v2`                                          |
+| Panel de peticiones del dashboard del laboratorio 8 | 4977                                                  |
+| Incidente con 5 réplicas                            | `yellow`; decider `same_shard`                        |
+| Script con el clúster sano / con la falla           | Código de salida 0 / 1                                |
+
+## Estado final
+
+| **Elemento**                                                          | **Se conserva**     | **Lo reutiliza**                                    |
+|-----------------------------------------------------------------------|---------------------|-----------------------------------------------------|
+| `weblogs-v2` con 5007 documentos y alias `weblogs`                    | Sí                  | Laboratorio 10 (carga histórica del proyecto final) |
+| `weblogs-mappings` con `scaled_float`                                 | Sí                  | Laboratorio 10 (template del data stream)           |
+| `weblogs-v1`, `runbook-test`, snapshot previo y clave `lab09-monitor` | No (se eliminan)    | \-                                                  |
+| Runbook documentado (F1)                                              | Sí (en tu cuaderno) | Laboratorio 10 (checklist de producción)            |
+
+## Preguntas de discusión
+
+- ¿Por qué el índice nuevo se crea sin `default_pipeline` y se activa después de copiar los datos?
+
+- ¿Qué habría pasado si en el paso C5 se hubiera usado `op_type` distinto de `create` y sin `conflicts: proceed`?
+
+- ¿Por qué el cambio de alias con `_aliases` es más seguro que borrar un índice y crear otro con el mismo nombre?
+
+- ¿Qué cambia en esta migración si el índice tuviera 2 TB y recibiera 20 000 documentos por segundo?
+
+- ¿Qué paso añadirías al runbook diario para detectar que una fuente dejó de enviar datos?
+
+- Un índice de `weblogs-v1` creado en 7.x, ¿qué opciones tendría antes de pasar a 9.x?
+
+## Resultado final
+
+Al terminar el laboratorio, el entorno debe quedar como se muestra en la imagen: lo que se conserva, cómo verificarlo y lo que se elimina.
+
+![Resultado final del laboratorio 9: Simular una migración y ejecutar un runbook](imagenes/lab09_resultado_final.png)

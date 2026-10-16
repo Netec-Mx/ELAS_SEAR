@@ -1,1628 +1,655 @@
-# Configurar roles, privilegios y una política de ciclo de vida para logs.
+# Laboratorio 7: Configurar snapshots y políticas de ILM
 
-## Metadatos
+- **Capítulo:** 7. Seguridad, backups y gestión de datos
 
-| Campo | Valor |
-|---|---|
-| Duración | 75 minutos |
-| Complejidad | Alta |
-| Nivel de Bloom | Aplicar |
+- **Duración:** 54 min
 
-## Descripción general
+- **Entorno:** Elastic Cloud Hosted (cuenta propia), Elasticsearch 9.x, Kibana Dev Tools y una terminal con `curl`
 
-En esta práctica se protege el acceso al clúster `es717-lab` mediante TLS, autenticación nativa, roles con privilegios mínimos y una API key limitada para ingestión. Después se implementa una política ILM para datos de logs, se crea un data stream administrado por dicha política y se reinyectan eventos con campos ECS mínimos.
+- **Dependencias:** Laboratorio 1 (`orders-shared` con 6 documentos de 3 tenants) y Laboratorio 3 (`weblogs-v1` con el alias `weblogs`).
 
-Al finalizar, el data stream `logs-ops-lab` quedará disponible como fuente segura para consultas y visualización en Discover durante la práctica posterior.
+## Objetivo
 
-## Objetivos de aprendizaje
+Proteger y gobernar los datos del curso: aislar a dos tenants con seguridad a nivel de documento (DLS) y de campo (FLS), configurar snapshots y restaurar datos, y definir una política de ILM sobre un data stream. Al terminar, el participante podrá:
 
-- [ ] Verificar TLS HTTP, TLS de transporte y autenticación en Elasticsearch 7.17.29.
-- [ ] Crear los roles `log_ingestor_lab`, `log_analyst_lab` y `log_operator_lab` aplicando mínimo privilegio.
-- [ ] Crear los usuarios nativos `ingest_lab` y `analyst_lab`, y validar sus permisos efectivos.
-- [ ] Generar una API key restringida para escribir documentos en `logs-ops-lab`.
-- [ ] Configurar ILM, templates componibles y un data stream con rollover y retención.
+- Crear roles y usuarios con DLS y FLS, y comprobar un acceso autorizado, uno no autorizado (403) y una autenticación fallida (401).
 
-## Prerrequisitos
+- Crear una API key restringida a un tenant.
 
-### Conocimientos requeridos
+- Tomar un snapshot manual en el repositorio de Elastic Cloud, crear una política de snapshots (SLM) y restaurar datos con otro nombre.
 
-- Comprensión básica de índices, aliases, shards, documentos y búsquedas en Elasticsearch.
-- Conocimiento introductorio de JSON, `curl`, `jq` y autenticación HTTP Basic.
-- Comprensión de los conceptos de roles, privilegios de clúster, privilegios de índice y API keys.
-- Práctica 6 completada, con documentos disponibles en `logs-app-lab-v1`.
+- Definir una política de ILM con rollover, fase warm y borrado, aplicarla a un data stream y seguir su avance con `_ilm/explain`.
 
-### Acceso y archivos requeridos
+- Documentar la matriz de usuarios, roles y tenants.
 
-- Acceso con permisos administrativos al host Docker.
-- Directorio raíz obligatorio: `/opt/elastic-labs`.
-- Archivo de composición disponible en `/opt/elastic-labs/compose.yaml`.
-- Certificado CA disponible en `/opt/elastic-labs/certs/ca/ca.crt`.
-- Archivo `/opt/elastic-labs/.env` con permisos `0600`.
-- Clúster `es717-lab` disponible en `https://localhost:9200`.
-- Usuario administrativo de laboratorio: `elastic`.
-- Contraseña administrativa de laboratorio: declarada en `/opt/elastic-labs/.env`.
+## Requisitos
 
-> **Importante:** No ejecute `docker compose down -v`. Este comando eliminaría volúmenes persistentes y el estado requerido por prácticas posteriores.
+- `GET orders-shared/_count` devuelve 6 y `GET weblogs/_count` devuelve 5006.
 
-## Entorno de laboratorio
+- Los alias `orders-acme`, `orders-globex` y `orders-initech` existen (`GET _alias/orders-*`).
 
-| Componente | Valor esperado |
-|---|---|
-| Elasticsearch | 7.17.29 |
-| Contenedor Elasticsearch | `es717-lab` |
-| Clúster | `es717-lab-cluster` |
-| Nodo | `es717-node-1` |
-| Endpoint HTTPS | `https://localhost:9200` |
-| Kibana | `https://localhost:5601` o la configuración definida por la composición |
-| Red Docker | `elastic-lab-net` |
-| Volumen Elasticsearch | `es717-data` |
-| Certificado CA | `/opt/elastic-labs/certs/ca/ca.crt` |
-| Directorio de trabajo | `/opt/elastic-labs/work` |
+- La dirección de Elasticsearch (`<ES_URL>`) anotada en la ficha del deployment.
 
-### Preparación inicial
+- Este laboratorio usa DLS y FLS, que son funciones de pago. La prueba de Elastic Cloud las incluye mientras esté vigente (paso A1 lo comprueba).
 
-1. Abra una terminal y sitúese en el directorio del laboratorio.
+## Distribución del tiempo
 
-   ```bash
-   cd /opt/elastic-labs
-   ```
+| **Parte** | **Contenido**                                  | **Tiempo** |
+|-----------|------------------------------------------------|------------|
+| Parte A   | Licencia y punto de partida                    | 4 min      |
+| Parte B   | Dos tenants: DLS, FLS y accesos no autorizados | 14 min     |
+| Parte C   | ILM sobre un data stream (se deja corriendo)   | 8 min      |
+| Parte D   | Snapshots, restore y SLM                       | 14 min     |
+| Parte E   | Resultado de ILM                               | 6 min      |
+| Parte F   | Auditoría, gobernanza y limpieza               | 8 min      |
 
-2. Verifique que el archivo de credenciales tenga permisos restrictivos.
+## Convenciones
 
-   ```bash
-   sudo chmod 0600 /opt/elastic-labs/.env
-   stat -c '%a %n' /opt/elastic-labs/.env
-   ```
+- Los bloques con `GET`, `PUT`, `POST` o `DELETE` se ejecutan en Dev Tools; los que empiezan con `curl.exe` se ejecutan en la terminal.
 
-   **Salida esperada**
+- En los comandos `curl.exe`, `-u usuario` hace que `curl` pida la contraseña de forma interactiva. Así no queda guardada en el historial de la terminal. Las URL van entre comillas dobles.
 
-   ```text
-   600 /opt/elastic-labs/.env
-   ```
+- Las contraseñas de los usuarios de práctica deben tener al menos 6 caracteres. Usa valores que no emplees en ningún otro sitio.
 
-3. Cree el directorio de trabajo si no existe.
+- La Parte C se inicia antes que la D porque ILM trabaja por tiempo y avanza mientras se hacen los snapshots.
 
-   ```bash
-   sudo mkdir -p /opt/elastic-labs/work
-   sudo chown "$USER":"$USER" /opt/elastic-labs/work
-   chmod 700 /opt/elastic-labs/work
-   ```
+## Parte A: licencia y punto de partida (4 min)
 
-4. Compruebe el estado de los contenedores del laboratorio.
+### Paso A1. Licencia e identidad
 
-   ```bash
-   docker compose ps
-   ```
+``` console
+GET _license
 
-   Si `es717-lab` no está en ejecución, inicie los servicios definidos sin eliminar volúmenes:
+GET _security/_authenticate
+```
 
-   ```bash
-   docker compose up -d
-   ```
+**Qué hace:** muestra la licencia activa del clúster y el usuario con el que estás autenticado en Dev Tools.
 
-5. Cargue las variables de entorno del laboratorio en la sesión actual.
+- `license.type` y `license.status`: tipo de licencia y si está vigente (`active`). Anota ambos y la fecha en `expiry_date`.
 
-   > El archivo `.env` debe contener al menos `ELASTIC_PASSWORD=ElasticLab_2026!`. Las contraseñas adicionales de usuarios de prueba se añadirán de forma controlada.
+- `_authenticate`: devuelve el usuario (`username`), sus roles (`roles`) y cómo se autenticó (`authentication_type`). Debe aparecer `elastic` con el rol `superuser`.
 
-   ```bash
-   set -a
-   source /opt/elastic-labs/.env
-   set +a
+Si más adelante la creación de un rol con `query` o `field_security` falla con un error de licencia no conforme, la prueba o la suscripción no incluyen DLS y FLS. Avisa al instructor: la Parte B se hará como demostración.
 
-   export ES_URL="https://localhost:9200"
-   export ES_CA="/opt/elastic-labs/certs/ca/ca.crt"
-   export ES_USER="elastic"
-   ```
+### Paso A2. Agregar un campo sensible a los pedidos
 
-6. Espere a que Elasticsearch responda correctamente.
-
-   ```bash
-   until curl --silent --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     "$ES_URL/_cluster/health?wait_for_status=yellow&timeout=5s" >/dev/null; do
-     echo "Esperando a Elasticsearch..."
-     sleep 5
-   done
-
-   echo "Elasticsearch está disponible."
-   ```
-
-   **Salida esperada**
-
-   ```text
-   Elasticsearch está disponible.
-   ```
-
----
-
-## Procedimiento paso a paso
-
-### Paso 1. Verificar TLS y autenticación del clúster
-
-**Objetivo:** Confirmar que la API HTTP usa HTTPS, que el certificado de la CA es válido para el laboratorio y que el usuario `elastic` puede autenticarse.
-
-#### Instrucciones
-
-1. Consulte la identidad autenticada mediante la API de seguridad.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     "$ES_URL/_security/_authenticate?pretty" \
-     | tee /opt/elastic-labs/work/01-authenticate-elastic.json
-   ```
-
-2. Consulte el estado del clúster.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     "$ES_URL/_cluster/health?pretty" \
-     | tee /opt/elastic-labs/work/01-cluster-health.json
-   ```
-
-3. Consulte los certificados conocidos por Elasticsearch.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     "$ES_URL/_ssl/certificates?pretty" \
-     | tee /opt/elastic-labs/work/01-ssl-certificates.json
-   ```
-
-4. Consulte la configuración de seguridad relevante para HTTP y transporte.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     "$ES_URL/_nodes/settings?filter_path=nodes.*.settings.xpack.security*&pretty" \
-     | tee /opt/elastic-labs/work/01-security-settings.json
-   ```
-
-#### Salida esperada
-
-La respuesta de autenticación debe mostrar el usuario `elastic` y roles administrativos, similares a:
-
-```json
+``` console
+PUT orders-shared/_mapping
 {
-  "username" : "elastic",
-  "roles" : [
-    "superuser"
-  ],
-  "enabled" : true,
-  "authentication_realm" : {
-    "name" : "reserved",
-    "type" : "reserved"
+  "properties": {
+    "customer_email": { "type": "keyword" }
+  }
+}
+
+POST orders-shared/_update_by_query?refresh=true&conflicts=proceed
+{
+  "script": {
+    "lang": "painless",
+    "source": "ctx._source.customer_email = ctx._source.tenant_id + '-' + ctx._source.order_id + '@example.com'"
   }
 }
 ```
 
-La salud del clúster debe ser `yellow` o `green`. En un clúster de un solo nodo, `yellow` puede ser aceptable si existen réplicas sin asignar.
+**Qué hace:** añade el campo `customer_email` al mapping y lo completa en los 6 documentos con valores ficticios, como `acme-2001@example.com`. Será el dato que FLS oculte.
 
-#### Verificación
+- `PUT _mapping`: agrega campos a un índice existente. No cambia campos ya definidos.
 
-Ejecute:
+- `_update_by_query`: actualiza cada documento que coincide con la consulta (sin `query`, todos).
 
-```bash
-jq -r '.username' /opt/elastic-labs/work/01-authenticate-elastic.json
-jq -r '.status' /opt/elastic-labs/work/01-cluster-health.json
-```
+- `script.source`: código Painless que se ejecuta por documento. `ctx._source` es el documento.
 
-Debe obtener:
+- `conflicts=proceed`: si un documento cambia durante la operación, continúa en lugar de abortar.
 
-```text
-elastic
-yellow
-```
+**Resultado esperado:** `"updated": 6`, `"failures": []`.
 
-o:
+## Parte B: dos tenants con DLS y FLS (14 min)
 
-```text
-elastic
-green
-```
+### Paso B1. Rol del tenant acme (DLS)
 
----
-
-### Paso 2. Preparar credenciales de usuarios nativos de laboratorio
-
-**Objetivo:** Declarar contraseñas exclusivas de usuarios de prueba en el archivo protegido `.env`.
-
-#### Instrucciones
-
-1. Añada las contraseñas de laboratorio si aún no existen.
-
-   ```bash
-   grep -q '^LAB_INGEST_PASSWORD=' /opt/elastic-labs/.env || cat >> /opt/elastic-labs/.env <<'EOF'
-   LAB_INGEST_PASSWORD="IngestLab_2026!"
-   EOF
-
-   grep -q '^LAB_ANALYST_PASSWORD=' /opt/elastic-labs/.env || cat >> /opt/elastic-labs/.env <<'EOF'
-   LAB_ANALYST_PASSWORD="AnalystLab_2026!"
-   EOF
-
-   sudo chmod 0600 /opt/elastic-labs/.env
-   ```
-
-2. Recargue las variables en la sesión actual.
-
-   ```bash
-   set -a
-   source /opt/elastic-labs/.env
-   set +a
-   ```
-
-3. Confirme que las variables están definidas sin imprimir sus valores.
-
-   ```bash
-   test -n "$LAB_INGEST_PASSWORD" && echo "LAB_INGEST_PASSWORD definida"
-   test -n "$LAB_ANALYST_PASSWORD" && echo "LAB_ANALYST_PASSWORD definida"
-   ```
-
-#### Salida esperada
-
-```text
-LAB_INGEST_PASSWORD definida
-LAB_ANALYST_PASSWORD definida
-```
-
-#### Verificación
-
-Compruebe nuevamente los permisos:
-
-```bash
-stat -c '%a %n' /opt/elastic-labs/.env
-```
-
-La salida debe indicar permisos `600`.
-
----
-
-### Paso 3. Crear roles con privilegios mínimos
-
-**Objetivo:** Definir roles separados para ingestión, análisis y monitorización operativa.
-
-#### Instrucciones
-
-1. Cree el rol `log_ingestor_lab`.
-
-   Este rol solamente podrá crear documentos en data streams o índices cuyo nombre comience por `logs-ops-lab`.
-
-   ```bash
-   cat > /opt/elastic-labs/work/role-log-ingestor-lab.json <<'EOF'
-   {
-     "cluster": [],
-     "indices": [
-       {
-         "names": ["logs-ops-lab*"],
-         "privileges": ["create_doc"],
-         "allow_restricted_indices": false
-       }
-     ],
-     "applications": [],
-     "run_as": [],
-     "metadata": {
-       "descripcion": "Ingestión mínima de documentos en logs-ops-lab",
-       "entorno": "laboratorio"
-     }
-   }
-   EOF
-
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     -X PUT "$ES_URL/_security/role/log_ingestor_lab" \
-     -H "Content-Type: application/json" \
-     --data-binary @/opt/elastic-labs/work/role-log-ingestor-lab.json \
-     | tee /opt/elastic-labs/work/03-role-log-ingestor-lab-result.json
-   ```
-
-2. Cree el rol `log_analyst_lab`.
-
-   Este rol puede buscar, leer documentos y consultar metadatos del data stream. Además, recibe acceso de solo lectura a Discover en el espacio predeterminado de Kibana.
-
-   ```bash
-   cat > /opt/elastic-labs/work/role-log-analyst-lab.json <<'EOF'
-   {
-     "cluster": [],
-     "indices": [
-       {
-         "names": ["logs-ops-lab*"],
-         "privileges": ["read", "view_index_metadata"],
-         "allow_restricted_indices": false
-       }
-     ],
-     "applications": [
-       {
-         "application": "kibana-.kibana",
-         "privileges": ["feature_discover.read"],
-         "resources": ["space:default"]
-       }
-     ],
-     "run_as": [],
-     "metadata": {
-       "descripcion": "Consulta de logs operativos y acceso de lectura a Discover",
-       "entorno": "laboratorio"
-     }
-   }
-   EOF
-
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     -X PUT "$ES_URL/_security/role/log_analyst_lab" \
-     -H "Content-Type: application/json" \
-     --data-binary @/opt/elastic-labs/work/role-log-analyst-lab.json \
-     | tee /opt/elastic-labs/work/03-role-log-analyst-lab-result.json
-   ```
-
-3. Cree el rol `log_operator_lab`.
-
-   El operador podrá observar la salud y métricas del clúster, pero no podrá leer ni modificar documentos.
-
-   ```bash
-   cat > /opt/elastic-labs/work/role-log-operator-lab.json <<'EOF'
-   {
-     "cluster": ["monitor"],
-     "indices": [],
-     "applications": [],
-     "run_as": [],
-     "metadata": {
-       "descripcion": "Monitorización del clúster sin acceso a documentos",
-       "entorno": "laboratorio"
-     }
-   }
-   EOF
-
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     -X PUT "$ES_URL/_security/role/log_operator_lab" \
-     -H "Content-Type: application/json" \
-     --data-binary @/opt/elastic-labs/work/role-log-operator-lab.json \
-     | tee /opt/elastic-labs/work/03-role-log-operator-lab-result.json
-   ```
-
-4. Consulte los roles creados.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     "$ES_URL/_security/role/log_ingestor_lab,log_analyst_lab,log_operator_lab?pretty" \
-     | tee /opt/elastic-labs/work/03-roles-created.json
-   ```
-
-#### Salida esperada
-
-Cada operación `PUT` debe devolver:
-
-```json
+``` console
+PUT _security/role/orders_acme_reader
 {
-  "role": {
-    "created": true
-  }
+  "indices": [
+    {
+      "names": ["orders-shared"],
+      "privileges": ["read"],
+      "query": "{\"term\": {\"tenant_id\": \"acme\"}}"
+    }
+  ]
 }
 ```
 
-Si se repite la práctica, puede aparecer:
+**Qué hace:** crea un rol que puede leer `orders-shared`, pero solo los documentos cuyo `tenant_id` es `acme`.
 
-```json
+- `names`: índices, alias o patrones sobre los que aplica el permiso.
+
+- `privileges: ["read"]`: permite buscar y obtener documentos. No permite escribir ni borrar.
+
+- `query`: consulta en forma de texto JSON (por eso las comillas escapadas). Es la regla de DLS: el rol solo ve los documentos que cumplen la consulta, en búsquedas, conteos, agregaciones y lecturas por ID.
+
+### Paso B2. Rol del tenant globex (DLS y FLS)
+
+``` console
+PUT _security/role/orders_globex_reader
 {
-  "role": {
-    "created": false
-  }
+  "indices": [
+    {
+      "names": ["orders-shared"],
+      "privileges": ["read"],
+      "query": "{\"term\": {\"tenant_id\": \"globex\"}}",
+      "field_security": {
+        "grant": ["tenant_id", "order_id", "total"]
+      }
+    }
+  ]
 }
 ```
 
-Esto indica que el rol existía y fue actualizado correctamente.
+**Qué hace:** igual que el anterior para `globex`, y además limita los campos visibles.
 
-#### Verificación
+- `field_security.grant`: lista de campos que el rol puede ver. Todo campo no incluido (aquí, `customer_email`) se oculta: no aparece en `_source`, no se puede buscar, ni agregar.
 
-Compruebe los privilegios configurados:
+- También existe `except`, que concede todos los campos menos los indicados. `grant` es más seguro porque un campo nuevo queda oculto por defecto.
 
-```bash
-jq '{
-  ingestor: .log_ingestor_lab.indices,
-  analyst: .log_analyst_lab.indices,
-  operator: .log_operator_lab.cluster
-}' /opt/elastic-labs/work/03-roles-created.json
-```
+### Paso B3. Usuarios de práctica
 
-Debe observar:
-
-- `create_doc` para `log_ingestor_lab`.
-- `read` y `view_index_metadata` para `log_analyst_lab`.
-- `monitor` como privilegio de clúster para `log_operator_lab`.
-
----
-
-### Paso 4. Crear usuarios nativos para ingestión y análisis
-
-**Objetivo:** Crear identidades humanas o de servicio separadas de la cuenta administrativa `elastic`.
-
-#### Instrucciones
-
-1. Cree el usuario de ingestión `ingest_lab`.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     -X PUT "$ES_URL/_security/user/ingest_lab" \
-     -H "Content-Type: application/json" \
-     -d "{
-       \"password\": \"$LAB_INGEST_PASSWORD\",
-       \"roles\": [\"log_ingestor_lab\"],
-       \"full_name\": \"Servicio de Ingestión del Laboratorio\",
-       \"email\": \"ingest_lab@example.org\",
-       \"enabled\": true
-     }" \
-     | tee /opt/elastic-labs/work/04-user-ingest-lab-result.json
-   ```
-
-2. Cree el usuario analista `analyst_lab`.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     -X PUT "$ES_URL/_security/user/analyst_lab" \
-     -H "Content-Type: application/json" \
-     -d "{
-       \"password\": \"$LAB_ANALYST_PASSWORD\",
-       \"roles\": [\"log_analyst_lab\"],
-       \"full_name\": \"Analista de Logs del Laboratorio\",
-       \"email\": \"analyst_lab@example.org\",
-       \"enabled\": true
-     }" \
-     | tee /opt/elastic-labs/work/04-user-analyst-lab-result.json
-   ```
-
-3. Consulte la identidad autenticada como `analyst_lab`.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "analyst_lab:$LAB_ANALYST_PASSWORD" \
-     "$ES_URL/_security/_authenticate?pretty" \
-     | tee /opt/elastic-labs/work/04-authenticate-analyst.json
-   ```
-
-#### Salida esperada
-
-Las operaciones de creación deben devolver:
-
-```json
+``` console
+POST _security/user/ana_acme
 {
-  "created": true
+  "password": "<CONTRASEÑA_ANA>",
+  "roles": ["orders_acme_reader"],
+  "full_name": "Ana (tenant acme)"
+}
+
+POST _security/user/gus_globex
+{
+  "password": "<CONTRASEÑA_GUS>",
+  "roles": ["orders_globex_reader"],
+  "full_name": "Gus (tenant globex)"
 }
 ```
 
-La autenticación del analista debe indicar:
+**Qué hace:** crea dos usuarios nativos, cada uno con el rol de su tenant. **Resultado esperado:** `"created": true` en ambos.
 
-```json
+### Paso B4. Acceso autorizado
+
+``` console
+curl.exe -s -u ana_acme "<ES_URL>/orders-shared/_search?filter_path=hits.total.value,hits.hits._source"
+
+curl.exe -s -u gus_globex "<ES_URL>/orders-shared/_search?filter_path=hits.total.value,hits.hits._source"
+```
+
+**Qué hace:** cada usuario consulta el mismo índice, `orders-shared`, que contiene los 6 documentos de los tres tenants.
+
+- `-u ana_acme`: autenticación básica; `curl` pide la contraseña.
+
+- `filter_path`: reduce la respuesta al total y a los `_source`.
+
+**Resultado esperado:**
+
+- `ana_acme`: `total.value` de 2 (pedidos 2001 y 2002), con los campos `tenant_id`, `order_id`, `total` y `customer_email`.
+
+- `gus_globex`: `total.value` de 2 (pedidos 3001 y 3002), **sin** `customer_email`.
+
+El mismo índice devuelve resultados distintos según quién pregunta. Es la ventaja frente a los alias filtrados: el filtro viaja con el usuario y no depende de que la aplicación use el alias correcto.
+
+### Paso B5. Lo que cada usuario no puede ver
+
+``` console
+curl.exe -s -u ana_acme "<ES_URL>/orders-shared/_count?q=tenant_id:globex"
+
+curl.exe -s -u gus_globex "<ES_URL>/orders-shared/_count?q=customer_email:globex-3001@example.com"
+
+curl.exe -s -u gus_globex "<ES_URL>/orders-shared/_count"
+```
+
+**Qué hace:** intenta consultar datos fuera del alcance del usuario.
+
+- `_count?q=...`: cuenta con una consulta de texto sencilla (`campo:valor`).
+
+- Primera: `ana_acme` pregunta por pedidos de `globex`. **Resultado esperado:** `count` de 0. DLS filtra antes de evaluar la consulta; ni siquiera sabe si existen.
+
+- Segunda: `gus_globex` busca por un campo oculto. **Resultado esperado:** `count` de 0, aunque el pedido existe. Con FLS, el campo no se puede usar para buscar.
+
+- Tercera: **Resultado esperado:** `count` de 2. Cada usuario cuenta solo lo suyo.
+
+### Paso B6. Acceso no autorizado y autenticación fallida
+
+``` console
+curl.exe -s -i -u ana_acme "<ES_URL>/weblogs/_search?size=0"
+
+curl.exe -s -i -u ana_acme -X POST "<ES_URL>/orders-shared/_doc" -H "Content-Type: application/json" -d "{}"
+
+curl.exe -s -i -u ana_acme:contraseña-incorrecta "<ES_URL>/orders-shared/_count"
+```
+
+**Qué hace:** tres intentos que deben fallar. `-i` muestra la línea de estado HTTP.
+
+| **Intento**                 | **Estado** | **Interpretación**                                                                                                        |
+|-----------------------------|------------|---------------------------------------------------------------------------------------------------------------------------|
+| Leer `weblogs`              | 403        | El usuario está autenticado, pero su rol no incluye `weblogs`. El mensaje contiene `is unauthorized for user [ana_acme]`. |
+| Escribir en `orders-shared` | 403        | El rol solo tiene `read`. Falta el privilegio `write`.                                                                    |
+| Contraseña incorrecta       | 401        | La autenticación falla antes de evaluar permisos.                                                                         |
+
+Regla para el diagnóstico: **401** es "no sé quién eres"; **403** es "sé quién eres, pero no tienes permiso".
+
+### Paso B7. API key restringida a un tenant
+
+``` console
+POST _security/api_key
 {
-  "username": "analyst_lab",
-  "roles": [
-    "log_analyst_lab"
-  ],
-  "enabled": true
-}
-```
-
-#### Verificación
-
-Ejecute:
-
-```bash
-jq -r '.username, (.roles[])' /opt/elastic-labs/work/04-authenticate-analyst.json
-```
-
-La salida debe incluir:
-
-```text
-analyst_lab
-log_analyst_lab
-```
-
----
-
-### Paso 5. Crear la política ILM para logs operativos
-
-**Objetivo:** Definir una política de ciclo de vida con rollover en fase `hot` y eliminación automática en fase `delete`.
-
-#### Instrucciones
-
-1. Cree la política `logs-ops-ilm-v1`.
-
-   La condición de rollover será:
-
-   - Edad máxima: `1d`.
-   - Tamaño máximo del shard primario: `1gb`.
-   - Retención de laboratorio: eliminación después de `7d`.
-
-   ```bash
-   cat > /opt/elastic-labs/work/logs-ops-ilm-v1.json <<'EOF'
-   {
-     "policy": {
-       "phases": {
-         "hot": {
-           "min_age": "0ms",
-           "actions": {
-             "rollover": {
-               "max_age": "1d",
-               "max_primary_shard_size": "1gb"
-             }
-           }
-         },
-         "delete": {
-           "min_age": "7d",
-           "actions": {
-             "delete": {}
-           }
-         }
-       }
-     }
-   }
-   EOF
-
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     -X PUT "$ES_URL/_ilm/policy/logs-ops-ilm-v1" \
-     -H "Content-Type: application/json" \
-     --data-binary @/opt/elastic-labs/work/logs-ops-ilm-v1.json \
-     | tee /opt/elastic-labs/work/05-ilm-policy-result.json
-   ```
-
-2. Consulte la política creada.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     "$ES_URL/_ilm/policy/logs-ops-ilm-v1?pretty" \
-     | tee /opt/elastic-labs/work/05-ilm-policy.json
-   ```
-
-#### Salida esperada
-
-La creación de la política debe devolver:
-
-```json
-{
-  "acknowledged": true
-}
-```
-
-#### Verificación
-
-```bash
-jq '.["logs-ops-ilm-v1"].policy.phases' /opt/elastic-labs/work/05-ilm-policy.json
-```
-
-Confirme que existen las fases `hot` y `delete`, con `max_age`, `max_primary_shard_size` y `min_age: 7d`.
-
----
-
-### Paso 6. Crear component template e index template para el data stream
-
-**Objetivo:** Definir mappings ECS mínimos y asociar la política ILM a los índices backing del data stream.
-
-#### Instrucciones
-
-1. Cree el component template con settings de ILM y mappings ECS mínimos.
-
-   ```bash
-   cat > /opt/elastic-labs/work/logs-ops-component-v1.json <<'EOF'
-   {
-     "template": {
-       "settings": {
-         "index.lifecycle.name": "logs-ops-ilm-v1",
-         "index.number_of_shards": 1,
-         "index.number_of_replicas": 0
-       },
-       "mappings": {
-         "dynamic": true,
-         "properties": {
-           "@timestamp": {
-             "type": "date"
-           },
-           "log": {
-             "properties": {
-               "level": {
-                 "type": "keyword"
-               }
-             }
-           },
-           "service": {
-             "properties": {
-               "name": {
-                 "type": "keyword"
-               }
-             }
-           },
-           "host": {
-             "properties": {
-               "name": {
-                 "type": "keyword"
-               }
-             }
-           },
-           "event": {
-             "properties": {
-               "dataset": {
-                 "type": "keyword"
-               }
-             }
-           },
-           "message": {
-             "type": "text"
-           }
-         }
-       }
-     },
-     "_meta": {
-       "descripcion": "Settings ILM y campos ECS mínimos para logs operativos",
-       "version_laboratorio": "v1"
-     }
-   }
-   EOF
-
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     -X PUT "$ES_URL/_component_template/logs-ops-component-v1" \
-     -H "Content-Type: application/json" \
-     --data-binary @/opt/elastic-labs/work/logs-ops-component-v1.json \
-     | tee /opt/elastic-labs/work/06-component-template-result.json
-   ```
-
-2. Cree el index template para el patrón `logs-ops-lab*`.
-
-   La prioridad `500` evita que un template genérico de menor prioridad reemplace la configuración del laboratorio.
-
-   ```bash
-   cat > /opt/elastic-labs/work/logs-ops-template-v1.json <<'EOF'
-   {
-     "index_patterns": ["logs-ops-lab*"],
-     "data_stream": {},
-     "composed_of": ["logs-ops-component-v1"],
-     "priority": 500,
-     "_meta": {
-       "descripcion": "Template de data stream para logs operativos del laboratorio",
-       "propietario": "equipo-plataforma"
-     }
-   }
-   EOF
-
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     -X PUT "$ES_URL/_index_template/logs-ops-template-v1" \
-     -H "Content-Type: application/json" \
-     --data-binary @/opt/elastic-labs/work/logs-ops-template-v1.json \
-     | tee /opt/elastic-labs/work/06-index-template-result.json
-   ```
-
-3. Simule el template antes de crear el data stream.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     -X POST "$ES_URL/_index_template/_simulate_index/logs-ops-lab?pretty" \
-     | tee /opt/elastic-labs/work/06-template-simulation.json
-   ```
-
-#### Salida esperada
-
-Las operaciones `PUT` deben devolver:
-
-```json
-{
-  "acknowledged": true
-}
-```
-
-La simulación debe mostrar, dentro de `template.settings`, la política:
-
-```json
-{
-  "index": {
-    "lifecycle": {
-      "name": "logs-ops-ilm-v1"
+  "name": "orders-initech-app",
+  "expiration": "1d",
+  "role_descriptors": {
+    "initech-reader": {
+      "indices": [
+        {
+          "names": ["orders-shared"],
+          "privileges": ["read"],
+          "query": "{\"term\": {\"tenant_id\": \"initech\"}}"
+        }
+      ]
     }
   }
 }
 ```
 
-#### Verificación
+**Qué hace:** crea una credencial para una aplicación que solo debe ver los pedidos de `initech`. Copia el valor de `encoded`.
 
-```bash
-jq -r '.template.settings.index.lifecycle.name' \
-  /opt/elastic-labs/work/06-template-simulation.json
+- `role_descriptors`: permisos de la clave. Una API key nunca tiene más permisos que el usuario que la crea; aquí se restringen aún más con DLS.
+
+- `expiration`: vigencia. Las claves de una aplicación deben tener caducidad y rotarse.
+
+``` console
+curl.exe -s "<ES_URL>/orders-shared/_search?filter_path=hits.total.value,hits.hits._source.order_id" -H "Authorization: ApiKey <ENCODED_KEY>"
 ```
 
-La salida esperada es:
+**Resultado esperado:** `total.value` de 2, con los pedidos 4001 y 4002.
 
-```text
-logs-ops-ilm-v1
-```
+## Parte C: ILM sobre un data stream (8 min)
 
----
+ILM (index lifecycle management) mueve los índices por fases según su edad o tamaño. En este laboratorio los tiempos son de minutos para ver el resultado; en producción serían días o semanas.
 
-### Paso 7. Crear el data stream `logs-ops-lab`
+### Paso C1. Acelerar la revisión de ILM
 
-**Objetivo:** Crear un data stream protegido por el template y la política ILM.
-
-#### Instrucciones
-
-1. Cree el data stream.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     -X PUT "$ES_URL/_data_stream/logs-ops-lab" \
-     | tee /opt/elastic-labs/work/07-data-stream-create-result.json
-   ```
-
-2. Consulte los data streams existentes.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     "$ES_URL/_data_stream/logs-ops-lab?pretty" \
-     | tee /opt/elastic-labs/work/07-data-stream.json
-   ```
-
-3. Consulte el índice backing creado automáticamente.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     "$ES_URL/_cat/indices/.ds-logs-ops-lab-*?v"
-   ```
-
-#### Salida esperada
-
-La creación debe devolver:
-
-```json
+``` console
+PUT _cluster/settings
 {
-  "acknowledged": true
+  "persistent": {
+    "indices.lifecycle.poll_interval": "30s"
+  }
 }
 ```
 
-La consulta del data stream debe mostrar un índice backing similar a:
+**Qué hace:** ILM evalúa las políticas cada cierto intervalo, que por defecto es de 10 minutos. Con 30 segundos el laboratorio avanza rápido. Al final se restablece el valor.
 
-```text
-.ds-logs-ops-lab-2026.08.25-000001
-```
+Si Elastic Cloud rechaza el ajuste, continúa sin él: ILM seguirá funcionando y cada paso tardará hasta 10 minutos, de modo que la Parte E se hará con lo que haya avanzado.
 
-La fecha concreta dependerá de la fecha de ejecución.
+### Paso C2. Crear la política
 
-#### Verificación
-
-```bash
-jq -r '.data_streams[0].name' /opt/elastic-labs/work/07-data-stream.json
-```
-
-Salida esperada:
-
-```text
-logs-ops-lab
-```
-
----
-
-### Paso 8. Reinyectar eventos con campos ECS mínimos
-
-**Objetivo:** Copiar una selección de eventos desde `logs-app-lab-v1` hacia el nuevo data stream, normalizándolos a campos ECS mínimos.
-
-#### Instrucciones
-
-1. Consulte hasta 20 documentos del índice generado en la práctica anterior.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     -X POST "$ES_URL/logs-app-lab-v1/_search" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "size": 20,
-       "sort": [
-         {
-           "@timestamp": "desc"
-         }
-       ],
-       "_source": true,
-       "query": {
-         "match_all": {}
-       }
-     }' \
-     | tee /opt/elastic-labs/work/08-source-events.json
-   ```
-
-2. Genere un archivo NDJSON para Bulk API. Los documentos se transforman para garantizar los campos:
-
-   - `@timestamp`
-   - `log.level`
-   - `service.name`
-   - `host.name`
-   - `event.dataset`
-   - `message`
-
-   ```bash
-   jq -c '
-     .hits.hits[]._source as $s |
-     {"create": {}},
-     {
-       "@timestamp": ($s["@timestamp"] // (now | todateiso8601)),
-       "log": {
-         "level": ($s.log.level // $s["log.level"] // $s.level // "INFO")
-       },
-       "service": {
-         "name": ($s.service.name // $s["service.name"] // "logs-app-lab")
-       },
-       "host": {
-         "name": ($s.host.name // $s["host.name"] // "es717-lab-host")
-       },
-       "event": {
-         "dataset": ($s.event.dataset // $s["event.dataset"] // "logs.ops.lab")
-       },
-       "message": ($s.message // "Evento reinyectado desde logs-app-lab-v1")
-     }
-   ' /opt/elastic-labs/work/08-source-events.json \
-   > /opt/elastic-labs/work/08-logs-ops-bulk.ndjson
-   ```
-
-3. Si no existían eventos en `logs-app-lab-v1`, genere tres eventos controlados para continuar la práctica.
-
-   ```bash
-   if [ ! -s /opt/elastic-labs/work/08-logs-ops-bulk.ndjson ]; then
-     cat > /opt/elastic-labs/work/08-logs-ops-bulk.ndjson <<'EOF'
-   {"create":{}}
-   {"@timestamp":"2026-08-25T10:00:00Z","log":{"level":"INFO"},"service":{"name":"checkout-api"},"host":{"name":"app-node-01"},"event":{"dataset":"logs.ops.lab"},"message":"Servicio iniciado correctamente"}
-   {"create":{}}
-   {"@timestamp":"2026-08-25T10:05:00Z","log":{"level":"WARN"},"service":{"name":"checkout-api"},"host":{"name":"app-node-01"},"event":{"dataset":"logs.ops.lab"},"message":"Latencia elevada detectada"}
-   {"create":{}}
-   {"@timestamp":"2026-08-25T10:10:00Z","log":{"level":"ERROR"},"service":{"name":"checkout-api"},"host":{"name":"app-node-02"},"event":{"dataset":"logs.ops.lab"},"message":"Error de conexión con el servicio de pagos"}
-   EOF
-   fi
-   ```
-
-4. Inyecte los documentos en el data stream usando la cuenta administrativa. La API Bulk utiliza la operación `create`, apropiada para data streams.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     -X POST "$ES_URL/logs-ops-lab/_bulk?filter_path=errors,items.*.create.status,items.*.create.error" \
-     -H "Content-Type: application/x-ndjson" \
-     --data-binary @/opt/elastic-labs/work/08-logs-ops-bulk.ndjson \
-     | tee /opt/elastic-labs/work/08-bulk-result.json
-   ```
-
-5. Consulte los eventos reinyectados.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     -X POST "$ES_URL/logs-ops-lab/_search?pretty" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "size": 10,
-       "sort": [
-         {
-           "@timestamp": "desc"
-         }
-       ],
-       "query": {
-         "match_all": {}
-       }
-     }' \
-     | tee /opt/elastic-labs/work/08-logs-ops-search.json
-   ```
-
-#### Salida esperada
-
-El resultado de Bulk debe indicar:
-
-```json
+``` console
+PUT _ilm/policy/curso-logs-ilm
 {
-  "errors": false
-}
-```
-
-La búsqueda debe devolver documentos con estructura similar a:
-
-```json
-{
-  "@timestamp": "2026-08-25T10:10:00Z",
-  "log": {
-    "level": "ERROR"
-  },
-  "service": {
-    "name": "checkout-api"
-  },
-  "host": {
-    "name": "app-node-02"
-  },
-  "event": {
-    "dataset": "logs.ops.lab"
-  },
-  "message": "Error de conexión con el servicio de pagos"
-}
-```
-
-#### Verificación
-
-```bash
-jq '.hits.total' /opt/elastic-labs/work/08-logs-ops-search.json
-jq -r '.hits.hits[0]._source.event.dataset' /opt/elastic-labs/work/08-logs-ops-search.json
-```
-
-El total debe ser mayor que cero y el dataset debe ser:
-
-```text
-logs.ops.lab
-```
-
----
-
-### Paso 9. Crear y validar una API key limitada para ingestión
-
-**Objetivo:** Crear una API key que solo pueda insertar documentos en `logs-ops-lab` y comprobar que no tenga privilegios administrativos.
-
-#### Instrucciones
-
-1. Cree la API key limitada. La clave expira después de 30 días.
-
-   ```bash
-   cat > /opt/elastic-labs/work/09-api-key-request.json <<'EOF'
-   {
-     "name": "ingest-logs-ops-lab",
-     "expiration": "30d",
-     "role_descriptors": {
-       "ingest_logs_ops_lab": {
-         "cluster": [],
-         "index": [
-           {
-             "names": ["logs-ops-lab*"],
-             "privileges": ["create_doc"]
-           }
-         ]
-       }
-     },
-     "metadata": {
-       "sistema": "elastic-lab",
-       "entorno": "laboratorio",
-       "propietario": "practica-07",
-       "uso": "ingestion-logs"
-     }
-   }
-   EOF
-
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     -X POST "$ES_URL/_security/api_key" \
-     -H "Content-Type: application/json" \
-     --data-binary @/opt/elastic-labs/work/09-api-key-request.json \
-     > /opt/elastic-labs/work/09-api-key-response.secret.json
-
-   chmod 600 /opt/elastic-labs/work/09-api-key-response.secret.json
-   ```
-
-2. Extraiga la clave codificada y guárdela en un archivo secreto local con permisos `0600`.
-
-   ```bash
-   jq -r '.encoded' /opt/elastic-labs/work/09-api-key-response.secret.json \
-     > /opt/elastic-labs/work/ingest-logs-ops-lab-api-key.secret
-
-   chmod 600 /opt/elastic-labs/work/ingest-logs-ops-lab-api-key.secret
-
-   jq 'del(.encoded)' /opt/elastic-labs/work/09-api-key-response.secret.json \
-     > /opt/elastic-labs/work/09-api-key-evidence.json
-
-   export API_KEY="$(cat /opt/elastic-labs/work/ingest-logs-ops-lab-api-key.secret)"
-   ```
-
-3. Verifique los metadatos de creación sin exponer la API key.
-
-   ```bash
-   jq '{id, name, expiration, metadata}' \
-     /opt/elastic-labs/work/09-api-key-evidence.json
-   ```
-
-4. Inserte un documento usando la API key.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -X POST "$ES_URL/logs-ops-lab/_doc" \
-     -H "Authorization: ApiKey $API_KEY" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "@timestamp": "2026-08-25T12:00:00Z",
-       "log": {
-         "level": "INFO"
-       },
-       "service": {
-         "name": "api-ingestion-test"
-       },
-       "host": {
-         "name": "agent-lab-01"
-       },
-       "event": {
-         "dataset": "logs.ops.lab"
-       },
-       "message": "Documento insertado mediante API key limitada"
-     }' \
-     | tee /opt/elastic-labs/work/09-api-key-index-result.json
-   ```
-
-5. Intente ejecutar una operación administrativa con la API key. Esta acción debe fallar.
-
-   ```bash
-   curl --silent --show-error \
-     --cacert "$ES_CA" \
-     -o /opt/elastic-labs/work/09-api-key-admin-denied.json \
-     -w "HTTP_STATUS=%{http_code}\n" \
-     -X GET "$ES_URL/_cluster/health" \
-     -H "Authorization: ApiKey $API_KEY"
-   ```
-
-6. Consulte la respuesta de denegación.
-
-   ```bash
-   cat /opt/elastic-labs/work/09-api-key-admin-denied.json | jq .
-   ```
-
-#### Salida esperada
-
-La inserción con API key debe devolver un resultado con `result` igual a `created`.
-
-La solicitud a `/_cluster/health` debe devolver:
-
-```text
-HTTP_STATUS=403
-```
-
-La respuesta JSON debe contener un error de seguridad similar a:
-
-```json
-{
-  "error": {
-    "type": "security_exception",
-    "reason": "action [cluster:monitor/health] is unauthorized for API key id [...]"
-  },
-  "status": 403
-}
-```
-
-#### Verificación
-
-Compruebe que la API key no tenga privilegios de clúster y que pueda crear documentos:
-
-```bash
-jq -r '.result' /opt/elastic-labs/work/09-api-key-index-result.json
-grep -q 'HTTP_STATUS=403' <(
-  curl --silent --cacert "$ES_CA" \
-    -o /dev/null \
-    -w "HTTP_STATUS=%{http_code}\n" \
-    -X GET "$ES_URL/_cluster/health" \
-    -H "Authorization: ApiKey $API_KEY"
-) && echo "API key correctamente restringida"
-```
-
-Salida esperada:
-
-```text
-created
-API key correctamente restringida
-```
-
----
-
-### Paso 10. Forzar rollover y comprobar la asignación de ILM
-
-**Objetivo:** Crear un nuevo índice backing de forma controlada y verificar que ILM administra ambos índices backing.
-
-#### Instrucciones
-
-1. Consulte el data stream antes del rollover.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     "$ES_URL/_data_stream/logs-ops-lab?pretty" \
-     | tee /opt/elastic-labs/work/10-data-stream-before-rollover.json
-   ```
-
-2. Fuerce un rollover manual del data stream.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     -X POST "$ES_URL/logs-ops-lab/_rollover" \
-     -H "Content-Type: application/json" \
-     -d '{}' \
-     | tee /opt/elastic-labs/work/10-rollover-result.json
-   ```
-
-3. Consulte de nuevo el data stream.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     "$ES_URL/_data_stream/logs-ops-lab?pretty" \
-     | tee /opt/elastic-labs/work/10-data-stream-after-rollover.json
-   ```
-
-4. Consulte el estado ILM de los índices backing.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     "$ES_URL/logs-ops-lab/_ilm/explain?pretty" \
-     | tee /opt/elastic-labs/work/10-ilm-explain.json
-   ```
-
-5. Liste los índices backing y su política de ciclo de vida.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     "$ES_URL/_cat/indices/.ds-logs-ops-lab-*?h=health,status,index,docs.count,store.size&v"
-   ```
-
-#### Salida esperada
-
-El resultado de rollover debe contener valores similares a:
-
-```json
-{
-  "old_index": ".ds-logs-ops-lab-2026.08.25-000001",
-  "new_index": ".ds-logs-ops-lab-2026.08.25-000002",
-  "rolled_over": true,
-  "dry_run": false
-}
-```
-
-En la respuesta de ILM Explain, los índices backing deben referenciar la política:
-
-```json
-{
-  "policy": "logs-ops-ilm-v1",
-  "phase": "hot"
-}
-```
-
-#### Verificación
-
-```bash
-jq '
-  .indices
-  | to_entries[]
-  | {
-      index: .key,
-      policy: .value.policy,
-      phase: .value.phase,
-      action: .value.action,
-      step: .value.step
+  "policy": {
+    "phases": {
+      "hot": {
+        "actions": {
+          "rollover": { "max_docs": 20, "max_primary_shard_size": "50gb" },
+          "set_priority": { "priority": 100 }
+        }
+      },
+      "warm": {
+        "min_age": "1m",
+        "actions": {
+          "set_priority": { "priority": 50 },
+          "readonly": {},
+          "forcemerge": { "max_num_segments": 1 }
+        }
+      },
+      "delete": {
+        "min_age": "4m",
+        "actions": { "delete": {} }
+      }
     }
-' /opt/elastic-labs/work/10-ilm-explain.json
-```
-
-Debe observar dos índices backing o más, todos asociados a `logs-ops-ilm-v1`.
-
----
-
-### Paso 11. Validar permisos de analista e ingesta
-
-**Objetivo:** Confirmar que cada identidad solo puede ejecutar las acciones previstas por su rol.
-
-#### Instrucciones
-
-1. Valide que `analyst_lab` puede leer logs.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "analyst_lab:$LAB_ANALYST_PASSWORD" \
-     -X POST "$ES_URL/logs-ops-lab/_search" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "size": 5,
-       "query": {
-         "match_all": {}
-       }
-     }' \
-     | tee /opt/elastic-labs/work/11-analyst-search-success.json
-   ```
-
-2. Valide que `analyst_lab` no puede escribir en el data stream.
-
-   ```bash
-   curl --silent --show-error \
-     --cacert "$ES_CA" \
-     -u "analyst_lab:$LAB_ANALYST_PASSWORD" \
-     -o /opt/elastic-labs/work/11-analyst-write-denied.json \
-     -w "HTTP_STATUS=%{http_code}\n" \
-     -X POST "$ES_URL/logs-ops-lab/_doc" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "@timestamp": "2026-08-25T13:00:00Z",
-       "message": "Esta operación debe ser denegada"
-     }'
-   ```
-
-3. Valide que `ingest_lab` puede crear un documento.
-
-   ```bash
-   curl --silent --show-error --fail \
-     --cacert "$ES_CA" \
-     -u "ingest_lab:$LAB_INGEST_PASSWORD" \
-     -X POST "$ES_URL/logs-ops-lab/_doc" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "@timestamp": "2026-08-25T13:05:00Z",
-       "log": {
-         "level": "INFO"
-       },
-       "service": {
-         "name": "native-user-ingestion"
-       },
-       "host": {
-         "name": "agent-lab-02"
-       },
-       "event": {
-         "dataset": "logs.ops.lab"
-       },
-       "message": "Documento creado por el usuario ingest_lab"
-     }' \
-     | tee /opt/elastic-labs/work/11-ingest-user-write-success.json
-   ```
-
-4. Valide que `ingest_lab` no puede leer documentos.
-
-   ```bash
-   curl --silent --show-error \
-     --cacert "$ES_CA" \
-     -u "ingest_lab:$LAB_INGEST_PASSWORD" \
-     -o /opt/elastic-labs/work/11-ingest-user-read-denied.json \
-     -w "HTTP_STATUS=%{http_code}\n" \
-     -X POST "$ES_URL/logs-ops-lab/_search" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "query": {
-         "match_all": {}
-       }
-     }'
-   ```
-
-5. Revise las respuestas de denegación.
-
-   ```bash
-   jq '.error.reason' /opt/elastic-labs/work/11-analyst-write-denied.json
-   jq '.error.reason' /opt/elastic-labs/work/11-ingest-user-read-denied.json
-   ```
-
-#### Salida esperada
-
-| Prueba | Resultado esperado |
-|---|---|
-| `analyst_lab` realiza `_search` | HTTP 200 |
-| `analyst_lab` intenta indexar | HTTP 403 |
-| `ingest_lab` crea documento | HTTP 201 |
-| `ingest_lab` intenta `_search` | HTTP 403 |
-
-#### Verificación
-
-Ejecute las comprobaciones resumidas:
-
-```bash
-jq -r '.hits.total.value // .hits.total' \
-  /opt/elastic-labs/work/11-analyst-search-success.json
-
-jq -r '.result' \
-  /opt/elastic-labs/work/11-ingest-user-write-success.json
-```
-
-La primera salida debe ser mayor que cero. La segunda debe ser:
-
-```text
-created
-```
-
----
-
-### Paso 12. Preparar la fuente de datos para Discover
-
-**Objetivo:** Confirmar que el data stream está disponible para utilizarse en Discover durante la práctica siguiente.
-
-#### Instrucciones
-
-1. Acceda a Kibana en el navegador usando el endpoint definido por el laboratorio, normalmente:
-
-   ```text
-   https://localhost:5601
-   ```
-
-2. Inicie sesión como `elastic`.
-
-3. Abra **Stack Management** → **Data Views** → **Create data view**.
-
-4. Cree una vista de datos con los siguientes valores:
-
-   | Campo | Valor |
-   |---|---|
-   | Nombre | `Logs Ops Lab` |
-   | Patrón de índice | `logs-ops-lab*` |
-   | Campo de tiempo | `@timestamp` |
-
-5. Guarde la vista de datos.
-
-6. Abra **Analytics** → **Discover** y seleccione la vista `Logs Ops Lab`.
-
-7. Aplique un filtro KQL para confirmar que se visualizan los documentos:
-
-   ```kql
-   event.dataset: "logs.ops.lab"
-   ```
-
-8. Opcionalmente, cierre sesión e inicie como `analyst_lab` para comprobar el acceso de solo lectura a Discover.
-
-#### Salida esperada
-
-Discover debe mostrar eventos del data stream `logs-ops-lab`, incluidos documentos con campos:
-
-- `@timestamp`
-- `log.level`
-- `service.name`
-- `host.name`
-- `event.dataset`
-- `message`
-
-#### Verificación
-
-En Discover, ejecute la consulta KQL:
-
-```kql
-log.level: ERROR
-```
-
-Debe aparecer al menos el evento de error reinyectado o creado durante esta práctica.
-
----
-
-## Validación y pruebas
-
-Ejecute el siguiente bloque para realizar una validación resumida del laboratorio:
-
-```bash
-echo "=== Salud del clúster ==="
-curl --silent --show-error --fail \
-  --cacert "$ES_CA" \
-  -u "$ES_USER:$ELASTIC_PASSWORD" \
-  "$ES_URL/_cluster/health?filter_path=status,cluster_name&pretty"
-
-echo
-echo "=== Roles de laboratorio ==="
-curl --silent --show-error --fail \
-  --cacert "$ES_CA" \
-  -u "$ES_USER:$ELASTIC_PASSWORD" \
-  "$ES_URL/_security/role/log_ingestor_lab,log_analyst_lab,log_operator_lab?pretty" \
-  | jq 'keys'
-
-echo
-echo "=== Usuarios nativos ==="
-curl --silent --show-error --fail \
-  --cacert "$ES_CA" \
-  -u "$ES_USER:$ELASTIC_PASSWORD" \
-  "$ES_URL/_security/user/ingest_lab,analyst_lab?pretty" \
-  | jq 'to_entries[] | {usuario: .key, roles: .value.roles, enabled: .value.enabled}'
-
-echo
-echo "=== Data stream ==="
-curl --silent --show-error --fail \
-  --cacert "$ES_CA" \
-  -u "$ES_USER:$ELASTIC_PASSWORD" \
-  "$ES_URL/_data_stream/logs-ops-lab?pretty" \
-  | jq '.data_streams[] | {name, generation, indices}'
-
-echo
-echo "=== Estado ILM ==="
-curl --silent --show-error --fail \
-  --cacert "$ES_CA" \
-  -u "$ES_USER:$ELASTIC_PASSWORD" \
-  "$ES_URL/logs-ops-lab/_ilm/explain?pretty" \
-  | jq '.indices | to_entries[] | {index: .key, policy: .value.policy, phase: .value.phase}'
-
-echo
-echo "=== Conteo de documentos ==="
-curl --silent --show-error --fail \
-  --cacert "$ES_CA" \
-  -u "$ES_USER:$ELASTIC_PASSWORD" \
-  "$ES_URL/logs-ops-lab/_count?pretty"
-```
-
-La práctica se considera completada cuando se cumplen todas las condiciones siguientes:
-
-- El clúster responde mediante HTTPS y autenticación.
-- Existen los tres roles definidos.
-- Existen los usuarios `ingest_lab` y `analyst_lab`.
-- Existe la política `logs-ops-ilm-v1`.
-- Existe el data stream `logs-ops-lab`.
-- El data stream contiene al menos un índice backing administrado por ILM.
-- Se ha realizado un rollover y existe una nueva generación del data stream.
-- La API key puede crear documentos, pero no consultar salud del clúster.
-- `analyst_lab` puede leer, pero no escribir.
-- `ingest_lab` puede escribir, pero no leer.
-
-## Resolución de problemas
-
-### Problema 1. `curl` devuelve un error de certificado TLS o no puede verificar la CA
-
-**Síntomas**
-
-```text
-curl: (60) SSL certificate problem: unable to get local issuer certificate
-```
-
-o:
-
-```text
-curl: (60) SSL certificate problem: certificate verify failed
-```
-
-**Causa**
-
-El comando no está usando el certificado CA del laboratorio, la ruta es incorrecta o el certificado presentado por Elasticsearch no corresponde al nombre de host utilizado.
-
-**Solución**
-
-1. Verifique que el certificado exista y pueda leerse.
-
-   ```bash
-   ls -l /opt/elastic-labs/certs/ca/ca.crt
-   ```
-
-2. Asegúrese de utilizar HTTPS y la opción `--cacert`.
-
-   ```bash
-   curl --cacert /opt/elastic-labs/certs/ca/ca.crt \
-     -u "elastic:$ELASTIC_PASSWORD" \
-     https://localhost:9200/
-   ```
-
-3. No utilice `-k` o `--insecure` como solución permanente. Esa opción desactiva la validación TLS y oculta errores reales de certificados o nombres DNS.
-
-4. Si el certificado no contiene `localhost` como SAN, consulte la configuración de la composición del laboratorio y utilice el nombre configurado en el certificado.
-
-### Problema 2. La escritura en el data stream devuelve `403 security_exception` o `illegal_argument_exception`
-
-**Síntomas**
-
-La API key o el usuario `ingest_lab` recibe un error similar a:
-
-```json
-{
-  "error": {
-    "type": "security_exception",
-    "reason": "action [indices:data/write/index] is unauthorized"
-  },
-  "status": 403
+  }
 }
 ```
 
-O la API Bulk muestra errores por operación no permitida en un data stream.
+**Qué hace:** define tres fases: hot (índice activo), warm (índice cerrado a escritura y compactado) y delete (retención vencida).
 
-**Causa**
+- `rollover`: crea un índice nuevo cuando se cumple cualquiera de las condiciones. `max_docs: 20` es solo para el laboratorio; en producción se usa `max_primary_shard_size` (hasta 50 GB por shard) y, si hace falta, `max_age`.
 
-Las causas más frecuentes son:
+- `min_age`: edad mínima para entrar en la fase. Para un índice que hizo rollover se cuenta desde el momento del rollover, no desde su creación.
 
-- El rol o la API key no tiene `create_doc` sobre el patrón `logs-ops-lab*`.
-- Se está escribiendo en un nombre diferente de `logs-ops-lab`.
-- Se usa una operación `index` en lugar de `create` mediante Bulk API.
-- El data stream o su index template no existe.
+- `set_priority`: prioridad de recuperación tras un reinicio; los índices recientes se recuperan primero.
 
-**Solución**
+- `readonly`: bloquea las escrituras en el índice. `forcemerge` con `max_num_segments: 1`: compacta el índice (solo es seguro porque ya no recibe escrituras).
 
-1. Compruebe que el data stream exista.
+- `delete`: borra el índice completo. Borrar índices es mucho más barato que borrar documentos.
 
-   ```bash
-   curl --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     "$ES_URL/_data_stream/logs-ops-lab?pretty"
-   ```
+En un clúster con nodos warm, la fase warm también mueve los shards a ese tier. El deployment de la prueba puede tener solo nodos hot: en ese caso los shards permanecen donde están y la política avanza igual.
 
-2. Compruebe los privilegios del rol de ingestión.
+### Paso C3. Template y data stream
 
-   ```bash
-   curl --cacert "$ES_CA" \
-     -u "$ES_USER:$ELASTIC_PASSWORD" \
-     "$ES_URL/_security/role/log_ingestor_lab?pretty"
-   ```
+``` console
+PUT _index_template/ilmtest-template
+{
+  "index_patterns": ["ilmtest-*"],
+  "priority": 300,
+  "data_stream": {},
+  "template": {
+    "settings": {
+      "index.lifecycle.name": "curso-logs-ilm",
+      "number_of_shards": 1,
+      "number_of_replicas": 1
+    },
+    "mappings": {
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "service":    { "type": "keyword" },
+        "message":    { "type": "text" }
+      }
+    }
+  }
+}
+```
 
-3. Confirme que el rol contiene:
+**Qué hace:** declara que los nombres `ilmtest-*` son data streams, con la política de ILM asociada mediante `index.lifecycle.name`.
 
-   ```json
-   {
-     "names": ["logs-ops-lab*"],
-     "privileges": ["create_doc"]
-   }
-   ```
+- `data_stream: {}`: convierte el template en uno de data streams; el primer documento crea el data stream y su primer índice de respaldo.
 
-4. Para Bulk API, utilice una línea de acción `create`:
+- Si no se indicara `index.lifecycle.name`, un data stream usaría su ciclo de vida propio (data stream lifecycle). Cuando se indica una política de ILM, esta tiene prioridad.
 
-   ```json
-   {"create":{}}
-   ```
+### Paso C4. Cargar documentos
 
-5. Si se modificó el rol o la API key, repita la creación de la API key para garantizar que se apliquen los privilegios previstos.
+``` console
+POST _reindex
+{
+  "max_docs": 25,
+  "source": {
+    "index": "weblogs",
+    "query": { "term": { "service": "payments" } },
+    "_source": ["@timestamp", "service", "message"]
+  },
+  "dest": { "index": "ilmtest-ds", "op_type": "create" }
+}
 
-## Limpieza
+GET ilmtest-ds/_count
+```
 
-Esta práctica deja recursos que serán utilizados en actividades posteriores. No elimine el data stream, los templates, la política ILM, los usuarios ni los volúmenes Docker.
+**Qué hace:** copia 25 documentos de pagos a `ilmtest-ds`. Como no existe, se crea como data stream.
 
-1. Elimine de la sesión actual las variables sensibles.
+- `max_docs`: limita el número de documentos copiados.
 
-   ```bash
-   unset API_KEY
-   unset LAB_INGEST_PASSWORD
-   unset LAB_ANALYST_PASSWORD
-   unset ELASTIC_PASSWORD
-   ```
+- `_source` (dentro de `source`): copia solo esos campos.
 
-2. Mantenga protegido el archivo que contiene la API key del laboratorio.
+- `op_type: create`: los data streams solo aceptan documentos nuevos (son append-only), no actualizaciones.
 
-   ```bash
-   chmod 600 /opt/elastic-labs/work/ingest-logs-ops-lab-api-key.secret
-   chmod 600 /opt/elastic-labs/work/09-api-key-response.secret.json
-   ```
+**Resultado esperado:** `created: 25` y `count` de 25. Supera el umbral de 20 documentos, así que el siguiente ciclo de ILM hará el rollover.
 
-3. Si no necesita conservar la respuesta completa que incluye la API key codificada, elimínela. La evidencia sin el secreto permanece en `09-api-key-evidence.json`.
+``` console
+GET _data_stream/ilmtest-ds?filter_path=data_streams.name,data_streams.generation,data_streams.ilm_policy,data_streams.indices.index_name
+```
 
-   ```bash
-   rm -f /opt/elastic-labs/work/09-api-key-response.secret.json
-   ```
+**Resultado esperado:** `generation` de 1, `ilm_policy` igual a `curso-logs-ilm` y un índice de respaldo con nombre `.ds-ilmtest-ds-<fecha>-000001`. Revisa de nuevo en la Parte E.
 
-4. No ejecute los siguientes comandos:
+## Parte D: snapshots, restore y SLM (14 min)
 
-   ```bash
-   docker compose down -v
-   docker volume rm es717-data
-   ```
+### Paso D1. El repositorio de Elastic Cloud
 
-## Resumen
+``` console
+GET _snapshot
 
-En esta práctica se verificó el uso de TLS y autenticación en Elasticsearch 7.17.29, separando la cuenta administrativa de las identidades operativas. Se implementaron roles de mínimo privilegio para ingestión, análisis y monitorización, y se validó que una API key limitada no puede realizar operaciones administrativas.
+GET _snapshot/found-snapshots/*?size=3&sort=start_time&order=desc&filter_path=snapshots.snapshot,snapshots.state,snapshots.start_time
 
-También se creó la política `logs-ops-ilm-v1`, el component template, el index template y el data stream `logs-ops-lab`. Los eventos reinyectados disponen de campos ECS mínimos y los índices backing están administrados por ILM. El rollover controlado demostró la creación de una nueva generación del data stream, que quedará disponible para análisis en Discover durante la siguiente práctica.
+GET _slm/policy/cloud-snapshot-policy?filter_path=*.policy.schedule,*.policy.retention,*.last_success.snapshot_name
+```
 
-### Recursos opcionales
+**Qué hace:** muestra los repositorios registrados, los tres snapshots más recientes y la política automática de la plataforma.
 
-- [Elasticsearch Security](https://www.elastic.co/docs/deploy-manage/security)
-- [Roles y privilegios en Elasticsearch](https://www.elastic.co/docs/deploy-manage/users-roles/cluster-or-deployment-auth/user-roles)
-- [API keys de Elasticsearch](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-security-create-api-key)
-- [Index Lifecycle Management](https://www.elastic.co/guide/en/elasticsearch/reference/7.17/index-lifecycle-management.html)
-- [Data streams en Elasticsearch 7.17](https://www.elastic.co/guide/en/elasticsearch/reference/7.17/data-streams.html)
+- `found-snapshots`: repositorio que Elastic Cloud registra en todo deployment Hosted.
+
+- `cloud-snapshot-policy`: política SLM de la plataforma. Por defecto toma un snapshot de todos los índices cada 30 minutos.
+
+- `size`, `sort`, `order`: limitan y ordenan el listado de snapshots.
+
+- `schedule` y `retention`: cuándo se ejecuta y cuánto se conservan. Anótalos.
+
+Los snapshots son incrementales: cada uno guarda solo los segmentos nuevos desde el anterior. Por eso un snapshot cada 30 minutos no multiplica el espacio.
+
+### Paso D2. Snapshot manual
+
+``` console
+PUT _snapshot/found-snapshots/lab07-orders-1?wait_for_completion=true
+{
+  "indices": ["orders-shared", "weblogs-v1"],
+  "include_global_state": false,
+  "metadata": { "tomado_por": "laboratorio 7" }
+}
+```
+
+**Qué hace:** toma un snapshot de dos índices del curso y espera a que termine.
+
+- `lab07-orders-1`: nombre del snapshot dentro del repositorio.
+
+- `wait_for_completion=true`: la respuesta llega al terminar. Sin él, la API devuelve de inmediato y el snapshot sigue en segundo plano.
+
+- `indices`: qué incluir. Sin este campo se incluyen todos los índices y data streams.
+
+- `include_global_state: false`: no incluye la configuración global del clúster (templates, políticas, etc.). Para restaurar datos suele ser lo adecuado; restaurar el estado global puede sobrescribir configuración.
+
+- `metadata`: información libre para documentar el snapshot.
+
+**Resultado esperado:** `"state": "SUCCESS"` y `shards.total` de 2 con `failed` en 0.
+
+### Paso D3. Simular una pérdida y restaurar
+
+``` console
+POST orders-shared/_delete_by_query?refresh=true
+{
+  "query": { "term": { "tenant_id": "globex" } }
+}
+
+GET orders-shared/_count
+```
+
+**Qué hace:** simula un borrado accidental de los pedidos de `globex`. **Resultado esperado:** `deleted: 2` y `count` de 4.
+
+``` console
+POST _snapshot/found-snapshots/lab07-orders-1/_restore?wait_for_completion=true
+{
+  "indices": "orders-shared",
+  "rename_pattern": "(.+)",
+  "rename_replacement": "restored-$1",
+  "include_aliases": false,
+  "include_global_state": false
+}
+
+GET restored-orders-shared/_count
+```
+
+**Qué hace:** restaura el índice del snapshot con otro nombre, sin tocar el original.
+
+- `rename_pattern` y `rename_replacement`: expresión regular y reemplazo para renombrar. `(.+)` captura el nombre completo y `$1` lo reutiliza con el prefijo `restored-`.
+
+- `include_aliases: false`: no recrea los alias, que seguirían apuntando al índice original.
+
+- Restaurar sobre el nombre original solo es posible si el índice está cerrado o no existe. Con otro nombre se puede comparar antes de decidir.
+
+**Resultado esperado:** `count` de 6 en el índice restaurado.
+
+``` console
+POST _reindex
+{
+  "source": {
+    "index": "restored-orders-shared",
+    "query": { "term": { "tenant_id": "globex" } }
+  },
+  "dest": { "index": "orders-shared", "op_type": "create" }
+}
+
+GET orders-shared/_count
+```
+
+**Qué hace:** devuelve a `orders-shared` solo los documentos perdidos. `op_type: create` evita sobrescribir documentos existentes (los `_id` se conservan). **Resultado esperado:** `created: 2` y `count` de 6.
+
+### Paso D4. Política de snapshots propia (SLM)
+
+``` console
+PUT _slm/policy/curso-diario
+{
+  "schedule": "0 30 1 * * ?",
+  "name": "<curso-{now/d}>",
+  "repository": "found-snapshots",
+  "config": {
+    "indices": ["orders-shared", "weblogs-v1"],
+    "include_global_state": false
+  },
+  "retention": {
+    "expire_after": "7d",
+    "min_count": 2,
+    "max_count": 10
+  }
+}
+
+POST _slm/policy/curso-diario/_execute
+```
+
+**Qué hace:** crea una política que toma un snapshot de los dos índices cada día y la ejecuta una vez de inmediato.
+
+- `schedule`: expresión cron de Elasticsearch (segundos, minutos, horas, día del mes, mes, día de la semana). `0 30 1 * * ?` es todos los días a la 01:30 UTC.
+
+- `name`: nombre de cada snapshot, con fecha (`<curso-{now/d}>` se resuelve a `curso-<fecha>`) más un sufijo único.
+
+- `retention.expire_after`: antigüedad a partir de la cual un snapshot de esta política es elegible para borrado.
+
+- `min_count` y `max_count`: mínimo que siempre se conserva y máximo permitido.
+
+- `_execute`: dispara la política ahora, sin esperar al horario. Devuelve el nombre del snapshot.
+
+``` console
+GET _slm/policy/curso-diario?filter_path=*.last_success,*.last_failure,*.next_execution_millis
+```
+
+**Resultado esperado:** `last_success` con el nombre del snapshot. La retención se aplica según `slm.retention_schedule` (por defecto, a la 01:30 UTC) y solo afecta a los snapshots de esta política.
+
+## Parte E: resultado de ILM (6 min)
+
+``` console
+GET _data_stream/ilmtest-ds?filter_path=data_streams.generation,data_streams.indices.index_name
+
+GET ilmtest-ds/_ilm/explain?filter_path=indices.*.index,indices.*.phase,indices.*.action,indices.*.step,indices.*.age
+```
+
+**Qué hace:** muestra los índices de respaldo del data stream y en qué punto de su ciclo está cada uno.
+
+- `phase`, `action`, `step`: fase, acción y paso en curso. El paso `complete` indica que terminó la fase.
+
+- `age`: edad del índice (desde el rollover).
+
+- `step_info` (si aparece): detalle del error cuando el paso está en `ERROR`. Se reintenta con `POST <índice>/_ilm/retry`.
+
+Cronología esperada con `poll_interval` de 30 s:
+
+| **Momento**                | **Qué se observa**                                                                                    |
+|----------------------------|-------------------------------------------------------------------------------------------------------|
+| Primer ciclo               | Rollover: `generation` de 2; aparece el índice `...-000002` como índice de escritura.                 |
+| 1 min después del rollover | El índice `...-000001` pasa a la fase `warm`: solo lectura y compactado a un segmento.                |
+| 4 min después del rollover | El índice `...-000001` entra en `delete` y desaparece. Quedan solo los documentos del índice vigente. |
+
+Si tras 3 minutos no hay rollover, fuerza uno con `POST ilmtest-ds/_rollover` y vuelve a consultar `_ilm/explain`. La política se aplicará a partir de ese momento.
+
+Pregunta para observar: después de que el primer índice se borra, `GET ilmtest-ds/_count` devuelve menos documentos que los 25 iniciales. ¿Por qué? Esto es lo que significa la retención por índices completos.
+
+## Parte F: auditoría, gobernanza y limpieza (8 min)
+
+### Paso F1. Auditoría (demostración del instructor)
+
+La auditoría registra eventos de seguridad: autenticaciones fallidas, accesos denegados, cambios de roles. Está desactivada por defecto. En Elastic Cloud Hosted se activa en la consola, en el deployment, con la opción **Edit**, y se añade el ajuste `xpack.security.audit.enabled: true` en la configuración de usuario de Elasticsearch y de Kibana. Guardar el cambio ejecuta un cambio de plan en el deployment, y los registros se entregan al deployment de monitoreo.
+
+Por eso no se hace en el laboratorio: requiere monitoreo configurado y un cambio de plan. El instructor puede mostrarlo en su propio deployment y revisar los eventos de los pasos B5 y B6 (accesos denegados del usuario `ana_acme`). Los eventos útiles para revisar son `authentication_failed` y `access_denied`.
+
+### Paso F2. Matriz de usuarios, roles y tenants
+
+Completa la matriz con lo que configuraste y los resultados de tus pruebas. Es el documento que un auditor pediría primero.
+
+| **Identidad**              | **Rol**                     | **Tenant** | **Alcance**               | **DLS / FLS** | **Prueba y resultado**           |
+|----------------------------|-----------------------------|------------|---------------------------|---------------|----------------------------------|
+| `ana_acme`                 | `orders_acme_reader`        | acme       | `read` en `orders-shared` | DLS / no      |                                  |
+| `gus_globex`               | `orders_globex_reader`      | globex     | `read` en `orders-shared` | DLS / FLS     |                                  |
+| Clave `orders-initech-app` | Descriptor `initech-reader` | initech    | `read` en `orders-shared` | DLS / no      |                                  |
+| `elastic`                  | `superuser`                 | todos      | Todo                      | No aplica     | Uso restringido a administración |
+
+### Paso F3. Limpieza
+
+``` console
+DELETE _data_stream/ilmtest-ds
+DELETE _index_template/ilmtest-template
+DELETE _ilm/policy/curso-logs-ilm
+DELETE restored-orders-shared
+
+DELETE _slm/policy/curso-diario
+DELETE _snapshot/found-snapshots/lab07-orders-1
+DELETE _snapshot/found-snapshots/curso-*
+
+DELETE _security/api_key
+{ "name": "orders-initech-app" }
+
+PUT _cluster/settings
+{
+  "persistent": { "indices.lifecycle.poll_interval": null }
+}
+```
+
+**Qué hace:** elimina lo creado en este laboratorio, en el orden que exigen las dependencias: la política de ILM no se puede borrar mientras un índice la use, por eso primero se elimina el data stream.
+
+- Borrar un snapshot en `found-snapshots` es permanente. Los comandos de esta limpieza se limitan a los snapshots que creaste (`lab07-orders-1` y los de `curso-*`); nunca borres los de `cloud-snapshot-policy`.
+
+- `null` en el ajuste de clúster: restablece el intervalo de ILM a su valor por defecto.
+
+Se conservan `orders-shared` (con el nuevo campo `customer_email`), los roles y usuarios de práctica, y todo lo de laboratorios anteriores.
+
+## Resumen de valores esperados
+
+| **Comprobación**                                        | **Resultado**                                |
+|---------------------------------------------------------|----------------------------------------------|
+| `_update_by_query` en `orders-shared`                   | updated: 6                                   |
+| `ana_acme`: búsqueda en `orders-shared`                 | 2 pedidos (2001, 2002), con `customer_email` |
+| `gus_globex`: búsqueda en `orders-shared`               | 2 pedidos (3001, 3002), sin `customer_email` |
+| `ana_acme` busca pedidos de globex                      | count: 0                                     |
+| `gus_globex` busca por `customer_email`                 | count: 0                                     |
+| `ana_acme` lee `weblogs` / escribe en `orders-shared`   | 403 / 403                                    |
+| Contraseña incorrecta                                   | 401                                          |
+| Clave `orders-initech-app`                              | 2 pedidos (4001, 4002)                       |
+| Snapshot `lab07-orders-1`                               | SUCCESS, 2 shards                            |
+| Tras el borrado accidental / tras restaurar y reindexar | count: 4 / count: 6                          |
+| Data stream tras el primer ciclo de ILM                 | generation: 2                                |
+
+## Estado final
+
+| **Elemento**                                                                            | **Se conserva**  | **Lo reutiliza**                   |
+|-----------------------------------------------------------------------------------------|------------------|------------------------------------|
+| `orders-shared` con 6 documentos y `customer_email`                                     | Sí               | Laboratorio 10 (proyecto final)    |
+| Roles `orders_acme_reader` y `orders_globex_reader`, usuarios `ana_acme` y `gus_globex` | Sí               | Proyecto final (pruebas de acceso) |
+| `weblogs` con 5006 documentos                                                           | Sí               | Laboratorios 8 y 9                 |
+| `ilmtest-ds`, `restored-orders-shared`, snapshots, SLM y clave de initech               | No (se eliminan) | \-                                 |
+
+## Preguntas de discusión
+
+- ¿Qué ventajas y qué costos tiene DLS frente a un alias filtrado por tenant?
+
+- ¿Qué pasaría si el rol de `gus_globex` usara `except: ["customer_email"]` en lugar de `grant`, y mañana se añadiera el campo `phone`?
+
+- El snapshot tomado cada 30 minutos, ¿es una estrategia de recuperación ante desastres suficiente? ¿Qué falta (RPO, RTO, copia en otra región)?
+
+- ¿Por qué conviene borrar índices completos con ILM en lugar de borrar documentos con `_delete_by_query`?
+
+- ¿Qué retención propondrías para logs de acceso web si el negocio exige 90 días y la regulación pide poder borrar los datos de una persona?
+
+- Si un auditor pide demostrar quién accedió a `orders-shared` la semana pasada, ¿qué necesitas tener activado hoy?
+
+## Resultado final
+
+Al terminar el laboratorio, el entorno debe quedar como se muestra en la imagen: lo que se conserva, cómo verificarlo y lo que se elimina.
+
+![Resultado final del laboratorio 7: Configurar snapshots y políticas de ILM](imagenes/lab07_resultado_final.png)

@@ -1,1119 +1,528 @@
-# 4 Laboratorio final: Diagnosticar y documentar un incidente en una plataforma de logs
+# Laboratorio final: proyecto de integración y demostración
 
-## Metadatos
+- **Capítulo:** 10. Rendimiento, ciclo de vida y preparación para producción
 
-| Campo | Valor |
-|---|---|
-| Duración | 60 minutos |
-| Complejidad | Difícil |
-| Nivel de Bloom | Crear |
+- **Duración:** 51 min (más un anexo opcional de demostración de 10 a 15 min)
 
-## Descripción general
+- **Entorno:** Elastic Cloud Hosted (cuenta propia), Elasticsearch 9.x, Kibana Dev Tools y una terminal con `curl`
 
-En este laboratorio final investigarás un incidente controlado sobre el clúster `es930-lab-cluster` y los datos restaurados en `logs-ops-lab`. Partirás de síntomas observables en Kibana Discover y recopilarás evidencia antes de realizar cambios, diferenciando entre fallos de ingestión, permisos, asignación de shards y capacidad.
+- **Dependencias:** Laboratorio 9 (alias `weblogs` sobre `weblogs-v2` con 5007 documentos; `weblogs-mappings` con `scaled_float`) y Laboratorio 3 (`weblogs-settings`). Archivo `proyecto_nuevos.ndjson` (500 documentos).
 
-La práctica concluye con una mitigación reversible, validación funcional y la redacción de un informe técnico de incidente que incorpore las líneas base, controles de seguridad, políticas ILM y garantías de recuperación de prácticas anteriores.
+- **Uso:** mini-reto integrador y evaluación final del curso. Se trabaja de forma individual.
 
-## Objetivos de aprendizaje
+## Objetivo
 
-Al finalizar el laboratorio, podrás:
+Integrar lo aprendido en una plataforma de logs mínima pero completa: dimensionar, crear un data stream con su template y su política de ILM, cargar datos históricos y nuevos, asegurar el acceso, diagnosticar un problema inducido y completar el checklist de producción. Al terminar, el participante podrá:
 
-- [ ] Delimitar un incidente de logs mediante Kibana Discover, KQL, Query DSL y ES|QL.
-- [ ] Recopilar evidencia no destructiva con las APIs de salud, shards, asignación, nodos, estadísticas, ILM y Bulk.
-- [ ] Distinguir síntomas, impacto, causas inmediatas, hipótesis y causa raíz probable.
-- [ ] Aplicar una mitigación segura y reversible para una réplica no viable o un problema controlado de permisos de ingestión.
-- [ ] Elaborar un informe técnico de incidente con cronología, evidencias, decisiones, escalamiento y acciones preventivas.
+- Dimensionar almacenamiento, shards y réplicas a partir de volumen y retención, y trasladarlo a una política de ILM.
 
-## Prerrequisitos
+- Crear un data stream con template compuesto y una política de ILM con rollover, fase warm y retención.
 
-### Conocimientos requeridos
+- Cargar datos históricos (con `_reindex`) y datos nuevos (con `_bulk` y una API key de mínimo privilegio).
 
-- Metodología de diagnóstico de Elasticsearch: delimitación, impacto, evidencia, hipótesis, mitigación y validación.
-- Uso básico de Kibana Discover, KQL, Elasticsearch Query DSL y ES|QL.
-- Interpretación de `_cluster/health`, `_cat/shards`, `_cluster/allocation/explain`, `_nodes/stats` e ILM.
-- Conceptos de roles, privilegios mínimos, API keys, ingestión Bulk, réplicas y clústeres de un nodo.
-- Contenido de las prácticas 6, 7, 8 y 9.
+- Diagnosticar y mitigar dos incidentes con evidencia, y documentar un plan de mitigación.
 
-### Acceso y estado requerido
+- Evaluar una plataforma contra un checklist de producción y presentar los resultados.
 
-Antes de comenzar, confirma lo siguiente:
+## Escenario
 
-- La Práctica 9 está completada.
-- `es930-lab` y `kibana930-lab` están disponibles.
-- El índice `logs-ops-lab` fue restaurado y contiene datos.
-- Las consultas guardadas de la Práctica 8 están disponibles en Kibana.
-- El runbook de actualización existe en:
+La empresa opera cuatro servicios (`checkout`, `catalog`, `payments` y `search`). El equipo de plataforma debe poner en producción un data stream de logs de acceso con estos requisitos:
 
-```text
-/opt/elastic-labs/reports/upgrade-runbook-717-to-930.md
+| **Requisito**                  | **Valor**                                                                                                      |
+|--------------------------------|----------------------------------------------------------------------------------------------------------------|
+| Volumen estimado en producción | 40 GB por día                                                                                                  |
+| Retención                      | 30 días: 7 en hot y 23 en warm                                                                                 |
+| Disponibilidad                 | 1 réplica                                                                                                      |
+| Factor de expansión medido     | 1.1 (el tamaño en disco es 1.1 veces el dato original)                                                         |
+| Margen de capacidad            | 20 % (watermarks, merges y crecimiento)                                                                        |
+| Rollover                       | Por tamaño de shard primario (hasta 50 GB) o 7 días, lo que ocurra primero                                     |
+| Acceso                         | Un usuario de solo lectura para operaciones; una credencial de ingesta con permisos mínimos                    |
+| Datos                          | Histórico: los logs ya cargados en `weblogs`. Nuevos: los del 15 de octubre de 2026 (`proyecto_nuevos.ndjson`) |
+
+En el deployment de la prueba, la política usa los valores reales (50 GB, 7 días, 30 días), aunque el volumen del laboratorio sea mínimo. Lo que se evalúa es el diseño y su verificación.
+
+## Distribución del tiempo y puntaje
+
+| **Parte** | **Contenido**                          | **Tiempo** | **Puntos** |
+|-----------|----------------------------------------|------------|------------|
+| Parte A   | Dimensionamiento                       | 6 min      | 15         |
+| Parte B   | ILM, template y data stream            | 11 min     | 25         |
+| Parte C   | Carga de datos históricos y nuevos     | 8 min      | 15         |
+| Parte D   | Acceso de solo lectura                 | 5 min      | 10         |
+| Parte E   | Diagnóstico de problemas inducidos     | 12 min     | 25         |
+| Parte F   | Checklist de producción y demostración | 9 min      | 10         |
+| Total     |                                        | 51 min     | 100        |
+
+## Convenciones
+
+- Los bloques con `GET`, `PUT`, `POST` o `DELETE` se ejecutan en Dev Tools. Los `curl.exe` se ejecutan en la terminal.
+
+- Cada parte indica la evidencia que se debe conservar (resultado o captura) para la entrega y la demostración.
+
+- En este laboratorio la explicación de cada comando es breve: los comandos se conocen de laboratorios anteriores. Las novedades sí se explican.
+
+## Parte A: dimensionamiento (6 min, 15 puntos)
+
+Resuelve con los datos del escenario y la fórmula del capítulo 6. Completa la tabla (con calculadora o en papel).
+
+``` console
+almacenamiento = GB por día × días de retención × (1 + réplicas) × factor de expansión
+capacidad a aprovisionar = almacenamiento / 0.80
 ```
 
-- El archivo de credenciales existe y tiene permisos `0600`:
+| **Cálculo**                                                                                                  | **Resultado** |
+|--------------------------------------------------------------------------------------------------------------|---------------|
+| Almacenamiento total a 30 días                                                                               |               |
+| Capacidad a aprovisionar (con margen del 20 %)                                                               |               |
+| Almacenamiento en hot (7 días)                                                                               |               |
+| Almacenamiento en warm (23 días)                                                                             |               |
+| Índices activos a 30 días si el rollover ocurre al llegar a 50 GB por shard primario (1 primario por índice) |               |
+| Shards totales con réplica (primarios más réplicas)                                                          |               |
+| Shards totales si el rollover fuera diario                                                                   |               |
 
-```text
-/opt/elastic-labs/.env
-```
+Justifica en dos líneas por qué conviene el rollover por tamaño y no diario. Los resultados esperados están en la sección "Resumen de valores esperados".
 
-> **Importante:** No ejecutes `docker compose down -v`. Esa operación eliminaría los volúmenes persistentes necesarios para la continuidad del curso.
+## Parte B: ILM, template y data stream (11 min, 25 puntos)
 
-## Entorno del laboratorio
+### Paso B1. Política de ILM
 
-### Componentes usados
-
-| Componente | Valor esperado |
-|---|---|
-| Elasticsearch objetivo | `es930-lab` / Elasticsearch 9.3.0 |
-| Kibana objetivo | `kibana930-lab` / Kibana 9.3.0 |
-| Clúster | `es930-lab-cluster` |
-| Nodo | `es930-node-1` |
-| Tipo de descubrimiento | `single-node` |
-| Índice de logs | `logs-ops-lab` |
-| Elasticsearch | `http://localhost:9201` |
-| Kibana | `http://localhost:5602` |
-| Directorio raíz | `/opt/elastic-labs` |
-| Directorio de evidencias | `/opt/elastic-labs/work/incident-10-00-01` |
-| Directorio de informes | `/opt/elastic-labs/reports` |
-
-### Preparación de la sesión
-
-1. Abre una terminal y prepara un directorio privado para las evidencias.
-
-   ```bash
-   cd /opt/elastic-labs
-   sudo mkdir -p /opt/elastic-labs/work/incident-10-00-01
-   sudo mkdir -p /opt/elastic-labs/reports
-   sudo chown -R "$USER":"$USER" /opt/elastic-labs/work/incident-10-00-01 /opt/elastic-labs/reports
-   chmod 700 /opt/elastic-labs/work/incident-10-00-01
-   umask 077
-   ```
-
-2. Carga las credenciales sin mostrarlas en pantalla.
-
-   ```bash
-   set -a
-   source /opt/elastic-labs/.env
-   set +a
-
-   export ES_URL="http://localhost:9201"
-   export KIBANA_URL="http://localhost:5602"
-   export EVIDENCE_DIR="/opt/elastic-labs/work/incident-10-00-01"
-   export REPORT="/opt/elastic-labs/reports/incident-10-00-01.md"
-   ```
-
-   Si la Práctica 9 dejó TLS habilitado en el endpoint HTTP, utiliza esta alternativa:
-
-   ```bash
-   export ES_URL="https://localhost:9201"
-   ```
-
-   En tal caso, añade `-k` a los comandos `curl` únicamente si el certificado es autofirmado dentro del laboratorio.
-
-3. Comprueba conectividad, autenticación y versión.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/?pretty" | tee "${EVIDENCE_DIR}/00-cluster-identidad.json"
-   ```
-
-**Resultado esperado**
-
-La respuesta incluye información similar a:
-
-```json
+``` console
+PUT _ilm/policy/proyecto-ilm
 {
-  "name" : "es930-node-1",
-  "cluster_name" : "es930-lab-cluster",
-  "version" : {
-    "number" : "9.3.0"
+  "policy": {
+    "phases": {
+      "hot": {
+        "actions": {
+          "rollover": { "max_primary_shard_size": "50gb", "max_age": "7d" },
+          "set_priority": { "priority": 100 }
+        }
+      },
+      "warm": {
+        "min_age": "0d",
+        "actions": {
+          "set_priority": { "priority": 50 },
+          "readonly": {},
+          "forcemerge": { "max_num_segments": 1 }
+        }
+      },
+      "delete": {
+        "min_age": "23d",
+        "actions": { "delete": {} }
+      }
+    }
   }
 }
 ```
 
-**Verificación**
+**Qué hace:** implementa los requisitos de retención. `min_age` se cuenta desde el rollover. El índice activo recibe escrituras hasta 7 días (hot); al rotar pasa de inmediato a warm (`min_age` de 0) y se elimina 23 días después de rotar. Así, ningún dato supera los 30 días desde su escritura: 7 en hot y 23 en warm.
 
-Confirma que:
+Pregunta de evaluación: ¿por qué `delete.min_age` es 23d y no 30d? ¿Qué pasaría con 30d? (Respuesta en el resumen.)
 
-```bash
-jq -r '.cluster_name, .name, .version.number' \
-  "${EVIDENCE_DIR}/00-cluster-identidad.json"
-```
+### Paso B2. Template del data stream
 
-muestra `es930-lab-cluster`, `es930-node-1` y `9.3.0`.
-
-## Procedimiento paso a paso
-
-### Paso 1. Registrar la apertura del incidente y preservar la evidencia inicial
-
-**Objetivo:** Crear una referencia temporal del incidente y comprobar que los artefactos previos requeridos están disponibles antes de modificar el clúster.
-
-**Instrucciones**
-
-1. Registra fecha, zona horaria y contexto local.
-
-   ```bash
-   {
-     echo "incident_id=INC-10-00-01"
-     echo "investigador=$USER"
-     echo "inicio_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-     echo "host=$(hostname)"
-     echo "es_url=$ES_URL"
-     echo "kibana_url=$KIBANA_URL"
-   } | tee "${EVIDENCE_DIR}/01-contexto-incidente.txt"
-   ```
-
-2. Confirma que el runbook de actualización y recuperación está presente.
-
-   ```bash
-   ls -l /opt/elastic-labs/reports/upgrade-runbook-717-to-930.md \
-     | tee "${EVIDENCE_DIR}/01-runbook-disponible.txt"
-   ```
-
-3. Revisa el estado de los contenedores sin reiniciarlos ni recrearlos.
-
-   ```bash
-   docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' \
-     | tee "${EVIDENCE_DIR}/01-contenedores.txt"
-   ```
-
-4. Registra los índices existentes y verifica que `logs-ops-lab` está disponible.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/_cat/indices?v&s=index" \
-     | tee "${EVIDENCE_DIR}/01-cat-indices-inicial.txt"
-   ```
-
-**Resultado esperado**
-
-- Los contenedores `es930-lab` y `kibana930-lab` aparecen en ejecución.
-- Existe el archivo `upgrade-runbook-717-to-930.md`.
-- El índice `logs-ops-lab` aparece en la salida de `_cat/indices`.
-
-**Verificación**
-
-```bash
-grep -E 'es930-lab|kibana930-lab' "${EVIDENCE_DIR}/01-contenedores.txt"
-grep 'logs-ops-lab' "${EVIDENCE_DIR}/01-cat-indices-inicial.txt"
-```
-
-No realices todavía cambios en réplicas, ILM, pipelines, nodos, índices ni contenedores.
-
----
-
-### Paso 2. Delimitar el impacto funcional desde Kibana Discover
-
-**Objetivo:** Identificar qué logs faltan o presentan errores, desde cuándo ocurre el problema y qué servicio está afectado.
-
-**Instrucciones**
-
-1. Abre Kibana en el navegador:
-
-   ```text
-   http://localhost:5602
-   ```
-
-2. Inicia sesión con el usuario `elastic` y la contraseña definida en `/opt/elastic-labs/.env`.
-
-3. Accede a **Discover** y selecciona el data view asociado a `logs-ops-lab`.
-
-4. Carga la consulta guardada de la Práctica 8 destinada a investigar errores o actividad de `payments-api`.
-
-5. Establece un rango temporal que incluya los eventos del incidente. Si desconoces la hora exacta, comienza con **Last 24 hours** y ajusta el rango tras localizar el primer error.
-
-6. Ejecuta la siguiente consulta KQL, adaptando el nombre de campo solo si la consulta guardada de la Práctica 8 documenta una estructura diferente:
-
-   ```kql
-   service.name : "payments-api" and log.level : "error"
-   ```
-
-7. Registra manualmente en un archivo:
-   - rango temporal consultado;
-   - cantidad aproximada de resultados;
-   - primer y último evento relevante;
-   - mensajes de error repetidos;
-   - identificadores de correlación, si existen;
-   - evidencia visual exportada o captura de pantalla.
-
-   ```bash
-   cat > "${EVIDENCE_DIR}/02-discover-observaciones.md" <<'EOF'
-   # Observaciones de Discover
-
-   - Consulta guardada utilizada:
-   - KQL ejecutada: `service.name : "payments-api" and log.level : "error"`
-   - Rango temporal:
-   - Número aproximado de eventos:
-   - Primer evento relevante:
-   - Último evento relevante:
-   - Mensajes repetidos:
-   - Servicios afectados:
-   - Impacto observado por el usuario:
-   - Archivo de captura/exportación:
-   EOF
-   ```
-
-8. Como corroboración por API, ejecuta una consulta Query DSL para contar errores por minuto. Ajusta el campo `log.level` si tu esquema usa otro campo equivalente.
-
-   ```bash
-   cat > "${EVIDENCE_DIR}/02-payments-errors-query.json" <<'EOF'
-   {
-     "size": 0,
-     "query": {
-       "bool": {
-         "filter": [
-           { "term": { "service.name.keyword": "payments-api" } },
-           { "term": { "log.level.keyword": "error" } }
-         ]
-       }
-     },
-     "aggs": {
-       "errores_por_minuto": {
-         "date_histogram": {
-           "field": "@timestamp",
-           "fixed_interval": "1m"
-         }
-       }
-     }
-   }
-   EOF
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -H 'Content-Type: application/json' \
-     -X POST "${ES_URL}/logs-ops-lab/_search?pretty" \
-     --data-binary @"${EVIDENCE_DIR}/02-payments-errors-query.json" \
-     | tee "${EVIDENCE_DIR}/02-payments-errors-dsl.json"
-   ```
-
-9. Ejecuta una consulta ES|QL equivalente para obtener una tendencia resumida.
-
-   ```bash
-   cat > "${EVIDENCE_DIR}/02-payments-errors-esql.json" <<'EOF'
-   {
-     "query": "FROM logs-ops-lab | WHERE service.name == \"payments-api\" AND log.level == \"error\" | STATS errores = COUNT(*) BY bucket = DATE_TRUNC(1 minute, @timestamp) | SORT bucket ASC"
-   }
-   EOF
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -H 'Content-Type: application/json' \
-     -X POST "${ES_URL}/_query?format=json" \
-     --data-binary @"${EVIDENCE_DIR}/02-payments-errors-esql.json" \
-     | tee "${EVIDENCE_DIR}/02-payments-errors-esql.json.out"
-   ```
-
-**Resultado esperado**
-
-- Discover muestra eventos de error asociados a `payments-api`.
-- La agregación Query DSL revela uno o más intervalos con incremento de errores.
-- ES|QL devuelve una serie temporal agrupada por minuto.
-- Puede observarse que los errores de aplicación no prueban por sí solos una caída de Elasticsearch: son un síntoma que debe correlacionarse con ingestión y estado del clúster.
-
-**Verificación**
-
-Comprueba la cantidad total de errores devuelta por Query DSL:
-
-```bash
-jq '.hits.total' "${EVIDENCE_DIR}/02-payments-errors-dsl.json"
-```
-
-Revisa la salida ES|QL:
-
-```bash
-jq '.' "${EVIDENCE_DIR}/02-payments-errors-esql.json.out"
-```
-
-Conserva la captura de Discover en el directorio de evidencia con un nombre como:
-
-```text
-02-discover-payments-api-errors.png
-```
-
----
-
-### Paso 3. Recopilar evidencia técnica del clúster sin modificarlo
-
-**Objetivo:** Determinar si el incidente incluye degradación de disponibilidad, shards no asignados, presión de recursos, crecimiento anómalo o incumplimiento de ILM.
-
-**Instrucciones**
-
-1. Captura la salud del clúster.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/_cluster/health?pretty" \
-     | tee "${EVIDENCE_DIR}/03-cluster-health-antes.json"
-   ```
-
-2. Registra los nodos, sus roles y métricas básicas.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/_cat/nodes?v&h=name,roles,master,heap.percent,ram.percent,cpu,load_1m,disk.used_percent" \
-     | tee "${EVIDENCE_DIR}/03-cat-nodes-antes.txt"
-   ```
-
-3. Captura el tamaño, salud y cantidad de documentos de los índices.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/_cat/indices?v&s=store.size:desc" \
-     | tee "${EVIDENCE_DIR}/03-cat-indices-antes.txt"
-   ```
-
-4. Examina los shards, ordenándolos por estado e índice.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/_cat/shards?v&s=state,index" \
-     | tee "${EVIDENCE_DIR}/03-cat-shards-antes.txt"
-   ```
-
-5. Si hay shards no asignados, solicita una explicación de asignación. No supongas la causa.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -X GET "${ES_URL}/_cluster/allocation/explain?pretty" \
-     | tee "${EVIDENCE_DIR}/03-allocation-explain-antes.json"
-   ```
-
-6. Obtén métricas de JVM, sistema de archivos, proceso e indexación del nodo.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/_nodes/stats/jvm,fs,process,indices?pretty" \
-     | tee "${EVIDENCE_DIR}/03-nodes-stats-antes.json"
-   ```
-
-7. Obtén estadísticas específicas del índice de logs.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/logs-ops-lab/_stats?pretty" \
-     | tee "${EVIDENCE_DIR}/03-logs-ops-stats-antes.json"
-   ```
-
-8. Revisa el estado ILM y los pipelines configurados para el índice.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/logs-ops-lab/_ilm/explain?pretty" \
-     | tee "${EVIDENCE_DIR}/03-ilm-explain-antes.json"
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/logs-ops-lab/_settings?filter_path=*.settings.index.number_of_replicas,*.settings.index.default_pipeline,*.settings.index.final_pipeline&pretty" \
-     | tee "${EVIDENCE_DIR}/03-index-settings-antes.json"
-   ```
-
-**Resultado esperado**
-
-En el escenario previsto puede aparecer una combinación de estas condiciones:
-
-- Estado `yellow`.
-- Un shard réplica `UNASSIGNED`.
-- Un mensaje de `_cluster/allocation/explain` que indique que una réplica no puede asignarse al mismo nodo que su shard primario.
-- Un único nodo de datos en el clúster.
-- Un índice `logs-ops-lab` con `number_of_replicas: "1"`.
-- Métricas de heap, CPU y disco que deben compararse con las líneas base de la Práctica 6.
-- ILM activo o configurado según la Práctica 7.
-
-**Verificación**
-
-Ejecuta los siguientes controles rápidos:
-
-```bash
-jq '{status, number_of_nodes, active_primary_shards, active_shards, unassigned_shards}' \
-  "${EVIDENCE_DIR}/03-cluster-health-antes.json"
-
-grep 'UNASSIGNED' "${EVIDENCE_DIR}/03-cat-shards-antes.txt" || true
-
-jq '.' "${EVIDENCE_DIR}/03-allocation-explain-antes.json"
-```
-
-Documenta una primera separación entre hechos y conclusiones:
-
-| Tipo | Ejemplo que debes adaptar a tu evidencia |
-|---|---|
-| Síntoma | Discover presenta errores de `payments-api` o ausencia de logs recientes. |
-| Impacto | Operadores no pueden confiar plenamente en los paneles o en la trazabilidad de pagos. |
-| Hecho técnico | El clúster tiene un shard réplica no asignado. |
-| Hipótesis | La réplica no se asigna porque el clúster solo tiene un nodo. |
-| Evidencia confirmatoria | `_cluster/allocation/explain` informa una decisión `same_shard` o equivalente. |
-
----
-
-### Paso 4. Investigar errores de ingestión y permisos mediante respuestas Bulk
-
-**Objetivo:** Confirmar si la ingestión falla por permisos insuficientes o una configuración de ingestión y separar ese fallo de la condición de réplicas.
-
-**Instrucciones**
-
-1. Busca primero artefactos de la simulación o respuestas Bulk que el instructor haya proporcionado.
-
-   ```bash
-   find /opt/elastic-labs/work -maxdepth 3 -type f \
-     \( -iname '*bulk*' -o -iname '*ingest*' -o -iname '*incident*' \) \
-     -printf '%TY-%Tm-%Td %TH:%TM %p\n' 2>/dev/null \
-     | sort \
-     | tee "${EVIDENCE_DIR}/04-artefactos-disponibles.txt"
-   ```
-
-2. Examina los ajustes de pipeline capturados en el paso anterior. Si `default_pipeline` o `final_pipeline` contiene un nombre, inspecciónalo sin modificarlo.
-
-   ```bash
-   PIPELINE_NAME=$(jq -r '
-     to_entries[]
-     | .value.settings.index.default_pipeline // .value.settings.index.final_pipeline // empty
-   ' "${EVIDENCE_DIR}/03-index-settings-antes.json" | head -n 1)
-
-   echo "pipeline_detectado=${PIPELINE_NAME:-ninguno}" \
-     | tee "${EVIDENCE_DIR}/04-pipeline-detectado.txt"
-
-   if [ -n "${PIPELINE_NAME}" ]; then
-     curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-       "${ES_URL}/_ingest/pipeline/${PIPELINE_NAME}?pretty" \
-       | tee "${EVIDENCE_DIR}/04-pipeline-inspeccion.json"
-   fi
-   ```
-
-3. Si el instructor ya proporcionó una respuesta Bulk fallida, cópiala al directorio de evidencias y analízala con `jq`. Si no existe, ejecuta la siguiente reproducción controlada autorizada. Esta prueba crea una API key sin privilegio de escritura y no debe indexar ningún documento.
-
-   ```bash
-   RUN_ID="lab-$(date -u +%Y%m%dT%H%M%SZ)"
-
-   cat > "${EVIDENCE_DIR}/04-api-key-denied-request.json" <<EOF
-   {
-     "name": "incident-denied-${RUN_ID}",
-     "role_descriptors": {
-       "lectura_sin_ingestion": {
-         "cluster": [],
-         "indices": [
-           {
-             "names": ["logs-ops-lab"],
-             "privileges": ["read"]
-           }
-         ]
-       }
-     }
-   }
-   EOF
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -H 'Content-Type: application/json' \
-     -X POST "${ES_URL}/_security/api_key" \
-     --data-binary @"${EVIDENCE_DIR}/04-api-key-denied-request.json" \
-     | tee "${EVIDENCE_DIR}/04-api-key-denied-response.json"
-
-   export DENIED_KEY_ID
-   export DENIED_KEY
-   DENIED_KEY_ID=$(jq -r '.id' "${EVIDENCE_DIR}/04-api-key-denied-response.json")
-   DENIED_KEY=$(jq -r '.encoded' "${EVIDENCE_DIR}/04-api-key-denied-response.json")
-
-   cat > "${EVIDENCE_DIR}/04-bulk-denied.ndjson" <<EOF
-   {"create":{"_id":"${RUN_ID}-denied"}}
-   {"@timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","service":{"name":"payments-api"},"log":{"level":"error"},"message":"Prueba controlada de API key sin privilegio create_doc","event":{"kind":"event","dataset":"lab.incident"}}
-   EOF
-
-   curl -sS \
-     -H "Authorization: ApiKey ${DENIED_KEY}" \
-     -H 'Content-Type: application/x-ndjson' \
-     -X POST "${ES_URL}/logs-ops-lab/_bulk?refresh=true" \
-     --data-binary @"${EVIDENCE_DIR}/04-bulk-denied.ndjson" \
-     | tee "${EVIDENCE_DIR}/04-bulk-denied-response.json"
-   ```
-
-4. Analiza la respuesta Bulk.
-
-   ```bash
-   jq '{
-     errors,
-     items: [
-       .items[]
-       | {
-           operation: (keys[0]),
-           status: (.[] .status),
-           error_type: (.[] .error.type // null),
-           reason: (.[] .error.reason // null)
-         }
-     ]
-   }' "${EVIDENCE_DIR}/04-bulk-denied-response.json"
-   ```
-
-5. Clasifica el resultado:
-   - Si aparece `security_exception`, `authorization_exception` o estado `403`, la causa inmediata es insuficiencia de privilegios.
-   - Si aparece un error de procesador, `illegal_argument_exception` o referencia a pipeline, la causa inmediata es una configuración de ingestión.
-   - Si la operación es exitosa, registra que la reproducción no confirma el fallo de permisos y usa la evidencia suministrada por el instructor para continuar el diagnóstico.
-
-**Resultado esperado**
-
-La reproducción controlada con una API key de solo lectura devuelve una respuesta Bulk con:
-
-```json
+``` console
+PUT _index_template/proyecto-logs-template
 {
-  "errors": true
+  "index_patterns": ["proyecto-logs-*"],
+  "priority": 300,
+  "data_stream": {},
+  "composed_of": ["weblogs-settings", "weblogs-mappings"],
+  "template": {
+    "settings": {
+      "index.lifecycle.name": "proyecto-ilm",
+      "number_of_shards": 1,
+      "number_of_replicas": 1
+    }
+  },
+  "_meta": { "description": "Logs de acceso web del proyecto final" }
+}
+
+POST _index_template/_simulate_index/proyecto-logs-prod
+```
+
+**Qué hace:** crea el template del data stream componiendo los mismos bloques de mapping y settings del curso, y asocia la política de ILM. La segunda petición muestra qué recibiría el data stream, sin crearlo.
+
+- `data_stream: {}`: los índices que coincidan con el patrón serán data streams.
+
+- `composed_of`: reutiliza `weblogs-settings` (analyzer de ruta) y `weblogs-mappings` (mapping explícito, con `scaled_float` desde el laboratorio 9).
+
+- `template.settings`: tiene prioridad sobre los component templates; aquí fija 1 shard, 1 réplica y la política.
+
+**Resultado esperado de \`\_simulate_index\`:** `index.lifecycle.name` igual a `proyecto-ilm`, el mapping con `response_time_ms` de tipo `scaled_float` y sin otros templates en `overlapping`.
+
+### Paso B3. Crear el data stream y verificar
+
+``` console
+PUT _data_stream/proyecto-logs-prod
+
+GET _data_stream/proyecto-logs-prod?filter_path=data_streams.name,data_streams.generation,data_streams.ilm_policy,data_streams.status,data_streams.indices.index_name
+
+GET proyecto-logs-prod/_ilm/explain?filter_path=indices.*.index,indices.*.phase,indices.*.action,indices.*.step
+```
+
+**Qué hace:** crea el data stream (con su primer índice de respaldo) y comprueba su estado y el de ILM.
+
+**Resultado esperado:** `generation` de 1, `ilm_policy` `proyecto-ilm`, `status` `GREEN` (o `YELLOW` brevemente mientras se asigna la réplica), y en ILM la fase `hot` con la acción `rollover` en el paso `check-rollover-ready`.
+
+## Parte C: carga de datos históricos y nuevos (8 min, 15 puntos)
+
+### Paso C1. Datos históricos
+
+``` console
+POST _reindex?refresh=true
+{
+  "source": {
+    "index": "weblogs",
+    "query": { "exists": { "field": "@timestamp" } }
+  },
+  "dest": { "index": "proyecto-logs-prod", "op_type": "create" }
+}
+
+GET proyecto-logs-prod/_count
+```
+
+**Qué hace:** copia al data stream los documentos de `weblogs` que tienen `@timestamp`. Los 30 documentos de `parse_failure` no tienen fecha y no se copian: un data stream exige `@timestamp`.
+
+**Resultado esperado:** `created: 4977` y `count` de 4977.
+
+### Paso C2. Credencial de ingesta
+
+``` console
+POST _security/api_key
+{
+  "name": "proyecto-ingesta",
+  "expiration": "1d",
+  "role_descriptors": {
+    "ingesta": {
+      "indices": [
+        { "names": ["proyecto-logs-*"], "privileges": ["create_doc", "auto_configure"] }
+      ]
+    }
+  }
 }
 ```
 
-y al menos un ítem con estado `403` y error de seguridad. La operación no crea un documento porque la API key no dispone de privilegios de escritura.
+**Qué hace:** crea una clave que solo puede añadir documentos nuevos a los data streams `proyecto-logs-*`. Copia el valor de `encoded`.
 
-**Verificación**
+### Paso C3. Datos nuevos
 
-```bash
-jq -r '.errors' "${EVIDENCE_DIR}/04-bulk-denied-response.json"
-
-jq '.items[] | .[] | {status, error}' \
-  "${EVIDENCE_DIR}/04-bulk-denied-response.json"
+``` console
+curl.exe -s -X POST "<ES_URL>/proyecto-logs-prod/_bulk?filter_path=took,errors" -H "Authorization: ApiKey <ENCODED_KEY>" -H "Content-Type: application/x-ndjson" --data-binary "@proyecto_nuevos.ndjson"
 ```
 
-La evidencia debe permitir formular una afirmación precisa:
+**Qué hace:** carga los 500 documentos del 15 de octubre. En un data stream, las líneas de acción del archivo son `create`.
 
-> La respuesta Bulk confirma que una API key sin privilegio de indexación no puede crear documentos en `logs-ops-lab`. Esto explica un fallo de ingestión cuando el cliente utiliza dicha key, pero no explica por sí solo un shard réplica no asignado.
+**Resultado esperado:** `"errors": false`. Si fuera `true`, repite la petición sin `filter_path` para ver el error de cada elemento.
 
----
+### Paso C4. Verificación
 
-### Paso 5. Formular hipótesis, seleccionar la mitigación y ejecutar un cambio reversible
+``` console
+POST proyecto-logs-prod/_refresh
 
-**Objetivo:** Aplicar la acción de menor riesgo que reduzca el impacto confirmado, sin ocultar la causa ni eliminar evidencia.
-
-**Instrucciones**
-
-1. Completa la siguiente matriz en un archivo de trabajo antes de modificar configuración.
-
-   ```bash
-   cat > "${EVIDENCE_DIR}/05-matriz-diagnostico.md" <<'EOF'
-   # Matriz de diagnóstico
-
-   | Elemento | Hallazgo | Evidencia | Confianza |
-   |---|---|---|---|
-   | Síntoma en Discover |  | 02-discover-observaciones.md |  |
-   | Impacto operativo |  | 02-discover-observaciones.md |  |
-   | Salud del clúster |  | 03-cluster-health-antes.json |  |
-   | Shard no asignado |  | 03-cat-shards-antes.txt |  |
-   | Motivo de asignación |  | 03-allocation-explain-antes.json |  |
-   | Estado de recursos |  | 03-nodes-stats-antes.json |  |
-   | ILM |  | 03-ilm-explain-antes.json |  |
-   | Ingestión Bulk |  | 04-bulk-denied-response.json |  |
-   | Causa inmediata probable |  |  |  |
-   | Causa raíz probable |  |  |  |
-   EOF
-   ```
-
-2. Confirma que el clúster tiene exactamente un nodo y que el shard no asignado es una réplica no viable. No reduzcas réplicas si la explicación identifica otra causa, como falta de disco, filtros de asignación o un primario sin asignar.
-
-   ```bash
-   jq '{number_of_nodes, status, unassigned_shards}' \
-     "${EVIDENCE_DIR}/03-cluster-health-antes.json"
-
-   jq '{
-     index,
-     shard,
-     primary,
-     current_state,
-     unassigned_info,
-     can_allocate,
-     allocate_explanation,
-     node_allocation_decisions
-   }' "${EVIDENCE_DIR}/03-allocation-explain-antes.json"
-   ```
-
-3. Si la evidencia confirma una réplica no asignable en el clúster de un solo nodo, aplica la mitigación reversible estableciendo cero réplicas en el índice de laboratorio.
-
-   ```bash
-   cat > "${EVIDENCE_DIR}/05-replicas-cero-request.json" <<'EOF'
-   {
-     "index": {
-       "number_of_replicas": 0
-     }
-   }
-   EOF
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -H 'Content-Type: application/json' \
-     -X PUT "${ES_URL}/logs-ops-lab/_settings?pretty" \
-     --data-binary @"${EVIDENCE_DIR}/05-replicas-cero-request.json" \
-     | tee "${EVIDENCE_DIR}/05-replicas-cero-response.json"
-   ```
-
-4. Para el fallo de permisos, no reutilices la API key denegada. Crea una API key temporal con privilegio mínimo `create_doc`, válida únicamente para la prueba de recuperación de ingestión.
-
-   ```bash
-   cat > "${EVIDENCE_DIR}/05-api-key-write-request.json" <<EOF
-   {
-     "name": "incident-create-doc-${RUN_ID}",
-     "role_descriptors": {
-       "ingestion_minima": {
-         "cluster": [],
-         "indices": [
-           {
-             "names": ["logs-ops-lab"],
-             "privileges": ["create_doc"]
-           }
-         ]
-       }
-     }
-   }
-   EOF
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -H 'Content-Type: application/json' \
-     -X POST "${ES_URL}/_security/api_key" \
-     --data-binary @"${EVIDENCE_DIR}/05-api-key-write-request.json" \
-     | tee "${EVIDENCE_DIR}/05-api-key-write-response.json"
-
-   export ALLOWED_KEY_ID
-   export ALLOWED_KEY
-   ALLOWED_KEY_ID=$(jq -r '.id' "${EVIDENCE_DIR}/05-api-key-write-response.json")
-   ALLOWED_KEY=$(jq -r '.encoded' "${EVIDENCE_DIR}/05-api-key-write-response.json")
-
-   export OK_DOC_ID="${RUN_ID}-allowed"
-
-   cat > "${EVIDENCE_DIR}/05-bulk-allowed.ndjson" <<EOF
-   {"create":{"_id":"${OK_DOC_ID}"}}
-   {"@timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","service":{"name":"payments-api"},"log":{"level":"info"},"message":"Prueba controlada de recuperación con privilegio create_doc","event":{"kind":"event","dataset":"lab.incident"},"labels":{"incident_id":"INC-10-00-01"}}
-   EOF
-
-   curl -sS \
-     -H "Authorization: ApiKey ${ALLOWED_KEY}" \
-     -H 'Content-Type: application/x-ndjson' \
-     -X POST "${ES_URL}/logs-ops-lab/_bulk?refresh=true" \
-     --data-binary @"${EVIDENCE_DIR}/05-bulk-allowed.ndjson" \
-     | tee "${EVIDENCE_DIR}/05-bulk-allowed-response.json"
-   ```
-
-5. Registra la decisión técnica tomada. La reducción a cero réplicas en un clúster de un nodo elimina el estado `yellow`, pero también elimina redundancia. Es una mitigación aceptable únicamente para el entorno de laboratorio o como riesgo temporal formalmente aceptado.
-
-   ```bash
-   cat > "${EVIDENCE_DIR}/05-decision-mitigacion.md" <<'EOF'
-   # Decisión de mitigación
-
-   - Cambio aplicado:
-   - Evidencia que lo justifica:
-   - Riesgo introducido o aceptado:
-   - Reversibilidad:
-   - Criterio para revertir:
-   - Responsable de aprobación:
-   - Hora UTC de aplicación:
-   EOF
-   ```
-
-**Resultado esperado**
-
-- La actualización de settings es reconocida con `"acknowledged": true`.
-- El Bulk ejecutado con la API key de privilegio mínimo devuelve `"errors": false`.
-- La mitigación de réplicas solo se aplica si el diagnóstico confirmó que el problema era una réplica no viable en un clúster de nodo único.
-
-**Verificación**
-
-```bash
-jq '.' "${EVIDENCE_DIR}/05-replicas-cero-response.json"
-
-jq '{
-  errors,
-  items: [.items[] | .[] | {status, result, error}]
-}' "${EVIDENCE_DIR}/05-bulk-allowed-response.json"
+GET proyecto-logs-prod/_search?size=0&track_total_hits=true
+{
+  "aggs": {
+    "por_servicio": { "terms": { "field": "service" } },
+    "errores_5xx": { "filter": { "range": { "status": { "gte": 500 } } } },
+    "por_dia": { "date_histogram": { "field": "@timestamp", "calendar_interval": "day" } }
+  }
+}
 ```
 
----
+**Qué hace:** refresca el data stream y cuenta por servicio, errores 5xx y día, para comprobar la carga completa.
 
-### Paso 6. Validar recuperación técnica y funcional
+**Resultado esperado:** total de 5477; payments 827, checkout 1661, search 1027, catalog 1962; 111 errores 5xx; por día: 12 de octubre 1708, 13 de octubre 1621, 14 de octubre 1648 y 15 de octubre 500.
 
-**Objetivo:** Demostrar con métricas, APIs y búsqueda funcional que la mitigación produjo el resultado esperado y que no generó un efecto secundario relevante.
+En Kibana, crea el data view `proyecto-logs-prod` (campo de tiempo `@timestamp`) y comprueba en Discover, con el rango del 12 al 16 de octubre de 2026, que el total coincide.
 
-**Instrucciones**
+## Parte D: acceso de solo lectura (5 min, 10 puntos)
 
-1. Espera hasta 60 segundos a que la salud del clúster alcance el estado esperado.
+``` console
+PUT _security/role/proyecto_viewer
+{
+  "indices": [
+    { "names": ["proyecto-logs-*"], "privileges": ["read", "view_index_metadata"] }
+  ]
+}
 
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/_cluster/health?wait_for_status=green&timeout=60s&pretty" \
-     | tee "${EVIDENCE_DIR}/06-cluster-health-despues.json"
-   ```
-
-2. Captura nuevamente el estado de shards, índices, nodos y estadísticas del índice.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/_cat/shards?v&s=state,index" \
-     | tee "${EVIDENCE_DIR}/06-cat-shards-despues.txt"
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/_cat/indices?v&s=store.size:desc" \
-     | tee "${EVIDENCE_DIR}/06-cat-indices-despues.txt"
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/_nodes/stats/jvm,fs,process,indices?pretty" \
-     | tee "${EVIDENCE_DIR}/06-nodes-stats-despues.json"
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/logs-ops-lab/_stats?pretty" \
-     | tee "${EVIDENCE_DIR}/06-logs-ops-stats-despues.json"
-   ```
-
-3. Comprueba que el documento de prueba autorizado fue indexado.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/logs-ops-lab/_doc/${OK_DOC_ID}?pretty" \
-     | tee "${EVIDENCE_DIR}/06-documento-prueba.json"
-   ```
-
-4. En Kibana Discover, busca el identificador de la prueba controlada:
-
-   ```kql
-   labels.incident_id : "INC-10-00-01"
-   ```
-
-5. Repite la consulta guardada de la Práctica 8 y la consulta KQL de `payments-api`. Comprueba si:
-   - los nuevos documentos son visibles;
-   - no hay retraso inesperado de ingestión;
-   - la búsqueda responde;
-   - los errores históricos siguen disponibles para investigación;
-   - el panel o visualización relacionado recuperó comportamiento normal.
-
-6. Compara las métricas de antes y después con la línea base de la Práctica 6. Registra como mínimo:
-   - `heap.percent`;
-   - `cpu`;
-   - `disk.used_percent`;
-   - `store.size`;
-   - total de documentos;
-   - `unassigned_shards`;
-   - estado de salud;
-   - resultado Bulk.
-
-**Resultado esperado**
-
-- El clúster pasa a `green` si la única causa del estado `yellow` era una réplica no asignable.
-- No quedan líneas `UNASSIGNED` para `logs-ops-lab`.
-- El Bulk autorizado devuelve `errors: false`.
-- El documento de prueba existe y es visible en Discover.
-- Los recursos del nodo no muestran una desviación importante frente a la línea base de la Práctica 6.
-
-**Verificación**
-
-```bash
-jq '{status, number_of_nodes, active_shards, unassigned_shards}' \
-  "${EVIDENCE_DIR}/06-cluster-health-despues.json"
-
-grep 'UNASSIGNED' "${EVIDENCE_DIR}/06-cat-shards-despues.txt" || true
-
-jq '._source | {timestamp: ."@timestamp", service, log, labels, message}' \
-  "${EVIDENCE_DIR}/06-documento-prueba.json"
+POST _security/user/ops_viewer
+{
+  "password": "<CONTRASEÑA_OPS>",
+  "roles": ["proyecto_viewer"],
+  "full_name": "Operaciones (solo lectura)"
+}
 ```
 
-Si el clúster no llega a `green`, no ocultes el resultado: conserva la evidencia, revisa `_cluster/allocation/explain` otra vez y considera el caso para escalamiento.
+**Qué hace:** crea un rol de solo lectura sobre el data stream y un usuario con ese rol. Pruébalo desde la terminal:
 
----
+``` console
+curl.exe -s -u ops_viewer "<ES_URL>/proyecto-logs-prod/_count"
 
-### Paso 7. Redactar el informe técnico de incidente
+curl.exe -s -i -u ops_viewer -X POST "<ES_URL>/proyecto-logs-prod/_doc" -H "Content-Type: application/json" -d "{}"
 
-**Objetivo:** Crear un informe técnico trazable que permita a otro equipo comprender el incidente, validar las decisiones y prevenir su recurrencia.
-
-**Instrucciones**
-
-1. Crea el informe usando la siguiente plantilla.
-
-   ```bash
-   cat > "${REPORT}" <<'EOF'
-   # Informe técnico de incidente INC-10-00-01
-
-   ## 1. Identificación
-
-   | Campo | Valor |
-   |---|---|
-   | Identificador | INC-10-00-01 |
-   | Fecha y hora de detección (UTC) | |
-   | Fecha y hora de mitigación (UTC) | |
-   | Investigador | |
-   | Entorno | Laboratorio Elasticsearch 9.3.0 |
-   | Clúster | es930-lab-cluster |
-   | Nodo | es930-node-1 |
-   | Índice afectado | logs-ops-lab |
-   | Severidad propuesta | |
-
-   ## 2. Resumen ejecutivo
-
-   Describa en 3 a 5 líneas qué ocurrió, qué usuarios o procesos fueron afectados,
-   cuál fue el impacto y cuál fue el estado final.
-
-   ## 3. Impacto
-
-   - Impacto en ingestión:
-   - Impacto en búsqueda y Discover:
-   - Impacto en disponibilidad:
-   - Impacto en integridad de datos:
-   - Impacto en seguridad:
-   - Riesgo de continuidad o recuperación:
-
-   ## 4. Línea temporal
-
-   | Hora UTC | Evento | Evidencia |
-   |---|---|---|
-   | | Detección inicial | |
-   | | Consulta de Discover | |
-   | | Captura de salud del clúster | |
-   | | Confirmación de Bulk o permisos | |
-   | | Mitigación aplicada | |
-   | | Validación final | |
-
-   ## 5. Evidencia técnica
-
-   ### Evidencia funcional
-
-   - Consulta guardada de Kibana utilizada:
-   - KQL:
-   - Rango temporal:
-   - Resultado observado:
-   - Archivo de captura:
-
-   ### Evidencia de Elasticsearch
-
-   - Salud antes:
-   - Salud después:
-   - Shards no asignados:
-   - Resultado de allocation explain:
-   - Métricas de heap, CPU y disco:
-   - Estadísticas del índice:
-   - Estado ILM:
-   - Respuesta Bulk denegada:
-   - Respuesta Bulk autorizada:
-
-   ## 6. Diagnóstico
-
-   | Categoría | Descripción |
-   |---|---|
-   | Síntoma | |
-   | Causa inmediata | |
-   | Causa raíz probable | |
-   | Evidencia que confirma la hipótesis | |
-   | Evidencia que descarta hipótesis alternativas | |
-   | Riesgo residual | |
-
-   ## 7. Mitigación aplicada
-
-   - Cambio:
-   - Justificación:
-   - Comando o API utilizada:
-   - Reversibilidad:
-   - Riesgo aceptado:
-   - Resultado:
-
-   ## 8. Validación de recuperación
-
-   - Estado del clúster:
-   - Shards:
-   - Resultado de Bulk:
-   - Verificación en Discover:
-   - Comparación con línea base de Práctica 6:
-   - Relación con ILM y seguridad de Práctica 7:
-   - Garantía de recuperación consultada en el runbook de Práctica 9:
-
-   ## 9. Escalamiento
-
-   - ¿Requiere escalamiento?: Sí / No
-   - Equipo destinatario:
-   - Criterio de escalamiento:
-   - Información que debe adjuntarse:
-   - Decisión final:
-
-   ## 10. Acciones preventivas
-
-   | Acción | Prioridad | Responsable | Fecha objetivo | Criterio de cierre |
-   |---|---|---|---|---|
-   | Revisar privilegios mínimos de API keys de ingestión | Alta | | | |
-   | Definir política explícita de réplicas para clústeres de un nodo | Alta | | | |
-   | Alertar sobre errores Bulk y shards no asignados | Media | | | |
-   | Validar ILM y capacidad frente a crecimiento de logs | Media | | | |
-   | Ensayar restauración según runbook | Media | | | |
-
-   ## 11. Lecciones aprendidas
-
-   - Qué evidencia fue más útil:
-   - Qué decisión podría automatizarse:
-   - Qué documentación debe mejorarse:
-   - Qué se validará en el siguiente ejercicio:
-   EOF
-   ```
-
-2. Completa el informe usando exclusivamente evidencias verificables almacenadas en:
-
-   ```text
-   /opt/elastic-labs/work/incident-10-00-01
-   ```
-
-3. Añade al informe referencias explícitas a:
-   - líneas base de rendimiento de la Práctica 6;
-   - roles, API keys, TLS e ILM de la Práctica 7;
-   - consultas y observaciones de Discover de la Práctica 8;
-   - runbook de actualización y recuperación de la Práctica 9.
-
-4. Determina si el incidente requiere escalamiento. Debe escalarse, por ejemplo, si se observa alguno de estos criterios:
-   - shards primarios no asignados o estado `red`;
-   - uso de disco cercano a los umbrales de Elasticsearch;
-   - heap o CPU sostenidamente por encima de la línea base;
-   - pérdida no explicada de eventos;
-   - permisos de producción asignados incorrectamente;
-   - fallo de ILM que compromete retención o cumplimiento;
-   - necesidad de modificar infraestructura, añadir nodos o restaurar desde snapshot.
-
-**Resultado esperado**
-
-Existe un informe completo en:
-
-```text
-/opt/elastic-labs/reports/incident-10-00-01.md
+curl.exe -s -i -u ops_viewer "<ES_URL>/weblogs/_count"
 ```
 
-El documento distingue claramente entre observaciones, evidencias, hipótesis, causa inmediata, causa raíz probable, mitigación, riesgo residual y acciones preventivas.
+**Resultado esperado:** la primera devuelve `count` de 5477; la segunda y la tercera, 403 (`is unauthorized for user [ops_viewer]`): sin permiso de escritura y sin acceso a `weblogs`. Evidencia: los tres resultados.
 
-**Verificación**
+## Parte E: diagnóstico de problemas inducidos (12 min, 25 puntos)
 
-```bash
-test -s "${REPORT}" && echo "Informe creado correctamente"
-grep -E '^## (3|4|5|6|7|8|9|10)\.' "${REPORT}"
+Cada incidente tiene una instrucción de inducción y un síntoma. Si trabajas en pareja, tu compañero ejecuta la inducción sin decirte qué hace y tú diagnosticas solo con el síntoma. Si trabajas solo, ejecuta la inducción y diagnostica como si no la conocieras. En cada incidente se documenta: síntoma, evidencia, causa, mitigación, verificación y prevención.
+
+### Incidente 1: la ingesta se rechaza con 403
+
+**Inducción:**
+
+``` console
+PUT proyecto-logs-prod/_settings
+{
+  "index.blocks.write": true
+}
 ```
 
-## Validación y pruebas
+**Síntoma:** al intentar ingestar, la aplicación recibe un error.
 
-Completa esta lista de validación final antes de entregar el laboratorio.
-
-| Validación | Comando o evidencia | Resultado esperado |
-|---|---|---|
-| Identidad del clúster | `00-cluster-identidad.json` | Clúster `es930-lab-cluster`, nodo `es930-node-1`, versión 9.3.0 |
-| Datos restaurados | `_cat/indices` | Existe `logs-ops-lab` |
-| Impacto funcional | Discover y KQL | Se identifican eventos o ausencia de logs relacionados con el incidente |
-| Tendencia de errores | Query DSL y ES|QL | Se puede cuantificar la tendencia de `payments-api` |
-| Salud inicial | `03-cluster-health-antes.json` | Se documenta estado y shards no asignados |
-| Asignación | `03-allocation-explain-antes.json` | Se identifica la causa real de no asignación |
-| Recursos | `_nodes/stats` | Heap, CPU y disco comparados contra Práctica 6 |
-| ILM | `03-ilm-explain-antes.json` | Estado ILM documentado |
-| Permisos | Respuesta Bulk denegada | Error `403` o error de seguridad confirmado, si aplica |
-| Recuperación de ingestión | Respuesta Bulk autorizada | `errors: false` |
-| Mitigación de réplicas | Salud posterior y CAT shards | Estado `green` y ausencia de réplica no asignada, si la condición era de nodo único |
-| Documento de prueba | GET por ID y Discover | Documento visible y consultable |
-| Informe final | `incident-10-00-01.md` | Incluye impacto, cronología, evidencia, diagnóstico, mitigación, escalamiento y prevención |
-
-Ejecuta este resumen técnico final:
-
-```bash
-echo "=== Salud posterior ==="
-jq '{status, number_of_nodes, active_primary_shards, active_shards, unassigned_shards}' \
-  "${EVIDENCE_DIR}/06-cluster-health-despues.json"
-
-echo
-echo "=== Resultado Bulk autorizado ==="
-jq '{errors, items: [.items[] | .[] | {status, result, error}]}' \
-  "${EVIDENCE_DIR}/05-bulk-allowed-response.json"
-
-echo
-echo "=== Réplicas configuradas ==="
-curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-  "${ES_URL}/logs-ops-lab/_settings?filter_path=*.settings.index.number_of_replicas&pretty"
+``` console
+POST proyecto-logs-prod/_doc
+{
+  "@timestamp": "2026-10-16T00:00:00Z",
+  "service": "search",
+  "status": 200,
+  "message": "prueba de ingesta"
+}
 ```
 
-## Solución de problemas
+**Diagnóstico guiado:**
 
-### 1. El clúster permanece en `yellow` después de establecer `number_of_replicas: 0`
+- Lee el mensaje de error: ¿es 401, 403 o 429? ¿Cuál es el tipo de excepción?
 
-**Síntomas**
+- Comprueba los bloqueos del índice con `GET proyecto-logs-prod/_settings?filter_path=*.settings.index.blocks`.
 
-- `_cluster/health` continúa mostrando `yellow`.
-- `_cat/shards` todavía presenta shards `UNASSIGNED`.
-- La explicación de asignación no corresponde a una réplica del índice `logs-ops-lab`.
+- Descarta las otras causas: salud (`_cluster/health`), disco (`_cat/allocation`) y permisos (`_security/_authenticate`).
 
-**Causa**
+**Resultado esperado:** error 403 de tipo `cluster_block_exception` con el texto `blocked by: [FORBIDDEN/8/index write (api)]`. No es un problema de credenciales: es un bloqueo de escritura del índice.
 
-La condición no está relacionada únicamente con la réplica del índice intervenido. Puede existir otro índice con réplicas configuradas, un shard primario sin asignar, un filtro de asignación, una restricción de tier o una condición de disco.
+**Mitigación y verificación:**
 
-**Corrección**
+``` console
+PUT proyecto-logs-prod/_settings
+{
+  "index.blocks.write": null
+}
 
-No apliques cambios masivos de réplicas. Identifica el índice y shard exactos:
-
-```bash
-curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-  "${ES_URL}/_cat/shards?v&s=state,index"
-
-curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-  "${ES_URL}/_cluster/allocation/explain?pretty"
+POST proyecto-logs-prod/_doc
+{
+  "@timestamp": "2026-10-16T00:00:00Z",
+  "service": "search",
+  "status": 200,
+  "message": "prueba de ingesta"
+}
 ```
 
-Actualiza el informe con el nuevo hallazgo y escala el caso si la causa requiere capacidad, cambio de topología, corrección de filtros o intervención fuera del alcance del laboratorio.
+Nota de contexto: un bloqueo parecido, `index.blocks.read_only_allow_delete`, lo pone el clúster solo cuando un nodo supera el watermark de inundación del disco (95 %). Aquí el bloqueo fue manual; la prevención es controlar quién puede cambiar settings de índices (privilegio `manage`) y auditarlo.
 
-### 2. La prueba Bulk autorizada devuelve `403`, `401` o `errors: true`
+### Incidente 2: faltan documentos tras una carga
 
-**Síntomas**
+**Inducción y síntoma:** una aplicación envía dos eventos con `_bulk` y recibe un código HTTP 200.
 
-- La respuesta Bulk con la API key de prueba no devuelve `errors: false`.
-- Aparece `security_exception`, `unable to authenticate`, `authorization_exception` o un error de pipeline.
-
-**Causa**
-
-La API key puede estar mal copiada, expirada, creada con un rol incorrecto, enviada sin la cabecera `Authorization: ApiKey`, o el índice puede tener un pipeline obligatorio que falla antes de indexar el documento.
-
-**Corrección**
-
-Primero inspecciona la respuesta exacta sin exponer la API key:
-
-```bash
-jq '.items[] | .[] | {status, error}' \
-  "${EVIDENCE_DIR}/05-bulk-allowed-response.json"
+``` console
+POST proyecto-logs-prod/_bulk
+{ "create": {} }
+{ "@timestamp": "2026-10-16T00:01:00Z", "service": "payments", "status": "error-interno", "message": "pago rechazado" }
+{ "create": {} }
+{ "@timestamp": "2026-10-16T00:02:00Z", "service": "payments", "status": 500, "message": "pago con timeout" }
 ```
 
-Si el error es de permisos, crea nuevamente una API key con `create_doc` sobre `logs-ops-lab` y repite solo la prueba controlada. Si el error menciona un pipeline, revisa el pipeline detectado en `04-pipeline-inspeccion.json`, documenta el hallazgo y no lo modifiques sin una corrección aprobada y reversible.
+**Diagnóstico guiado:**
 
-## Limpieza
+- La respuesta es 200, pero ¿qué dice el campo `errors`? Revisa el arreglo `items`, elemento por elemento.
 
-La limpieza debe eliminar únicamente artefactos temporales de la prueba controlada. Debes conservar las evidencias y el informe final.
+- Lee el `status` y la `reason` del elemento fallido.
 
-1. Elimina el documento creado por la prueba de ingestión autorizada.
+- Compara el valor enviado con el tipo del campo en el mapping: `GET proyecto-logs-prod/_mapping/field/status`.
 
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -X DELETE "${ES_URL}/logs-ops-lab/_doc/${OK_DOC_ID}?refresh=true&pretty" \
-     | tee "${EVIDENCE_DIR}/cleanup-delete-documento-prueba.json"
-   ```
+**Resultado esperado:** `"errors": true`; el primer elemento falla con estado 400 y un error de tipo `document_parsing_exception` (o `mapper_parsing_exception`): no se pudo interpretar `error-interno` como `short`. El segundo se indexó. La causa está en el productor (envía texto en un campo numérico), no en Elasticsearch.
 
-2. Revoca las API keys temporales creadas durante el laboratorio.
+**Mitigación:** corregir el productor y reenviar solo el documento rechazado. Para eventos en tránsito, reparar con un ingest pipeline que normalice el campo. **Prevención:** revisar `errors` en toda respuesta de `_bulk` y guardar los elementos rechazados para reprocesarlos (cola de eventos fallidos). Usar `ignore_malformed` evita el rechazo, a costa de no indexar el campo defectuoso; es una decisión de diseño, no un parche.
 
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -X DELETE "${ES_URL}/_security/api_key?id=${DENIED_KEY_ID}&pretty" \
-     | tee "${EVIDENCE_DIR}/cleanup-delete-denied-key.json"
+**Limpieza de los documentos de prueba de los incidentes 1 y 2:**
 
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -X DELETE "${ES_URL}/_security/api_key?id=${ALLOWED_KEY_ID}&pretty" \
-     | tee "${EVIDENCE_DIR}/cleanup-delete-allowed-key.json"
-   ```
+``` console
+POST proyecto-logs-prod/_delete_by_query?refresh=true
+{
+  "query": { "range": { "@timestamp": { "gte": "2026-10-16T00:00:00Z" } } }
+}
 
-3. Elimina variables sensibles de la sesión actual.
+GET proyecto-logs-prod/_count
+```
 
-   ```bash
-   unset DENIED_KEY DENIED_KEY_ID ALLOWED_KEY ALLOWED_KEY_ID ELASTIC_PASSWORD
-   ```
+**Resultado esperado:** `deleted: 2` y `count` de 5477 (los documentos de los incidentes 1 y 2 que sí se indexaron). Los datos nuevos del 15 de octubre quedan intactos.
 
-4. Mantén el ajuste de cero réplicas si fue la mitigación aprobada para este clúster de laboratorio. No lo reviertas a `1` mientras el clúster siga teniendo un único nodo, porque el estado volvería previsiblemente a `yellow`.
+### Incidente 3 (opcional): el clúster pasa a yellow
 
-5. No ejecutes ninguno de estos comandos:
+Si terminaste antes de tiempo. **Inducción:** `PUT proyecto-logs-prod/_settings` con `{"index.number_of_replicas": 4}`. **Síntoma:** `GET _cluster/health` devuelve `yellow`. Diagnostica con `_cat/indices?health=yellow`, `_cat/shards/proyecto-logs-prod?v` y `_cluster/allocation/explain`, y resuelve devolviendo las réplicas a 1. Es el incidente del laboratorio 9; aquí se resuelve sin la guía.
 
-   ```bash
-   docker compose down -v
-   docker volume rm es717-data es930-data kibana717-data kibana930-data
-   ```
+### Plan de mitigación (entregable)
 
-## Resumen
+Completa la tabla del incidente 1 o del 2, según la indique el instructor:
 
-En este laboratorio aplicaste una metodología de diagnóstico estructurada: partiste de síntomas observables en Discover, mediste el impacto, capturaste evidencia de Elasticsearch antes de modificar el entorno, formulaste hipótesis y validaste una mitigación reversible.
+| **Campo**                                    | **Contenido** |
+|----------------------------------------------|---------------|
+| Incidente                                    |               |
+| Impacto (qué dejó de funcionar y para quién) |               |
+| Síntoma observado                            |               |
+| Evidencia (comando y resultado)              |               |
+| Causa raíz                                   |               |
+| Mitigación inmediata                         |               |
+| Verificación                                 |               |
+| Acción correctiva y preventiva               |               |
+| Responsable                                  |               |
 
-Las conclusiones principales deben reflejar que:
+## Parte F: checklist de producción y demostración (9 min, 10 puntos)
 
-- Un error de aplicación o de ingestión no demuestra por sí mismo una caída del clúster.
-- Un estado `yellow` requiere identificar qué shard está sin asignar y solicitar una explicación de asignación.
-- Una réplica en un clúster de un nodo representa un riesgo de disponibilidad, no necesariamente una pérdida de servicio inmediata.
-- Las respuestas de Bulk son evidencia directa para distinguir problemas de permisos, autenticación y pipelines.
-- Una mitigación operativa solo está completa cuando se valida con salud del clúster, shards, métricas, consultas funcionales y documentación.
-- El informe técnico convierte la investigación en conocimiento reutilizable, facilita el escalamiento y define acciones preventivas verificables.
+Evalúa tu plataforma contra el checklist. Para cada control, anota la evidencia (comando y resultado) y marca Cumple, No cumple o No aplica. Un control sin evidencia cuenta como no cumplido.
 
-### Recursos opcionales
+| **Área**         | **Control**                                                                  | **Evidencia**                                                                | **Estado** |
+|------------------|------------------------------------------------------------------------------|------------------------------------------------------------------------------|------------|
+| Salud            | Clúster `green` y sin shards sin asignar                                     | `GET _cluster/health`                                                        |            |
+| Topología        | Al menos 2 zonas de disponibilidad y 1 réplica en todos los índices de datos | Consola de Elastic Cloud; `GET _cat/indices?v&h=index,rep&s=rep`             |            |
+| Mapping          | Mapping explícito en el template; sin campos dinámicos inesperados           | `GET proyecto-logs-prod/_mapping`                                            |            |
+| Ciclo de vida    | Política ILM asociada y sin errores                                          | `GET proyecto-logs-prod/_ilm/explain`; `GET */_ilm/explain?only_errors=true` |            |
+| Dimensionamiento | Shards entre 10 y 50 GB en producción; cálculo documentado                   | Parte A                                                                      |            |
+| Ingesta          | Credencial de ingesta con permisos mínimos y caducidad                       | `GET _security/api_key?active_only=true`                                     |            |
+| Ingesta          | Respuestas `_bulk` revisadas; manejo de rechazados                           | Incidente 2                                                                  |            |
+| Seguridad        | Usuario de solo lectura probado (200 y 403)                                  | Parte D                                                                      |            |
+| Seguridad        | Aplicaciones sin usar el usuario `elastic`                                   | `GET _security/_authenticate` en cada aplicación                             |            |
+| Backups          | Snapshot reciente y política SLM                                             | `GET _snapshot/found-snapshots/*?size=1&sort=start_time&order=desc`          |            |
+| Backups          | Restore ensayado                                                             | Laboratorio 7                                                                |            |
+| Monitoreo        | Dashboard operativo y alerta de errores                                      | Laboratorio 8                                                                |            |
+| Operación        | Runbook de verificación diaria y de cambios de mapping                       | Laboratorio 9                                                                |            |
+| Gobernanza       | Retención documentada y matriz de accesos                                    | Laboratorio 7 y Parte B                                                      |            |
+| Diagnóstico      | Plan de mitigación documentado                                               | Parte E                                                                      |            |
+| Costos           | Retención y réplicas justificadas                                            | Parte A                                                                      |            |
 
-- [Diagnóstico de clústeres Elasticsearch en estado rojo o amarillo](https://www.elastic.co/docs/troubleshoot/elasticsearch/red-yellow-cluster-status)
-- [API Cluster Health](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-cluster-health)
-- [API Cluster Allocation Explain](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-cluster-allocation-explain)
-- [API Bulk](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-bulk)
-- [API Explain ILM](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-ilm-explain-lifecycle)
-- [Seguridad con API keys de Elasticsearch](https://www.elastic.co/docs/deploy-manage/api-keys)
+### Demostración
+
+Prepara una demostración de 2 minutos con: el diseño elegido y su dimensionamiento, el data stream en Discover o en el dashboard, el resultado de un incidente y los controles que no cumples y cómo los cerrarías.
+
+### Cierre
+
+``` console
+DELETE _security/api_key
+{ "name": "proyecto-ingesta" }
+```
+
+Se conservan el data stream, el template, la política de ILM, el rol y el usuario de solo lectura. La prueba gratuita dura 14 días; al vencer, el deployment se suspende. Antes de que termine, exporta lo que quieras conservar: templates, pipelines y políticas (con `GET`), y los dashboards desde Kibana en **Saved Objects**.
+
+## Anexo opcional: búsqueda semántica y vectorial (demostración, 10 a 15 min)
+
+Solo demostración del instructor, fuera de la evaluación. Antes de la clase hay que verificar en la documentación oficial qué incluye por defecto la versión usada y si el deployment de la prueba tiene disponible un endpoint de inferencia.
+
+### Paso X1. Endpoints de inferencia disponibles
+
+``` console
+GET _inference/_all
+```
+
+**Qué hace:** lista los endpoints de inferencia del clúster. Cada uno identifica un modelo y el servicio que lo ejecuta (por ejemplo, ELSER en nodos de machine learning o en el Elastic Inference Service). **Resultado esperado:** al menos un endpoint de embeddings dispersos; si la lista está vacía o el modelo no puede desplegarse en la prueba, se muestra la demostración con capturas.
+
+### Paso X2. Índice con semantic_text
+
+``` console
+PUT semantic-demo
+{
+  "mappings": {
+    "properties": {
+      "texto": { "type": "semantic_text" }
+    }
+  }
+}
+
+POST semantic-demo/_bulk?refresh=wait_for
+{ "index": { "_id": "1" } }
+{ "texto": "Tips to speed up a laptop: close unused apps and add more memory." }
+{ "index": { "_id": "2" } }
+{ "texto": "How to bake sourdough bread at home." }
+{ "index": { "_id": "3" } }
+{ "texto": "Cluster performance: reducing query latency with filters and caching." }
+{ "index": { "_id": "4" } }
+{ "texto": "Resetting your account password step by step." }
+```
+
+**Qué hace:** crea un índice con un campo `semantic_text`. Al indexar, Elasticsearch genera los embeddings con el endpoint de inferencia por defecto; no hace falta definir un pipeline.
+
+- `semantic_text`: campo que gestiona la inferencia y el almacenamiento de los vectores.
+
+- Sin `inference_id`, se usa el endpoint por defecto de la versión y el deployment. En producción se fija de forma explícita para que todos los índices usen el mismo modelo.
+
+- ELSER es un modelo en inglés; por eso los textos están en inglés. Para español se usa un modelo multilingüe, con otro `inference_id`.
+
+### Paso X3. Consulta semántica
+
+``` console
+GET semantic-demo/_search
+{
+  "query": {
+    "match": { "texto": "my computer is very slow" }
+  }
+}
+```
+
+**Qué hace:** busca por significado. La consulta no comparte palabras con el documento 1, pero el modelo relaciona "computer is slow" con "speed up a laptop". **Resultado esperado:** el documento 1 en primer lugar, seguido probablemente del 3. El orden depende del modelo.
+
+Comparación: `match` sobre un campo `text` normal no encontraría el documento 1 con esa consulta, porque no hay términos en común. Las aplicaciones reales combinan ambas técnicas (búsqueda híbrida: léxica y semántica, fusionadas, por ejemplo, con reciprocal rank fusion).
+
+``` console
+DELETE semantic-demo
+```
+
+## Resumen de valores esperados
+
+| **Elemento**                                             | **Resultado**                                                                                           |
+|----------------------------------------------------------|---------------------------------------------------------------------------------------------------------|
+| Almacenamiento total a 30 días                           | 40 × 30 × 2 × 1.1 = 2640 GB                                                                             |
+| Capacidad a aprovisionar                                 | 2640 / 0.80 = 3300 GB                                                                                   |
+| Hot (7 días) y warm (23 días)                            | 616 GB y 2024 GB                                                                                        |
+| Índices a 30 días con rollover a 50 GB (1 primario)      | Alrededor de 24 (1200 GB / 50 GB)                                                                       |
+| Shards con réplica: rollover por tamaño / diario         | Alrededor de 48 / 60                                                                                    |
+| Por qué `delete.min_age` es 23d                          | Cuenta desde el rollover: 7d de escritura en hot más 23d = 30d. Con 30d, un dato podría vivir hasta 37d |
+| Carga histórica                                          | created 4977                                                                                            |
+| Total del data stream tras la carga nueva                | 5477                                                                                                    |
+| Por servicio                                             | payments 827, checkout 1661, search 1027, catalog 1962                                                  |
+| Errores 5xx                                              | 111                                                                                                     |
+| Por día (UTC)                                            | 12 oct: 1708, 13 oct: 1621, 14 oct: 1648, 15 oct: 500                                                   |
+| Usuario de solo lectura: lectura / escritura / `weblogs` | 200 / 403 / 403                                                                                         |
+| Incidente 1                                              | 403 `cluster_block_exception`, bloqueo `index write`                                                    |
+| Incidente 2                                              | 200 con `errors: true`; fallo 400 por tipo de `status`                                                  |
+
+Nota sobre el índice con rollover por tamaño: el cálculo supone que el tráfico es constante. La estimación de índices (24) cambia si el volumen real difiere del estimado, por eso se revisa con el consumo medido.
+
+## Rúbrica de evaluación
+
+| **Criterio**                | **Qué se espera**                                                                                                          | **Puntos** |
+|-----------------------------|----------------------------------------------------------------------------------------------------------------------------|------------|
+| A. Dimensionamiento         | Cálculos correctos y justificación del rollover por tamaño                                                                 | 15         |
+| B. Diseño                   | Política ILM coherente con la retención; template compuesto; data stream verificado con `_simulate_index` y `_ilm/explain` | 25         |
+| C. Carga                    | Histórico y nuevos cargados, con totales verificados por servicio, errores y día                                           | 15         |
+| D. Acceso                   | Rol y usuario de solo lectura probados, con 200 y 403                                                                      | 10         |
+| E. Diagnóstico              | Dos incidentes con síntoma, evidencia, causa, mitigación y verificación; plan de mitigación completo                       | 25         |
+| F. Checklist y demostración | Controles con evidencia; demostración clara de 2 minutos                                                                   | 10         |
+| Total                       |                                                                                                                            | 100        |
+
+## Preguntas de discusión
+
+- ¿Qué decisión de diseño cambiarías si el volumen fuera 20 veces mayor? ¿Y si hubiera 2000 tenants pequeños?
+
+- ¿Qué parte del checklist fue la más difícil de comprobar y qué automatizarías primero?
+
+- ¿Qué incidente costó más diagnosticar y qué señal lo habría detectado antes?
+
+- ¿Qué runbook añadirías antes de poner esta plataforma en producción?
+
+- ¿Qué dejarías fuera de la primera versión productiva y por qué?
+
+## Resultado final
+
+Al terminar el laboratorio, el entorno debe quedar como se muestra en la imagen: lo que se conserva, cómo verificarlo y lo que se elimina.
+
+![Resultado final del laboratorio 10: Proyecto final de integración y demostración](imagenes/lab10_resultado_final.png)

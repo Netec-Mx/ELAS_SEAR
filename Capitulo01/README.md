@@ -1,1162 +1,490 @@
-# Analizar la arquitectura, los roles de nodos y el estado de un deployment de Elasticsearch.
+# Laboratorio 1: Evaluación de topologías en la nube
 
-## Metadatos
+- **Capítulo:** 1. Fundamentos y modelo distribuido de Elasticsearch
 
-| Campo | Valor |
-|---|---|
-| Duración | 60 minutos |
-| Complejidad | Media |
-| Nivel de Bloom | Aplicar |
+- **Duración:** 34 min
 
-## Descripción general
+- **Entorno:** Elastic Cloud Hosted, Elasticsearch 9.x, Kibana Dev Tools
 
-En esta práctica se desplegarán dos clústeres aislados de Elasticsearch mediante Docker Compose: Elasticsearch 7.17.29 y Elasticsearch 9.3.0, cada uno con su instancia de Kibana. Se inspeccionarán los componentes de la arquitectura distribuida, los roles de nodo, la salud del clúster, la asignación de *shards* y el comportamiento de las réplicas en un diseño de nodo único.
+- **Dependencias:** ninguna. Este es el primer laboratorio de la cadena; los datos y la ficha que genera se reutilizan en laboratorios posteriores.
 
-El clúster Elasticsearch 9.3.0 quedará como entorno principal para las prácticas posteriores de generación, consulta y análisis de datos. Elasticsearch 7.17.29 permanecerá disponible para comparaciones y para la práctica de actualización.
+## Objetivo
 
-## Objetivos de aprendizaje
+Revisar la salud de un clúster en Elastic Cloud, observar shards y réplicas para entender por qué un índice puede quedar en estado yellow, y comparar estrategias de multi-tenancy sobre un caso. Al terminar, el participante podrá:
 
-Al finalizar la práctica, podrá:
+- Identificar la versión, los nodos y los roles de un deployment, tanto desde la API como desde la consola de Elastic Cloud.
 
-- [ ] Levantar y validar los deployments de Elasticsearch 7.17.29 y 9.3.0 con Kibana mediante Docker Compose.
-- [ ] Identificar clústeres, nodos, índices, *shards* primarios, réplicas, alias, *data streams* y Kibana.
-- [ ] Consultar la salud, los roles de nodo, la configuración de descubrimiento y la asignación de *shards* mediante APIs de Elasticsearch.
-- [ ] Explicar por qué un clúster de un solo nodo presenta estado `yellow` cuando existen réplicas configuradas.
-- [ ] Relacionar el diseño de laboratorio con patrones de producción que separan roles de maestro, datos, ingesta y coordinación.
+- Provocar un estado yellow, diagnosticar su causa con la API de explicación de asignación y corregirlo.
 
-## Requisitos previos
+- Comparar el consumo de shards entre un índice por tenant y un índice compartido con aliases filtrados.
 
-### Conocimientos
+- Dejar cargado el escenario de datos `orders-shared` que se reutiliza en laboratorios posteriores.
 
-- Uso básico de terminal Linux y edición de archivos YAML.
-- Conceptos básicos de Docker, Docker Compose, JSON y APIs REST.
-- Comprensión inicial de los conceptos de clúster, nodo, índice, documento, *shard* primario y réplica.
-- Uso básico de `curl` y `jq`.
+## Requisitos
 
-### Acceso y software
+- Deployment de Elastic Cloud **Hosted** con Elasticsearch 9.x y, como mínimo, 2 zonas de disponibilidad.
 
-| Requisito | Valor esperado |
-|---|---|
-| Sistema operativo | Ubuntu Desktop 24.04.2 LTS o Ubuntu Server 22.04.5 LTS |
-| Docker Engine | 27.5.1 o compatible |
-| Docker Compose plugin | 2.32.4 o compatible |
-| Memoria disponible | 16 GB mínimo; 24 GB recomendado |
-| CPU disponible | 4 vCPU mínimo; 6 vCPU recomendado |
-| Disco SSD libre | 40 GB mínimo; 60 GB recomendado |
-| Puertos disponibles | 9200, 9201, 5601 y 5602 |
-| Directorio de trabajo | `/opt/elastic-labs` |
-| Parámetro del kernel | `vm.max_map_count=262144` |
-| Acceso a Internet | Necesario para descargar imágenes desde Elastic Docker Registry |
+- Acceso a Kibana Dev Tools con un usuario con privilegios de administración del clúster (por ejemplo, el usuario `elastic`).
 
-> **Importante:** Esta práctica utiliza credenciales exclusivas de laboratorio. No reutilice `ElasticLab_2026!` fuera del entorno de formación.
+## Distribución del tiempo
 
----
+| **Parte**             | **Contenido**                            | **Tiempo** |
+|-----------------------|------------------------------------------|------------|
+| Preparación y Parte A | Acceso al deployment y salud del clúster | 8 min      |
+| Parte B               | Shards, réplicas y estado yellow         | 12 min     |
+| Parte C               | Estrategias de multi-tenancy             | 14 min     |
 
-## Entorno de laboratorio
+## Convenciones del laboratorio
 
-La práctica crea dos stacks aislados en la misma red Docker:
+- Todos los comandos se ejecutan en la consola de Dev Tools (pestaña Console). Cada petición se ejecuta con el botón de reproducir o con Ctrl + Enter.
 
-| Componente | Versión | Contenedor | Puerto de host | Clúster |
-|---|---:|---|---:|---|
-| Elasticsearch | 7.17.29 | `es717-lab` | `9200` | `es717-lab-cluster` |
-| Kibana | 7.17.29 | `kibana717-lab` | `5601` | Asociado a `es717-lab-cluster` |
-| Elasticsearch | 9.3.0 | `es930-lab` | `9201` | `es930-lab-cluster` |
-| Kibana | 9.3.0 | `kibana930-lab` | `5602` | Asociado a `es930-lab-cluster` |
+- La consola acepta la sintaxis `MÉTODO ruta` seguida del cuerpo JSON; no se usa `curl` ni la URL completa.
 
-Los volúmenes persistentes obligatorios son:
+- Los índices del laboratorio usan prefijos fijos (`lab01-`, `orders-`) para identificarlos y limpiarlos.
 
-- `es717-data`
-- `es930-data`
-- `kibana717-data`
-- `kibana930-data`
+- Cada comando va seguido de una explicación de lo que hace y del significado de sus parámetros.
 
-La red Docker obligatoria es `elastic-lab-net`.
+- No eliminar el deployment ni índices que el laboratorio no pida borrar: los laboratorios siguientes dependen de ellos.
 
-> **Continuidad del curso:** No ejecute `docker compose down -v`. La opción `-v` eliminaría los volúmenes persistentes y destruiría el estado que se reutilizará en prácticas posteriores.
+## Preparación: acceso al deployment
 
----
+1.  Ingresar a la consola de Elastic Cloud (cloud.elastic.co) y abrir el deployment del curso.
 
-## Procedimiento paso a paso
+2.  Verificar que el deployment sea de tipo **Hosted** (muestra nodos, zonas y tiers). Un proyecto Serverless no sirve para el curso: no expone nodos ni shards como se trabaja aquí.
 
-### Paso 1. Preparar el directorio de trabajo y validar el host
+3.  Seleccionar **Open Kibana**.
 
-**Objetivo:** Crear la estructura de directorios obligatoria y confirmar que Docker, puertos y parámetros del kernel cumplen los requisitos.
+4.  En el menú principal, dentro de la sección Management, abrir **Dev Tools** y usar la pestaña **Console**.
 
-**Instrucciones:**
+## Parte A: salud del clúster
 
-1. Abra una terminal y cree el directorio raíz del laboratorio con el directorio de evidencias.
+### Paso A1. Identificar el clúster
 
-   ```bash
-   sudo mkdir -p /opt/elastic-labs/work
-   sudo chown -R "$USER":"$USER" /opt/elastic-labs
-   cd /opt/elastic-labs
-   ```
-
-2. Verifique las versiones de Docker y Docker Compose.
-
-   ```bash
-   docker --version
-   docker compose version
-   ```
-
-3. Verifique el valor de `vm.max_map_count`.
-
-   ```bash
-   sysctl vm.max_map_count
-   ```
-
-4. Si el valor es inferior a `262144`, configúrelo temporalmente.
-
-   ```bash
-   sudo sysctl -w vm.max_map_count=262144
-   ```
-
-5. Para conservar la configuración después de reiniciar el host Linux, cree un archivo de configuración del sistema.
-
-   ```bash
-   echo "vm.max_map_count=262144" | sudo tee /etc/sysctl.d/99-elastic-labs.conf
-   sudo sysctl --system
-   ```
-
-6. Verifique que los puertos requeridos no estén ocupados.
-
-   ```bash
-   ss -ltn | grep -E ':(9200|9201|5601|5602)\s' || true
-   ```
-
-7. Cree los archivos iniciales que se utilizarán durante el laboratorio.
-
-   ```bash
-   touch /opt/elastic-labs/work/comandos-ejecutados.txt
-   touch /opt/elastic-labs/work/observaciones-arquitectura.md
-   ```
-
-**Salida esperada:**
-
-- Docker y Docker Compose muestran una versión instalada.
-- `vm.max_map_count` muestra `262144`.
-- El comando `ss` no muestra procesos utilizando los puertos requeridos, o solamente muestra servicios que usted ya haya identificado y detenido.
-- Existe la ruta `/opt/elastic-labs/work`.
-
-**Verificación:**
-
-```bash
-ls -ld /opt/elastic-labs /opt/elastic-labs/work
-sysctl vm.max_map_count
+``` console
+GET /
 ```
 
-El resultado debe confirmar que el usuario actual puede escribir en el directorio del laboratorio y que el parámetro del kernel tiene el valor requerido.
+**Qué hace:** consulta la raíz del servidor y devuelve la información básica del clúster. Es equivalente a conectarse al puerto 9200 en una instalación local.
 
----
+Campos a revisar en la respuesta:
 
-### Paso 2. Crear el archivo de credenciales y el archivo Docker Compose
+- `name`: nodo que atendió la petición.
 
-**Objetivo:** Definir las credenciales de laboratorio con permisos restrictivos y crear la configuración reproducible de los dos deployments.
+- `cluster_name`: nombre del clúster.
 
-**Instrucciones:**
+- `version.number`: versión de Elasticsearch. Debe ser 9.x.
 
-1. Cree el archivo `/opt/elastic-labs/.env`.
+- `version.build_flavor`: tipo de distribución.
 
-   ```bash
-   cat > /opt/elastic-labs/.env <<'EOF'
-   ELASTIC_PASSWORD=ElasticLab_2026!
-   EOF
-   ```
+- `version.lucene_version`: versión de Lucene sobre la que corre.
 
-2. Restrinja los permisos del archivo de credenciales.
+### Paso A2. Consultar la salud del clúster
 
-   ```bash
-   chmod 0600 /opt/elastic-labs/.env
-   ls -l /opt/elastic-labs/.env
-   ```
-
-3. Cree el archivo obligatorio `/opt/elastic-labs/compose.yaml`.
-
-   ```bash
-   cat > /opt/elastic-labs/compose.yaml <<'EOF'
-   services:
-     es717-lab:
-       image: docker.elastic.co/elasticsearch/elasticsearch:7.17.29
-       container_name: es717-lab
-       environment:
-         - node.name=es717-node-1
-         - cluster.name=es717-lab-cluster
-         - discovery.type=single-node
-         - bootstrap.memory_lock=true
-         - ES_JAVA_OPTS=-Xms1g -Xmx1g
-         - xpack.security.enabled=true
-         - xpack.security.http.ssl.enabled=false
-         - xpack.security.transport.ssl.enabled=false
-         - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
-       ulimits:
-         memlock:
-           soft: -1
-           hard: -1
-       ports:
-         - "9200:9200"
-       volumes:
-         - es717-data:/usr/share/elasticsearch/data
-       networks:
-         - elastic-lab-net
-       healthcheck:
-         test: ["CMD-SHELL", "curl -fsu elastic:$${ELASTIC_PASSWORD} http://localhost:9200/_cluster/health >/dev/null"]
-         interval: 15s
-         timeout: 10s
-         retries: 20
-
-     kibana717-lab:
-       image: docker.elastic.co/kibana/kibana:7.17.29
-       container_name: kibana717-lab
-       depends_on:
-         es717-lab:
-           condition: service_healthy
-       environment:
-         - ELASTICSEARCH_HOSTS=http://es717-lab:9200
-         - ELASTICSEARCH_USERNAME=kibana_system
-         - ELASTICSEARCH_PASSWORD=${ELASTIC_PASSWORD}
-         - SERVER_NAME=kibana717-lab
-       entrypoint: ["/bin/sh", "-ec"]
-       command:
-         - |
-           until curl -fsu elastic:"$${ELASTIC_PASSWORD}" http://es717-lab:9200/_cluster/health >/dev/null; do sleep 3; done
-           curl -fsS -X POST -u elastic:"$${ELASTIC_PASSWORD}" \
-             -H 'Content-Type: application/json' \
-             http://es717-lab:9200/_security/user/kibana_system/_password \
-             -d "{\"password\":\"$${ELASTIC_PASSWORD}\"}"
-           exec /usr/local/bin/kibana-docker
-       ports:
-         - "5601:5601"
-       volumes:
-         - kibana717-data:/usr/share/kibana/data
-       networks:
-         - elastic-lab-net
-
-     es930-lab:
-       image: docker.elastic.co/elasticsearch/elasticsearch:9.3.0
-       container_name: es930-lab
-       environment:
-         - node.name=es930-node-1
-         - cluster.name=es930-lab-cluster
-         - discovery.type=single-node
-         - bootstrap.memory_lock=true
-         - ES_JAVA_OPTS=-Xms1g -Xmx1g
-         - xpack.security.enabled=true
-         - xpack.security.http.ssl.enabled=false
-         - xpack.security.transport.ssl.enabled=false
-         - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
-       ulimits:
-         memlock:
-           soft: -1
-           hard: -1
-       ports:
-         - "9201:9200"
-       volumes:
-         - es930-data:/usr/share/elasticsearch/data
-       networks:
-         - elastic-lab-net
-       healthcheck:
-         test: ["CMD-SHELL", "curl -fsu elastic:$${ELASTIC_PASSWORD} http://localhost:9200/_cluster/health >/dev/null"]
-         interval: 15s
-         timeout: 10s
-         retries: 20
-
-     kibana930-lab:
-       image: docker.elastic.co/kibana/kibana:9.3.0
-       container_name: kibana930-lab
-       depends_on:
-         es930-lab:
-           condition: service_healthy
-       environment:
-         - ELASTICSEARCH_HOSTS=http://es930-lab:9200
-         - ELASTICSEARCH_USERNAME=kibana_system
-         - ELASTICSEARCH_PASSWORD=${ELASTIC_PASSWORD}
-         - SERVER_NAME=kibana930-lab
-       entrypoint: ["/bin/sh", "-ec"]
-       command:
-         - |
-           until curl -fsu elastic:"$${ELASTIC_PASSWORD}" http://es930-lab:9200/_cluster/health >/dev/null; do sleep 3; done
-           curl -fsS -X POST -u elastic:"$${ELASTIC_PASSWORD}" \
-             -H 'Content-Type: application/json' \
-             http://es930-lab:9200/_security/user/kibana_system/_password \
-             -d "{\"password\":\"$${ELASTIC_PASSWORD}\"}"
-           exec /usr/local/bin/kibana-docker
-       ports:
-         - "5602:5601"
-       volumes:
-         - kibana930-data:/usr/share/kibana/data
-       networks:
-         - elastic-lab-net
-
-   networks:
-     elastic-lab-net:
-       name: elastic-lab-net
-       driver: bridge
-
-   volumes:
-     es717-data:
-       name: es717-data
-     es930-data:
-       name: es930-data
-     kibana717-data:
-       name: kibana717-data
-     kibana930-data:
-       name: kibana930-data
-   EOF
-   ```
-
-4. Valide la sintaxis y la interpolación de variables del archivo Compose.
-
-   ```bash
-   docker compose --env-file /opt/elastic-labs/.env config > /opt/elastic-labs/work/compose-validado.yaml
-   ```
-
-5. Revise que no se hayan publicado puertos distintos a los requeridos.
-
-   ```bash
-   grep -nE '9200:9200|9201:9200|5601:5601|5602:5601' /opt/elastic-labs/work/compose-validado.yaml
-   ```
-
-**Salida esperada:**
-
-- El archivo `.env` tiene permisos `-rw-------`.
-- `docker compose config` finaliza sin errores de sintaxis.
-- El archivo validado contiene los cuatro servicios, la red `elastic-lab-net` y los cuatro volúmenes persistentes.
-
-**Verificación:**
-
-```bash
-cd /opt/elastic-labs
-docker compose --env-file .env config --services
+``` console
+GET _cluster/health
 ```
 
-Debe mostrar:
+**Qué hace:** devuelve el estado global del clúster.
 
-```text
-es717-lab
-kibana717-lab
-es930-lab
-kibana930-lab
+Campos a revisar:
+
+- `status`: green, yellow o red.
+
+- `number_of_nodes` y `number_of_data_nodes`: nodos totales y nodos que almacenan datos.
+
+- `active_primary_shards` y `active_shards`: primaries activos y total de copias activas.
+
+- `unassigned_shards`: copias sin nodo asignado.
+
+- `active_shards_percent_as_number`: porcentaje de shards activos. Debe ser 100 cuando el estado es green.
+
+### Paso A3. Listar los nodos y sus roles
+
+``` console
+GET _cat/nodes?v&h=name,node.role,master,heap.percent,disk.used_percent
 ```
 
----
+**Qué hace:** lista los nodos en formato de tabla legible.
 
-### Paso 3. Iniciar los dos deployments y validar la conectividad básica
+Parámetros:
 
-**Objetivo:** Descargar las imágenes, iniciar los contenedores y confirmar que ambos clústeres responden por HTTP autenticado.
+- `_cat`: familia de APIs que devuelve texto tabulado en lugar de JSON, pensada para lectura en consola.
 
-**Instrucciones:**
+- `v`: incluye la fila de encabezados.
 
-1. Sitúese en el directorio de laboratorio.
+- `h=`: columnas a mostrar, separadas por coma.
 
-   ```bash
-   cd /opt/elastic-labs
-   ```
+- `node.role`: abreviatura de roles. Los más frecuentes en Elastic Cloud son `m` (master-eligible), `v` (voting-only, nodo tiebreaker), `h` (data hot), `w` (data warm), `c` (data cold), `s` (data content) e `i` (ingest).
 
-2. Inicie los servicios en segundo plano.
+- `master`: un asterisco (`*`) marca al master elegido.
 
-   ```bash
-   docker compose --env-file .env up -d
-   ```
+- `heap.percent`: uso del heap de la JVM.
 
-3. Consulte el estado de los servicios.
+- `disk.used_percent`: uso de disco, que se compara con los watermarks de 85 %, 90 % y 95 % vistos en el tema 1.2.
 
-   ```bash
-   docker compose ps
-   ```
+### Paso A4. Listar los índices
 
-4. Espere hasta que Elasticsearch muestre estado `healthy`. Si Kibana tarda más tiempo en iniciar, espere uno o dos minutos adicionales.
+``` console
+GET _cat/indices?v
+```
 
-   ```bash
-   watch -n 5 'docker compose ps'
-   ```
+**Qué hace:** lista los índices con su salud, número de shards y tamaño.
 
-   Para salir de `watch`, pulse `Ctrl+C`.
+Columnas relevantes: `health`, `index`, `pri` (primaries), `rep` (réplicas por primary), `docs.count` y `store.size`. Los índices cuyo nombre empieza con punto son del sistema y no se modifican.
 
-5. Cargue la variable de contraseña en la sesión actual.
+### Paso A5. Contrastar con la consola y completar la ficha del deployment
 
-   ```bash
-   set -a
-   . /opt/elastic-labs/.env
-   set +a
-   ```
+En la consola de Elastic Cloud, abrir la configuración del deployment (opción **Edit**) y comparar con lo observado en `_cat/nodes`:
 
-6. Consulte la información principal de Elasticsearch 7.17.29.
+- Zonas de disponibilidad configuradas.
 
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     http://localhost:9200/ | jq .
-   ```
+- Tamaño y tiers de datos habilitados (hot, warm, cold).
 
-7. Consulte la información principal de Elasticsearch 9.3.0.
+- Presencia de nodos master dedicados o de un tiebreaker.
 
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     http://localhost:9201/ | jq .
-   ```
+Completar la ficha del deployment. Se usará en todos los laboratorios del curso:
 
-8. Guarde evidencias de las respuestas.
+| **Dato**                   | **Valor** |
+|----------------------------|-----------|
+| Nombre del deployment      |           |
+| Versión de Elasticsearch   |           |
+| Zonas de disponibilidad    |           |
+| Número de nodos de datos   |           |
+| Tiers habilitados          |           |
+| Estado inicial del clúster |           |
 
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     http://localhost:9200/ | jq . \
-     > /opt/elastic-labs/work/es717-root.json
+## Parte B: shards, réplicas y estado yellow
 
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     http://localhost:9201/ | jq . \
-     > /opt/elastic-labs/work/es930-root.json
-   ```
+### Paso B1. Crear un índice con más réplicas de las que el clúster puede alojar
 
-9. Abra Kibana en un navegador:
-
-   - Kibana 7.17.29: <http://localhost:5601>
-   - Kibana 9.3.0: <http://localhost:5602>
-
-   Inicie sesión con:
-
-   ```text
-   Usuario: elastic
-   Contraseña: ElasticLab_2026!
-   ```
-
-**Salida esperada:**
-
-La respuesta de cada endpoint raíz contiene, entre otros campos:
-
-```json
+``` console
+PUT lab01-demo
 {
-  "name": "es717-node-1",
-  "cluster_name": "es717-lab-cluster",
-  "version": {
-    "number": "7.17.29"
+  "settings": {
+    "number_of_shards": 3,
+    "number_of_replicas": 2
   }
 }
 ```
 
-Y para el segundo clúster:
+**Qué hace:** crea un índice que pide más copias de las que el clúster puede alojar. Con 2 nodos de datos, cada shard necesita 3 nodos (1 primary y 2 réplicas) y solo hay 2.
 
-```json
+Parámetros:
+
+- `number_of_shards`: cantidad de primary shards. No se puede cambiar después sin split, shrink o reindex.
+
+- `number_of_replicas`: copias por cada primary. Se puede modificar en cualquier momento.
+
+Si el deployment tiene 3 nodos de datos, usar `"number_of_replicas": 3` para provocar la misma situación.
+
+### Paso B2. Observar la ubicación de los shards
+
+``` console
+GET _cat/shards/lab01-demo?v&h=index,shard,prirep,state,node,unassigned.reason
+```
+
+**Qué hace:** muestra cada copia de cada shard y su ubicación.
+
+Columnas:
+
+- `shard`: número de shard (0 a 2).
+
+- `prirep`: `p` indica primary y `r` indica réplica.
+
+- `state`: STARTED, INITIALIZING o UNASSIGNED.
+
+- `node`: nodo donde está alojada la copia; vacío si no tiene.
+
+- `unassigned.reason`: motivo registrado por el master (por ejemplo, INDEX_CREATED).
+
+**Resultado esperado:** los 3 primaries y 3 réplicas en STARTED, y 3 réplicas en UNASSIGNED.
+
+### Paso B3. Confirmar el estado del índice
+
+``` console
+GET _cluster/health/lab01-demo
+```
+
+**Qué hace:** devuelve el mismo informe de salud, limitado a un índice.
+
+**Resultado esperado:** `status: yellow`. Todos los datos están disponibles, pero la tolerancia a fallos está reducida.
+
+### Paso B4. Diagnosticar la causa
+
+``` console
+GET _cluster/allocation/explain
 {
-  "name": "es930-node-1",
-  "cluster_name": "es930-lab-cluster",
-  "version": {
-    "number": "9.3.0"
+  "index": "lab01-demo",
+  "shard": 0,
+  "primary": false
+}
+```
+
+**Qué hace:** explica por qué una copia de shard no está asignada.
+
+Parámetros del cuerpo:
+
+- `index`: índice a analizar.
+
+- `shard`: número de shard.
+
+- `primary`: `false` para analizar una réplica, `true` para analizar el primary.
+
+Sin cuerpo, la API analiza la primera copia sin asignar que encuentre.
+
+Campos a revisar en la respuesta:
+
+- `current_state`: `unassigned`.
+
+- `unassigned_info.reason`: motivo del estado.
+
+- `can_allocate`: `no`.
+
+- `node_allocation_decisions[].deciders`: decisión de cada decider por nodo. Debe aparecer `same_shard`, que indica que el nodo ya tiene una copia de ese shard.
+
+### Paso B5. Corregir y verificar
+
+``` console
+PUT lab01-demo/_settings
+{
+  "index": {
+    "number_of_replicas": 1
   }
 }
 ```
 
-**Verificación:**
+**Qué hace:** actualiza un setting dinámico del índice sin recrearlo ni reindexar.
 
-```bash
-docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+``` console
+GET _cluster/health/lab01-demo?wait_for_status=green&timeout=30s
 ```
 
-Deben aparecer los contenedores `es717-lab`, `kibana717-lab`, `es930-lab` y `kibana930-lab`. Los contenedores de Elasticsearch deben indicar estado `healthy` después de completar su inicialización.
+Parámetros:
 
----
+- `wait_for_status=green`: la petición espera hasta que el índice alcance ese estado.
 
-### Paso 4. Inspeccionar identidad, salud y roles de los nodos
+- `timeout=30s`: tiempo máximo de espera. Si se agota, la respuesta trae `timed_out: true`.
 
-**Objetivo:** Obtener evidencia directa de la identidad de ambos clústeres, de sus nodos y de sus roles efectivos.
+**Resultado esperado:** `status: green`.
 
-**Instrucciones:**
+## Parte C: estrategias de multi-tenancy
 
-1. Consulte la salud de Elasticsearch 7.17.29 y guarde la evidencia.
+Caso: una aplicación registra pedidos para tres tenants (acme, globex e initech). Se comparan dos estrategias y se conserva la segunda para los laboratorios siguientes.
 
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9200/_cluster/health?pretty" \
-     | tee /opt/elastic-labs/work/es717-cluster-health.json
-   ```
+### Paso C1. Estrategia 1: un índice por tenant
 
-2. Consulte la salud de Elasticsearch 9.3.0 y guarde la evidencia.
+``` console
+PUT orders-idx-acme
+{
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 1
+  }
+}
 
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_cluster/health?pretty" \
-     | tee /opt/elastic-labs/work/es930-cluster-health.json
-   ```
-
-3. Consulte el resumen de nodos del clúster 7.17.29.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9200/_cat/nodes?v"
-   ```
-
-4. Consulte el resumen de nodos del clúster 9.3.0.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_cat/nodes?v"
-   ```
-
-5. Guarde la salida de las Cat APIs en archivos de evidencia.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9200/_cat/nodes?v" \
-     > /opt/elastic-labs/work/es717-cat-nodes.txt
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_cat/nodes?v" \
-     > /opt/elastic-labs/work/es930-cat-nodes.txt
-   ```
-
-6. Consulte la Nodes API de cada clúster. La primera petición obtiene la respuesta completa requerida para la práctica; la segunda aplica un filtro para facilitar su interpretación.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9200/_nodes?pretty" \
-     > /opt/elastic-labs/work/es717-nodes-completo.json
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_nodes?pretty" \
-     > /opt/elastic-labs/work/es930-nodes-completo.json
-   ```
-
-7. Extraiga los roles y configuraciones relevantes de descubrimiento.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9200/_nodes/settings,process?filter_path=nodes.*.name,nodes.*.roles,nodes.*.settings.discovery,nodes.*.settings.cluster,nodes.*.process.id&pretty"
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_nodes/settings,process?filter_path=nodes.*.name,nodes.*.roles,nodes.*.settings.discovery,nodes.*.settings.cluster,nodes.*.process.id&pretty"
-   ```
-
-8. Documente en `/opt/elastic-labs/work/observaciones-arquitectura.md` los roles observados. Utilice una tabla como la siguiente.
-
-   ```bash
-   cat >> /opt/elastic-labs/work/observaciones-arquitectura.md <<'EOF'
-
-   ## Roles observados
-
-   | Clúster | Nodo | Roles observados | Interpretación |
-   |---|---|---|---|
-   | es717-lab-cluster | es717-node-1 | Completar según API | Nodo único con múltiples responsabilidades |
-   | es930-lab-cluster | es930-node-1 | Completar según API | Nodo único con múltiples responsabilidades |
-
-   EOF
-   ```
-
-**Salida esperada:**
-
-- La salud indica un único nodo (`number_of_nodes: 1`).
-- El nombre de cada clúster coincide con el configurado en Compose.
-- Los nodos muestran roles combinados, normalmente relacionados con maestro, datos, ingesta y otras capacidades habilitadas por defecto.
-- La configuración de descubrimiento incluye `single-node`.
-
-Ejemplo conceptual de una fila de Cat Nodes:
-
-```text
-ip         heap.percent ram.percent cpu load_1m node.role master name
-172.20.x.x           35          80   2    0.30 dimrstw      * es930-node-1
+PUT orders-idx-globex
+{
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 1
+  }
+}
 ```
 
-La representación abreviada de roles puede variar según la versión. La Nodes API es la fuente más adecuada para interpretar los nombres completos de los roles.
+**Qué hace:** crea un índice independiente por tenant, con un primary y una réplica. Aun vacíos, cada uno ocupa 2 shards.
 
-**Verificación:**
+### Paso C2. Indexar un documento
 
-Confirme los nombres de clúster y nodo con los siguientes comandos:
-
-```bash
-jq -r '.cluster_name, .name, .version.number' /opt/elastic-labs/work/es717-root.json
-jq -r '.cluster_name, .name, .version.number' /opt/elastic-labs/work/es930-root.json
+``` console
+POST orders-idx-acme/_doc?refresh=wait_for
+{
+  "order_id": 1001,
+  "total": 250.5
+}
 ```
 
-Debe identificar:
+**Qué hace:** indexa un documento con `_id` generado automáticamente.
 
-```text
-es717-lab-cluster
-es717-node-1
-7.17.29
-```
+Parámetros:
 
-y:
+- `POST` sin `_id` en la ruta: Elasticsearch genera el identificador. Con `PUT orders-idx-acme/_doc/1001` se fijaría el `_id`.
 
-```text
-es930-lab-cluster
-es930-node-1
-9.3.0
-```
+- `refresh=wait_for`: la respuesta espera al siguiente refresh, de modo que el documento ya aparece en la búsqueda siguiente.
 
----
+Campos a revisar en la respuesta:
 
-### Paso 5. Crear índices, alias y un data stream para observar la arquitectura
+- `result`: `created`.
 
-**Objetivo:** Crear recursos controlados que permitan distinguir entre índice, *shard* primario, réplica, alias y *data stream*.
+- `_shards.total` y `_shards.successful`: copias en las que se intentó y se logró escribir (2 y 2).
 
-**Instrucciones:**
+- `_seq_no` y `_primary_term`: control de versiones de la operación.
 
-1. Cree un índice de demostración en Elasticsearch 7.17.29 con dos *shards* primarios y una réplica por primario.
+### Paso C3. Estrategia 2: un índice compartido con mapeo explícito
 
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -X PUT "http://localhost:9200/arquitectura-717" \
-     -H 'Content-Type: application/json' \
-     -d '{
-       "settings": {
-         "number_of_shards": 2,
-         "number_of_replicas": 1
-       },
-       "mappings": {
-         "properties": {
-           "@timestamp": { "type": "date" },
-           "mensaje": { "type": "keyword" },
-           "origen": { "type": "keyword" }
-         }
-       }
-     }' | jq .
-   ```
-
-2. Cree un índice de demostración equivalente en Elasticsearch 9.3.0.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -X PUT "http://localhost:9201/arquitectura-930" \
-     -H 'Content-Type: application/json' \
-     -d '{
-       "settings": {
-         "number_of_shards": 2,
-         "number_of_replicas": 1
-       },
-       "mappings": {
-         "properties": {
-           "@timestamp": { "type": "date" },
-           "mensaje": { "type": "keyword" },
-           "origen": { "type": "keyword" }
-         }
-       }
-     }' | jq .
-   ```
-
-3. Cree un alias de lectura para el índice de Elasticsearch 9.3.0.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -X POST "http://localhost:9201/_aliases" \
-     -H 'Content-Type: application/json' \
-     -d '{
-       "actions": [
-         {
-           "add": {
-             "index": "arquitectura-930",
-             "alias": "arquitectura-actual"
-           }
-         }
-       ]
-     }' | jq .
-   ```
-
-4. Cree una plantilla de índice que habilite un *data stream* de logs en Elasticsearch 9.3.0.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -X PUT "http://localhost:9201/_index_template/logs-lab-template" \
-     -H 'Content-Type: application/json' \
-     -d '{
-       "index_patterns": ["logs-lab-*"],
-       "priority": 500,
-       "data_stream": {},
-       "template": {
-         "settings": {
-           "number_of_shards": 1,
-           "number_of_replicas": 1
-         },
-         "mappings": {
-           "properties": {
-             "@timestamp": { "type": "date" },
-             "message": { "type": "match_only_text" },
-             "service": {
-               "properties": {
-                 "name": { "type": "keyword" }
-               }
-             },
-             "log": {
-               "properties": {
-                 "level": { "type": "keyword" }
-               }
-             }
-           }
-         }
-       }
-     }' | jq .
-   ```
-
-5. Cree el *data stream*.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -X PUT "http://localhost:9201/_data_stream/logs-lab-aplicacion" \
-     | jq .
-   ```
-
-6. Indexe un documento en el índice de demostración de Elasticsearch 9.3.0.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -X POST "http://localhost:9201/arquitectura-930/_doc/1?refresh=true" \
-     -H 'Content-Type: application/json' \
-     -d '{
-       "@timestamp": "2026-08-25T10:00:00Z",
-       "mensaje": "Documento de prueba para arquitectura",
-       "origen": "laboratorio"
-     }' | jq .
-   ```
-
-7. Indexe un evento en el *data stream*. Debe incluir el campo obligatorio `@timestamp`.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -X POST "http://localhost:9201/logs-lab-aplicacion/_doc?refresh=true" \
-     -H 'Content-Type: application/json' \
-     -d '{
-       "@timestamp": "2026-08-25T10:05:00Z",
-       "message": "Servicio iniciado correctamente",
-       "service": {
-         "name": "api-laboratorio"
-       },
-       "log": {
-         "level": "INFO"
-       }
-     }' | jq .
-   ```
-
-8. Consulte el alias creado.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_alias/arquitectura-actual?pretty"
-   ```
-
-9. Consulte el *data stream* y su índice de respaldo.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_data_stream/logs-lab-aplicacion?pretty" \
-     | tee /opt/elastic-labs/work/es930-data-stream.json
-   ```
-
-10. Liste los índices visibles de ambos clústeres.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9200/_cat/indices?v"
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_cat/indices?v"
-   ```
-
-**Salida esperada:**
-
-- La creación de índices, alias, plantilla y *data stream* devuelve `"acknowledged": true`.
-- El alias `arquitectura-actual` apunta a `arquitectura-930`.
-- El *data stream* `logs-lab-aplicacion` muestra al menos un índice de respaldo con un nombre similar a:
-
-```text
-.ds-logs-lab-aplicacion-2026.08.25-000001
-```
-
-- Los índices `arquitectura-717` y `arquitectura-930` tienen dos *shards* primarios y una réplica configurada.
-
-**Verificación:**
-
-Compruebe que la búsqueda a través del alias devuelve el documento indexado:
-
-```bash
-curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-  "http://localhost:9201/arquitectura-actual/_search?pretty" \
-  | jq '.hits.hits[]._source'
-```
-
-Debe aparecer el documento con `mensaje: "Documento de prueba para arquitectura"`.
-
----
-
-### Paso 6. Analizar la asignación de shards y explicar el estado yellow
-
-**Objetivo:** Inspeccionar la ubicación de *shards* y demostrar por qué las réplicas permanecen sin asignar en un clúster de un solo nodo.
-
-**Instrucciones:**
-
-1. Liste los *shards* del índice de demostración de Elasticsearch 7.17.29.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9200/_cat/shards/arquitectura-717?v"
-   ```
-
-2. Liste los *shards* del índice, alias y *data stream* de Elasticsearch 9.3.0.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_cat/shards/arquitectura-930?v"
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_cat/shards/logs-lab-aplicacion?v"
-   ```
-
-3. Guarde una vista completa de la distribución de *shards* del clúster 9.3.0.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_cat/shards?v" \
-     > /opt/elastic-labs/work/es930-cat-shards.txt
-   ```
-
-4. Solicite una explicación de asignación para la réplica no asignada del índice `arquitectura-930`.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -X POST "http://localhost:9201/_cluster/allocation/explain?pretty" \
-     -H 'Content-Type: application/json' \
-     -d '{
-       "index": "arquitectura-930",
-       "shard": 0,
-       "primary": false
-     }' | tee /opt/elastic-labs/work/es930-allocation-explain.json
-   ```
-
-5. Consulte de nuevo la salud del clúster 9.3.0.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_cluster/health?pretty" \
-     | jq '{
-       cluster_name,
-       status,
-       number_of_nodes,
-       active_primary_shards,
-       active_shards,
-       unassigned_shards,
-       active_shards_percent_as_number
-     }'
-   ```
-
-6. Registre la interpretación técnica en el archivo de observaciones.
-
-   ```bash
-   cat >> /opt/elastic-labs/work/observaciones-arquitectura.md <<'EOF'
-
-   ## Análisis de shards y réplicas
-
-   El laboratorio usa `discovery.type=single-node`; por tanto, cada clúster contiene un único nodo.
-   Los shards primarios pueden asignarse a ese nodo y atender escrituras y búsquedas.
-   Las réplicas no pueden asignarse al mismo nodo que su shard primario debido a las reglas de
-   asignación de Elasticsearch. Si se permitiera esa colocación, la pérdida del nodo eliminaría
-   simultáneamente el primario y su réplica, por lo que no aportaría alta disponibilidad.
-
-   Un estado `yellow` es esperado cuando existen réplicas sin asignar pero todos los shards
-   primarios están activos. Un estado `red` implicaría que al menos un shard primario no está
-   disponible y, por tanto, una parte de los datos no puede atender operaciones normales.
-
-   EOF
-   ```
-
-**Salida esperada:**
-
-Para los índices creados con una réplica, la Cat Shards API debe mostrar:
-
-- Filas con `p` y estado `STARTED` para los *shards* primarios.
-- Filas con `r` y estado `UNASSIGNED` para las réplicas.
-
-Ejemplo conceptual:
-
-```text
-index             shard prirep state      docs store ip         node
-arquitectura-930  0     p      STARTED       1  ... 172.20.x.x es930-node-1
-arquitectura-930  0     r      UNASSIGNED
-arquitectura-930  1     p      STARTED       0  ... 172.20.x.x es930-node-1
-arquitectura-930  1     r      UNASSIGNED
-```
-
-La respuesta de `/_cluster/allocation/explain` debe incluir una decisión de asignación negativa relacionada con la imposibilidad de ubicar una réplica en el mismo nodo que contiene el primario, normalmente identificada como una regla equivalente a `same_shard`.
-
-**Verificación:**
-
-Ejecute la siguiente consulta y compruebe que existen *shards* no asignados:
-
-```bash
-curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-  "http://localhost:9201/_cluster/health?pretty" \
-  | jq '{status, active_primary_shards, unassigned_shards}'
-```
-
-El resultado esperado es normalmente `yellow` y un valor de `unassigned_shards` mayor que cero después de crear índices con réplicas.
-
-> **Nota:** Puede haber índices internos de Kibana u otros índices del sistema que también influyan en el número de *shards*. El análisis debe centrarse especialmente en `arquitectura-717`, `arquitectura-930` y el índice de respaldo del *data stream*.
-
----
-
-### Paso 7. Relacionar el diseño de laboratorio con patrones de producción
-
-**Objetivo:** Interpretar las evidencias técnicas y contrastar el deployment de nodo único con una arquitectura distribuida de producción.
-
-**Instrucciones:**
-
-1. Consulte la configuración efectiva relacionada con el clúster y el descubrimiento en Elasticsearch 9.3.0.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_nodes/settings?filter_path=nodes.*.name,nodes.*.settings.cluster.name,nodes.*.settings.discovery.type&pretty"
-   ```
-
-2. Consulte las estadísticas resumidas del clúster 9.3.0.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_cluster/stats?filter_path=cluster_name,status,nodes.count,nodes.roles,indices.count,indices.shards&pretty"
-   ```
-
-3. Complete la siguiente comparación en el archivo de observaciones.
-
-   ```bash
-   cat >> /opt/elastic-labs/work/observaciones-arquitectura.md <<'EOF'
-
-   ## Comparación con patrones de producción
-
-   | Aspecto | Laboratorio de un nodo | Patrón de producción recomendado |
-   |---|---|---|
-   | Elección de maestro | El mismo nodo participa y opera el clúster | Varios nodos master-eligible estables |
-   | Almacenamiento | El mismo nodo almacena todos los primarios | Datos distribuidos en varios nodos de datos |
-   | Réplicas | No pueden asignarse en otro nodo | Réplicas ubicadas en nodos o zonas distintas |
-   | Ingesta | Comparte recursos con búsqueda y almacenamiento | Nodos ingest dedicados si los pipelines son costosos |
-   | Coordinación | El nodo único recibe y procesa solicitudes | Nodos coordinadores dedicados bajo alta carga |
-   | Alta disponibilidad | No existe tolerancia a la caída del nodo | Redundancia de nodos, zonas, snapshots y pruebas de restauración |
-   | Escalado | Vertical y limitado al host Docker | Horizontal mediante incorporación de nodos y capacidad |
-
-   EOF
-   ```
-
-4. Responda las siguientes preguntas en el mismo archivo:
-
-   ```bash
-   cat >> /opt/elastic-labs/work/observaciones-arquitectura.md <<'EOF'
-
-   ## Preguntas de análisis
-
-   1. ¿Qué responsabilidades concentra el nodo es930-node-1?
-   Respuesta: completar.
-
-   2. ¿Por qué el nodo maestro no debe interpretarse como el único nodo que almacena todos los datos?
-   Respuesta: completar.
-
-   3. ¿Por qué una réplica en el mismo nodo que su primario no proporciona alta disponibilidad?
-   Respuesta: completar.
-
-   4. ¿Qué carga podría justificar nodos ingest dedicados?
-   Respuesta: completar.
-
-   5. ¿Qué riesgos operativos existirían si este deployment de laboratorio se utilizara en producción?
-   Respuesta: completar.
-
-   EOF
-   ```
-
-5. Revise visualmente en Kibana 9.3.0 el acceso al entorno principal:
-
-   - Abra <http://localhost:5602>.
-   - Inicie sesión con el usuario `elastic`.
-   - Acceda a **Management** o **Stack Management**.
-   - Explore las secciones de índices, *data streams* y estado del clúster disponibles en la interfaz.
-   - Confirme que aparecen `arquitectura-930` y `logs-lab-aplicacion`.
-
-**Salida esperada:**
-
-El análisis debe establecer que el nodo único concentra funciones que, en producción, pueden separarse para reducir contención de recursos y mejorar la disponibilidad. También debe indicar que el estado `yellow` del laboratorio no representa pérdida de datos mientras los primarios estén activos, pero sí evidencia ausencia de tolerancia a fallos.
-
-**Verificación:**
-
-Revise que el documento de observaciones exista y contenga las tres secciones solicitadas:
-
-```bash
-grep -nE '^## (Roles observados|Análisis de shards y réplicas|Comparación con patrones de producción)' \
-  /opt/elastic-labs/work/observaciones-arquitectura.md
-```
-
----
-
-## Validación y pruebas
-
-Ejecute la siguiente lista de comprobación final. Cada comando debe devolver información válida sin errores de autenticación, conexión o asignación de primarios.
-
-1. Verificar los cuatro contenedores:
-
-   ```bash
-   cd /opt/elastic-labs
-   docker compose ps
-   ```
-
-2. Verificar los nombres y versiones de ambos clústeres:
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" http://localhost:9200/ \
-     | jq '{name, cluster_name, version: .version.number}'
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" http://localhost:9201/ \
-     | jq '{name, cluster_name, version: .version.number}'
-   ```
-
-3. Verificar que cada clúster tiene un único nodo:
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9200/_cluster/health" | jq '{cluster_name, number_of_nodes, status}'
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_cluster/health" | jq '{cluster_name, number_of_nodes, status}'
-   ```
-
-4. Verificar el índice, el alias y el *data stream* del clúster 9.3.0:
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_cat/indices/arquitectura-930?v"
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_alias/arquitectura-actual?pretty"
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_data_stream/logs-lab-aplicacion?pretty"
-   ```
-
-5. Verificar que las réplicas no están asignadas debido al diseño de un nodo:
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "http://localhost:9201/_cat/shards/arquitectura-930?v"
-   ```
-
-6. Verificar que se generaron las evidencias principales:
-
-   ```bash
-   find /opt/elastic-labs/work -maxdepth 1 -type f -printf '%f\n' | sort
-   ```
-
-Evidencias mínimas esperadas:
-
-```text
-compose-validado.yaml
-es717-cat-nodes.txt
-es717-cluster-health.json
-es717-nodes-completo.json
-es717-root.json
-es930-allocation-explain.json
-es930-cat-nodes.txt
-es930-cat-shards.txt
-es930-cluster-health.json
-es930-data-stream.json
-es930-nodes-completo.json
-es930-root.json
-observaciones-arquitectura.md
-```
-
----
-
-## Resolución de problemas
-
-### Problema 1: Elasticsearch no inicia y los logs muestran un error relacionado con `vm.max_map_count`
-
-**Síntomas:**
-
-- El contenedor `es717-lab` o `es930-lab` se reinicia continuamente.
-- `docker compose ps` muestra el contenedor como `Restarting` o no saludable.
-- Los logs contienen mensajes parecidos a `max virtual memory areas vm.max_map_count ... is too low`.
-
-**Causa:**
-
-El host Linux no tiene configurado el valor mínimo requerido por Elasticsearch para `vm.max_map_count`. Elasticsearch utiliza mapas de memoria para trabajar con segmentos de Lucene y no inicia si el límite del host es insuficiente.
-
-**Solución:**
-
-1. Configure el valor requerido en el host:
-
-   ```bash
-   sudo sysctl -w vm.max_map_count=262144
-   ```
-
-2. Persista la configuración:
-
-   ```bash
-   echo "vm.max_map_count=262144" | sudo tee /etc/sysctl.d/99-elastic-labs.conf
-   sudo sysctl --system
-   ```
-
-3. Reinicie solamente los servicios afectados, sin eliminar volúmenes:
-
-   ```bash
-   cd /opt/elastic-labs
-   docker compose restart es717-lab es930-lab
-   docker compose ps
-   ```
-
-4. Revise los logs si el problema persiste:
-
-   ```bash
-   docker logs es930-lab --tail 100
-   ```
-
-### Problema 2: El clúster permanece en estado `yellow` después de crear los índices de demostración
-
-**Síntomas:**
-
-- `GET /_cluster/health` devuelve `"status": "yellow"`.
-- `GET /_cat/shards?v` muestra réplicas con estado `UNASSIGNED`.
-- La API `/_cluster/allocation/explain` indica que no es posible asignar una réplica al nodo actual.
-
-**Causa:**
-
-El laboratorio está configurado intencionalmente con `discovery.type=single-node`. Elasticsearch no asigna una réplica en el mismo nodo que contiene el *shard* primario, porque esa copia no protegería los datos ante la caída del nodo. El estado `yellow` es esperado mientras los *shards* primarios estén activos.
-
-**Solución:**
-
-No intente forzar la asignación de réplicas en este laboratorio. Documente el comportamiento como evidencia de la limitación de alta disponibilidad del diseño de nodo único.
-
-Si necesita que el entorno de laboratorio muestre estado `green` de forma temporal para un índice no crítico, reduzca las réplicas a cero:
-
-```bash
-curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-  -X PUT "http://localhost:9201/arquitectura-930/_settings" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "index": {
-      "number_of_replicas": 0
+``` console
+PUT orders-shared
+{
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 1
+  },
+  "mappings": {
+    "properties": {
+      "tenant_id": { "type": "keyword" },
+      "order_id":  { "type": "long" },
+      "total":     { "type": "double" }
     }
-  }' | jq .
+  }
+}
 ```
 
-> No aplique esta modificación si necesita conservar la evidencia de réplicas no asignadas para la evaluación de esta práctica.
+**Qué hace:** crea un único índice para todos los tenants, con mapeo explícito.
 
----
+Tipos de campo:
+
+- `keyword`: valor exacto, sin análisis. Es el adecuado para filtrar por `tenant_id`.
+
+- `long`: entero de 64 bits.
+
+- `double`: decimal de 64 bits.
+
+### Paso C4. Crear un alias filtrado por tenant
+
+``` console
+POST _aliases
+{
+  "actions": [
+    { "add": { "index": "orders-shared", "alias": "orders-acme",
+               "filter": { "term": { "tenant_id": "acme" } },
+               "routing": "acme" } },
+    { "add": { "index": "orders-shared", "alias": "orders-globex",
+               "filter": { "term": { "tenant_id": "globex" } },
+               "routing": "globex" } },
+    { "add": { "index": "orders-shared", "alias": "orders-initech",
+               "filter": { "term": { "tenant_id": "initech" } },
+               "routing": "initech" } }
+  ]
+}
+```
+
+**Qué hace:** crea un alias por tenant que se comporta como un índice, pero solo ve los documentos de ese tenant.
+
+Parámetros:
+
+- `actions`: lista de operaciones sobre aliases, aplicadas de forma atómica.
+
+- `add`: crea el alias.
+
+- `index` y `alias`: índice destino y nombre del alias.
+
+- `filter`: consulta que se aplica automáticamente en cada búsqueda por el alias.
+
+- `routing`: dirige escrituras y búsquedas al shard que corresponde a ese valor. Con un solo shard no cambia el resultado, pero es el patrón que se usa con índices de varios shards.
+
+El filtro actúa solo en las búsquedas. Al escribir por el alias, el documento debe llevar su propio `tenant_id`.
+
+### Paso C5. Cargar datos de los tres tenants
+
+``` console
+POST orders-shared/_bulk?refresh=wait_for
+{ "index": {} }
+{ "tenant_id": "acme",    "order_id": 2001, "total": 80.0 }
+{ "index": {} }
+{ "tenant_id": "acme",    "order_id": 2002, "total": 120.0 }
+{ "index": {} }
+{ "tenant_id": "globex",  "order_id": 3001, "total": 45.5 }
+{ "index": {} }
+{ "tenant_id": "globex",  "order_id": 3002, "total": 300.0 }
+{ "index": {} }
+{ "tenant_id": "initech", "order_id": 4001, "total": 99.9 }
+{ "index": {} }
+{ "tenant_id": "initech", "order_id": 4002, "total": 15.0 }
+```
+
+**Qué hace:** carga 6 documentos en una sola petición con la Bulk API, que se estudia a detalle en el capítulo 4.
+
+Formato:
+
+- NDJSON: un objeto JSON por línea, alternando una línea de acción y una línea de documento.
+
+- `{ "index": {} }`: acción de indexar. El índice viene de la ruta y el `_id` se genera solo.
+
+- Revisar en la respuesta que aparezca `"errors": false`.
+
+### Paso C6. Consultar por el alias y por el índice base
+
+``` console
+GET orders-initech/_search
+
+GET orders-shared/_search
+```
+
+**Qué hace:** busca por el alias y por el índice base.
+
+**Resultado esperado** (campo `hits.total.value`):
+
+- Por el alias: 2 documentos, solo de initech.
+
+- Por el índice base: 6 documentos, de los tres tenants.
+
+### Paso C7. Comparar el consumo de shards
+
+``` console
+GET _cat/shards/orders-*?v&h=index,shard,prirep,state,node
+```
+
+Parámetros:
+
+- `orders-*`: patrón que selecciona todos los índices cuyo nombre empiece con `orders-`.
+
+**Resultado esperado:** 4 shards para los dos índices individuales (`orders-idx-acme` y `orders-idx-globex`) frente a 2 shards para `orders-shared`, aun con tres tenants. Con 500 tenants serían 1000 shards contra 2.
 
 ## Limpieza
 
-Esta práctica establece el estado inicial compartido para prácticas posteriores. Por ese motivo, **no elimine los volúmenes ni ejecute `docker compose down -v`**.
+Eliminar solo lo que no se reutiliza:
 
-Si necesita liberar memoria y CPU temporalmente, detenga los contenedores conservando los datos:
-
-```bash
-cd /opt/elastic-labs
-docker compose stop
+``` console
+DELETE lab01-demo
+DELETE orders-idx-acme
+DELETE orders-idx-globex
 ```
 
-Para reanudar el entorno más adelante:
+**Qué hace:** elimina los índices que solo sirvieron para la comparación. `orders-shared` y sus aliases se conservan.
 
-```bash
-cd /opt/elastic-labs
-docker compose --env-file .env up -d
+## Estado final y dependencias
+
+| **Elemento**                                              | **Se conserva** | **Lo reutiliza**                                                    |
+|-----------------------------------------------------------|-----------------|---------------------------------------------------------------------|
+| Deployment Hosted 9.x con mínimo 2 zonas                  | Sí              | Todos los laboratorios                                              |
+| Ficha del deployment completada                           | Sí              | Laboratorios 2 a 10                                                 |
+| `orders-shared` con 6 documentos                          | Sí              | Laboratorio 7.4 (DLS y FLS con 2 tenants)                           |
+| Aliases `orders-acme`, `orders-globex` y `orders-initech` | Sí              | Laboratorio 7.4 y, opcionalmente, laboratorio 9.4 (reindex y alias) |
+| `lab01-demo`, `orders-idx-acme`, `orders-idx-globex`      | No              | Solo se usaron para comparar                                        |
+
+Verificación final:
+
+``` console
+GET _cat/indices/orders-*?v&h=index,health,pri,rep,docs.count
+
+GET _alias/orders-*
 ```
 
-Para comprobar que los volúmenes persistentes se conservan:
+Debe verse `orders-shared` con 6 documentos y los tres aliases apuntando a él.
 
-```bash
-docker volume ls | grep -E 'es717-data|es930-data|kibana717-data|kibana930-data'
-```
+## Preguntas de discusión
 
----
+- ¿Por qué `orders-shared/_search` devuelve datos de todos los tenants aunque existan aliases filtrados?
 
-## Resumen
+- ¿Cuántos shards consumiría cada estrategia con 500 tenants?
 
-En esta práctica se desplegaron y validaron dos clústeres Elasticsearch aislados: `es717-lab-cluster` con Elasticsearch 7.17.29 y `es930-lab-cluster` con Elasticsearch 9.3.0. Se utilizaron las APIs `GET /`, `GET /_cluster/health`, `GET /_cat/nodes?v`, `GET /_nodes`, `GET /_cat/shards?v` y `POST /_cluster/allocation/explain` para obtener evidencia directa de la arquitectura en ejecución.
+- ¿Qué estrategia elegirías para 5 tenants grandes? ¿Y para 2000 tenants pequeños?
 
-También se crearon índices, un alias y un *data stream* en el clúster 9.3.0. El estado `yellow` observado al configurar réplicas es esperado en un deployment de nodo único: los *shards* primarios están disponibles, pero Elasticsearch no puede ubicar las réplicas en un nodo diferente. En producción, la alta disponibilidad requiere varios nodos, distribución de *shards*, réplicas asignables, capacidad suficiente y una estrategia validada de recuperación mediante *snapshots*.
+- ¿Qué cambia si cada tenant exige una política de retención distinta?
+
+- Con 2 zonas de disponibilidad, ¿qué pasa con el estado del clúster si se pierde una zona completa?
+
+## Resultado final
+
+Al terminar el laboratorio, el entorno debe quedar como se muestra en la imagen: lo que se conserva, cómo verificarlo y lo que se elimina.
+
+![Resultado final del laboratorio 1: Evaluación de topologías en la nube](imagenes/lab01_resultado_final.png)

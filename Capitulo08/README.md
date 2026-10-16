@@ -1,1103 +1,370 @@
-# Investigar un incidente con Discover y consultas guardadas
+- **Dependencias:** Laboratorio 4 (`weblogs` con 5006 documentos, con `team` y `tier`) y Laboratorio 5 (data view `weblogs`). Si el data view no existe, se crea en la Parte A.
 
-## Metadatos
+## Objetivo
 
-| Elemento | Valor |
-|---|---|
-| Duración | 50 minutos |
-| Complejidad | Media |
-| Nivel de Bloom | Aplicar |
+Construir un dashboard de operación sobre los logs del curso y configurar una alerta que se dispare con tráfico nuevo. Al terminar, el participante podrá:
 
-## Descripción general
+- Explorar los logs en Discover con KQL y guardar una búsqueda.
 
-En este laboratorio se investigará un incidente controlado de `payments-api` utilizando Kibana Discover 7.17.29. Se inyectarán eventos ECS en el data stream `logs-ops-lab`, se delimitará una ventana temporal de incidente y se identificarán errores HTTP 5xx, timeouts y fallos de autenticación.
+- Crear visualizaciones en Lens (métrica, serie de tiempo, barras y tabla) y reunirlas en un dashboard con un control de filtro.
 
-Al finalizar, se habrán creado o validado un data view, filtros estructurados, consultas KQL reutilizables y evidencias JSON para el informe técnico. Las consultas guardadas y la línea temporal obtenida se conservarán como evidencia previa a la actualización de la Práctica 9.
+- Enviar documentos con la hora de llegada mediante un ingest pipeline para simular tráfico en vivo.
 
-## Objetivos de aprendizaje
+- Crear un conector y una regla de alerta de tipo Elasticsearch query, provocar la alerta y verificar su notificación y su recuperación.
 
-- [ ] Crear o validar el data view `logs-ops-lab*` usando `@timestamp` como campo temporal.
-- [ ] Inyectar y verificar eventos controlados del incidente en el data stream `logs-ops-lab`.
-- [ ] Investigar errores de `payments-api` mediante Discover, filtros estructurados, columnas y KQL.
-- [ ] Identificar el periodo, hosts, endpoints, códigos HTTP y mensajes asociados al incidente.
-- [ ] Guardar al menos tres consultas operativas normalizadas para triage, impacto y seguimiento.
+- Ubicar en Kibana las piezas por las que entran datos de Beats, Elastic Agent y APM.
 
-## Prerrequisitos
+## Requisitos
 
-### Conocimientos requeridos
+- `GET weblogs/_count` devuelve 5006.
 
-- Uso básico de terminal Linux, Docker Compose, `curl` y `jq`.
-- Navegación básica por Kibana Discover.
-- Sintaxis básica de Kibana Query Language (KQL).
-- Comprensión de los campos ECS: `@timestamp`, `service.name`, `log.level`, `host.name`, `event.dataset`, `http.response.status_code`, `trace.id` y `message`.
+- Acceso a Kibana con el usuario `elastic` (o un usuario con acceso a Stack Management y Dashboards).
 
-### Acceso requerido
+- Las fechas de los datos están en UTC. Kibana muestra las horas en la zona horaria del navegador: para Ciudad de México (UTC-6) hay una diferencia de 6 horas.
 
-- Práctica 7 completada.
-- Data stream `logs-ops-lab` disponible.
-- Política ILM `logs-ops-ilm-v1` disponible.
-- Usuario `analyst_lab` y sus privilegios de lectura sobre `logs-ops-lab*`.
-- Acceso a Kibana 7.17.29 en `https://localhost:5601`.
-- Acceso administrativo local al host para ejecutar comandos en `/opt/elastic-labs`.
-- Credenciales de laboratorio de Elasticsearch disponibles en `/opt/elastic-labs/.env`.
+## Distribución del tiempo
 
-> **Nota de seguridad:** use el usuario `analyst_lab` para la investigación en Kibana. Use el usuario `elastic` únicamente desde la terminal para la carga controlada de datos y validaciones técnicas. No reutilice las credenciales del laboratorio fuera de este entorno.
+| **Parte** | **Contenido**                          | **Tiempo** |
+|-----------|----------------------------------------|------------|
+| Parte A   | Discover y data view                   | 6 min      |
+| Parte B   | Dashboard con Lens                     | 17 min     |
+| Parte C   | Tráfico en vivo con un ingest pipeline | 7 min      |
+| Parte D   | Conector y regla de alerta             | 15 min     |
+| Parte E   | Recorrido por Integraciones y Fleet    | 5 min      |
+| Parte F   | Limpieza y cierre                      | 4 min      |
 
-## Entorno de laboratorio
+## Convenciones
 
-### Componentes relevantes
+- Los bloques con `GET`, `PUT` o `POST` se ejecutan en Dev Tools. Las demás partes se hacen en la interfaz de Kibana; los nombres de menús pueden variar un poco según la versión 9.x.
 
-| Componente | Valor esperado |
-|---|---|
-| Directorio raíz | `/opt/elastic-labs` |
-| Directorio de trabajo | `/opt/elastic-labs/work` |
-| Archivo de variables | `/opt/elastic-labs/.env` |
-| Elasticsearch 7.17.29 | `https://localhost:9200` |
-| Kibana 7.17.29 | `https://localhost:5601` |
-| Contenedor Elasticsearch 7 | `es717-lab` |
-| Contenedor Kibana 7 | `kibana717-lab` |
-| Clúster Elasticsearch 7 | `es717-lab-cluster` |
-| Data stream objetivo | `logs-ops-lab` |
-| Data view esperado | `logs-ops-lab*` |
-| Usuario de investigación | `analyst_lab` |
+- Cuando una pantalla ofrece varias opciones, solo se indican las que importan para el laboratorio. El resto se deja con su valor por defecto.
 
-### Preparación inicial
+- El rango de tiempo del dashboard se fija en términos absolutos porque los datos son de octubre de 2026 y el selector relativo ("últimos 15 minutos") no los mostraría.
 
-1. Abra una terminal y acceda al directorio raíz obligatorio:
+## Parte A: Discover y data view (6 min)
 
-   ```bash
-   cd /opt/elastic-labs
-   ```
+### Paso A1. Comprobar el data view
 
-2. Verifique que el archivo de credenciales exista y tenga permisos restrictivos:
+1.  En Kibana, abrir **Stack Management** y luego **Data Views**.
 
-   ```bash
-   ls -l /opt/elastic-labs/.env
-   ```
+2.  Si existe el data view `weblogs` (del laboratorio 5), continuar con el paso A2.
 
-   La salida debe indicar permisos equivalentes a:
+3.  Si no existe, seleccionar **Create data view** con el nombre `weblogs`, el patrón de índice `weblogs` y el campo de marca de tiempo `@timestamp`. Guardar.
 
-   ```text
-   -rw------- 1 root root ... /opt/elastic-labs/.env
-   ```
+**Qué hace:** un data view define qué índices se consultan y qué campo es el reloj. Discover, Lens y las reglas usan data views, no nombres de índice directos.
 
-3. Verifique el estado de los contenedores requeridos:
+### Paso A2. Explorar y guardar una búsqueda
 
-   ```bash
-   docker compose ps
-   ```
+1.  Abrir **Discover**, seleccionar el data view `weblogs` y fijar el rango de tiempo absoluto: del 12 de octubre de 2026 a las 00:00 al 15 de octubre de 2026 a las 00:00.
 
-4. Si `es717-lab` o `kibana717-lab` no están en ejecución, inícielos sin eliminar volúmenes:
+2.  Comprobar el número de documentos. **Resultado esperado:** 4976. Son los 5006 documentos menos los 30 que no tienen `@timestamp` (los `parse_failure`) y por eso quedan fuera de cualquier rango de tiempo.
 
-   ```bash
-   docker compose up -d es717-lab kibana717-lab
-   ```
+3.  En la barra de búsqueda, escribir la consulta KQL `service : "payments" and status >= 500` y ejecutarla. **Resultado esperado:** 40 documentos.
 
-5. Cargue las credenciales de laboratorio y valide la salud del clúster 7.17.29:
+4.  En el panel de campos, abrir `detail` y revisar los valores más frecuentes.
 
-   ```bash
-   set -a
-   . /opt/elastic-labs/.env
-   set +a
+5.  Guardar la sesión con el nombre `Errores 5xx de payments`.
 
-   curl -sk -u "elastic:${ELASTIC_PASSWORD}" \
-     "https://localhost:9200/_cluster/health?pretty"
-   ```
+**Qué hace:** KQL (Kibana Query Language) es el lenguaje de búsqueda de la barra. `service : "payments"` busca un valor y los operadores `and`, `or`, `not` y las comparaciones (`>=`) combinan condiciones. Equivale a una consulta `bool` con filtros.
 
-> **Importante:** no ejecute `docker compose down -v`. Ese comando eliminaría volúmenes persistentes y rompería la continuidad requerida entre prácticas.
+## Parte B: dashboard con Lens (17 min)
 
----
+Se construye un dashboard con cuatro paneles y un control. Los valores esperados permiten comprobar cada panel.
 
-## Procedimiento paso a paso
+| **Panel** | **Tipo**                                          | **Valor esperado (rango del 12 al 15 de octubre)**                      |
+|-----------|---------------------------------------------------|-------------------------------------------------------------------------|
+| 1         | Métrica: total de peticiones                      | 4976                                                                    |
+| 2         | Serie de tiempo por hora, desglosada por servicio | Pico de payments el 13 de octubre a las 14:00 UTC (08:00 en UTC-6)      |
+| 3         | Barras: errores 5xx por servicio                  | payments 40, checkout 25, search 16, catalog 14 (total 95)              |
+| 4         | Tabla: tiempo de respuesta por servicio           | Promedio: payments ≈ 404, search ≈ 185, catalog ≈ 113, checkout ≈ 94 ms |
 
-### Paso 1. Verificar el data stream y preparar el directorio de evidencias
+### Paso B1. Crear el dashboard
 
-**Objetivo:** confirmar que `logs-ops-lab` está disponible antes de inyectar los eventos del incidente.
+1.  Abrir **Dashboards** y seleccionar **Create dashboard**.
 
-**Instrucciones:**
+2.  Fijar el rango de tiempo absoluto del 12 de octubre de 2026 a las 00:00 al 15 de octubre de 2026 a las 00:00.
 
-1. Cree los directorios de trabajo para scripts y evidencias:
+3.  Seleccionar **Create visualization**. Se abre Lens. Elegir el data view `weblogs`.
 
-   ```bash
-   mkdir -p /opt/elastic-labs/work/evidence
-   chmod 700 /opt/elastic-labs/work/evidence
-   ```
+### Paso B2. Panel 1: total de peticiones
 
-2. Verifique que exista el data stream `logs-ops-lab`:
+1.  En Lens, abrir el selector de tipo de gráfico y elegir **Metric**.
 
-   ```bash
-   curl -sk -u "elastic:${ELASTIC_PASSWORD}" \
-     "https://localhost:9200/_data_stream/logs-ops-lab?pretty"
-   ```
+2.  Arrastrar el campo **Records** al área de la métrica. Records es el conteo de documentos.
 
-3. Verifique la política ILM aplicada al data stream o a su índice de respaldo:
+3.  Cambiar el nombre de la métrica a `Peticiones`.
 
-   ```bash
-   curl -sk -u "elastic:${ELASTIC_PASSWORD}" \
-     "https://localhost:9200/logs-ops-lab/_ilm/explain?pretty"
-   ```
+4.  Seleccionar **Save and return**. **Resultado esperado:** 4976.
 
-4. Guarde la salida de la validación del data stream como evidencia inicial:
+### Paso B3. Panel 2: peticiones por hora y servicio
 
-   ```bash
-   curl -sk -u "elastic:${ELASTIC_PASSWORD}" \
-     "https://localhost:9200/_data_stream/logs-ops-lab?pretty" \
-     > /opt/elastic-labs/work/evidence/08-00-01-data-stream-inicial.json
-   ```
+1.  Repetir **Add** \> **Create visualization** y elegir el tipo **Bar vertical stacked** (o **Area stacked**).
 
-**Resultado esperado:**
+2.  Arrastrar `@timestamp` al eje horizontal. Lens usa un `date_histogram`; en las opciones del eje, fijar el intervalo en **1 hour**.
 
-- La API `_data_stream` devuelve un objeto con el nombre `logs-ops-lab`.
-- La API ILM devuelve información sobre el índice de respaldo del data stream.
-- El archivo `08-00-01-data-stream-inicial.json` queda creado.
+3.  Arrastrar **Records** al eje vertical.
 
-**Verificación:**
+4.  Arrastrar `service` a **Break down by** (los 4 valores más frecuentes).
 
-```bash
-jq '.data_streams[0].name' \
-  /opt/elastic-labs/work/evidence/08-00-01-data-stream-inicial.json
+5.  Guardar con el título `Peticiones por hora y servicio`.
+
+**Qué hace:** cada barra es una hora. El desglose por servicio equivale a una agregación `terms` anidada dentro del `date_histogram`, la misma estructura del laboratorio 5. **Resultado esperado:** una barra de `payments` visiblemente más alta el 13 de octubre a las 14:00 UTC. Kibana la muestra a las 08:00 si el navegador está en UTC-6.
+
+### Paso B4. Panel 3: errores 5xx por servicio
+
+1.  Crear otra visualización de tipo **Bar horizontal**.
+
+2.  Arrastrar `service` al eje vertical y **Records** al horizontal.
+
+3.  En la configuración de la capa, agregar el filtro KQL `status >= 500`. El filtro por capa deja el resto del dashboard intacto.
+
+4.  Ordenar por Records, descendente. Guardar como `Errores 5xx por servicio`.
+
+**Resultado esperado:** payments 40, checkout 25, search 16, catalog 14. Pueden contrastarse con el resultado de ES\|QL del laboratorio 5.
+
+### Paso B5. Panel 4: tiempo de respuesta por servicio
+
+1.  Crear una visualización de tipo **Table**.
+
+2.  En **Rows**, agregar `service`.
+
+3.  En **Metrics**, agregar tres: **Records** (con el nombre `Peticiones`), **Average** de `response_time_ms` y **Percentile** de `response_time_ms` con el valor 95.
+
+4.  Guardar como `Tiempo de respuesta por servicio`.
+
+**Resultado esperado:** promedios de alrededor de 404 ms (payments), 185 ms (search), 113 ms (catalog) y 94 ms (checkout). El percentil 95 de payments (alrededor de 1400 ms) es más de cinco veces su mediana (alrededor de 270 ms): el promedio esconde la cola larga de las peticiones lentas.
+
+### Paso B6. Control de filtro y guardado
+
+1.  En el dashboard, abrir el menú **Add panel** y elegir **Controls** \> **Options list**. Configurarlo con el data view `weblogs` y el campo `service`.
+
+2.  Probar el control: seleccionar `payments` y observar cómo los cuatro paneles se filtran. Limpiar la selección.
+
+3.  Seleccionar **Save**. Nombre: `Operación weblogs`. Activar **Store time with dashboard**, para que al abrirlo se aplique el rango absoluto.
+
+Un dashboard bien diseñado responde una pregunta por panel, ordena de lo general (arriba) a lo específico (abajo), usa el mismo color para el mismo servicio en todos los paneles y limita la cantidad de paneles. Con más de 8 o 10 se vuelve difícil de leer.
+
+## Parte C: tráfico en vivo con un ingest pipeline (7 min)
+
+Las reglas de alerta evalúan una ventana de tiempo reciente, y los datos de `weblogs` son de octubre de 2026. Para probar una alerta se necesitan documentos con la hora actual. En lugar de escribir la hora a mano, un pipeline la asigna al llegar.
+
+### Paso C1. Pipeline, template e índice
+
+``` console
+PUT _ingest/pipeline/live-pipeline
+{
+  "description": "Asigna @timestamp con la hora de llegada del documento",
+  "processors": [
+    {
+      "set": {
+        "field": "@timestamp",
+        "value": "{{{_ingest.timestamp}}}"
+      }
+    }
+  ]
+}
+
+PUT _index_template/weblogs-live-template
+{
+  "index_patterns": ["weblogs-live*"],
+  "priority": 150,
+  "composed_of": ["weblogs-settings", "weblogs-mappings"],
+  "template": {
+    "settings": { "index.default_pipeline": "live-pipeline" }
+  }
+}
+
+PUT weblogs-live
 ```
 
-La salida esperada es:
+**Qué hace:** define el pipeline, un template que lo asocia a los índices `weblogs-live*` (con el mapping de los laboratorios anteriores) y crea el índice.
 
-```text
-"logs-ops-lab"
+- `set`: asigna un valor a un campo.
+
+- `{{{_ingest.timestamp}}}`: variable de metadatos del pipeline con la hora en que Elasticsearch procesa el documento. Las tres llaves evitan que se escapen caracteres.
+
+- `index.default_pipeline`: todo documento que llegue a ese índice pasa por el pipeline, como en el laboratorio 4.
+
+### Paso C2. Tráfico normal
+
+``` console
+POST weblogs-live/_bulk?refresh=wait_for
+{ "index": {} }
+{ "service": "checkout", "team": "ventas", "tier": "critical", "method": "GET", "url": "/api/cart", "status": 200, "response_time_ms": 45.2, "message": "GET /api/cart 200 45.2ms ok" }
+{ "index": {} }
+{ "service": "checkout", "team": "ventas", "tier": "critical", "method": "POST", "url": "/api/cart", "status": 201, "response_time_ms": 78.9, "message": "POST /api/cart 201 78.9ms ok" }
+{ "index": {} }
+{ "service": "catalog", "team": "catalogo", "tier": "standard", "method": "GET", "url": "/api/products", "status": 200, "response_time_ms": 92.4, "message": "GET /api/products 200 92.4ms cache hit" }
+{ "index": {} }
+{ "service": "catalog", "team": "catalogo", "tier": "standard", "method": "GET", "url": "/api/products/17", "status": 200, "response_time_ms": 88.0, "message": "GET /api/products/17 200 88.0ms ok" }
+{ "index": {} }
+{ "service": "search", "team": "busqueda", "tier": "standard", "method": "GET", "url": "/api/search?q=mouse", "status": 200, "response_time_ms": 131.6, "message": "GET /api/search?q=mouse 200 131.6ms ok" }
+{ "index": {} }
+{ "service": "payments", "team": "pagos", "tier": "critical", "method": "POST", "url": "/api/pay", "status": 200, "response_time_ms": 240.3, "message": "POST /api/pay 200 240.3ms ok" }
 ```
 
----
+**Qué hace:** indexa 6 peticiones normales sin `@timestamp`. **Resultado esperado:** `"errors": false`.
 
-### Paso 2. Inyectar eventos controlados del incidente
-
-**Objetivo:** generar una secuencia reproducible de eventos de aplicación con errores HTTP 5xx, timeouts y errores de autenticación.
-
-**Instrucciones:**
-
-1. Cree el script de inyección de eventos:
-
-   ```bash
-   cat > /opt/elastic-labs/work/inject_incident_08-00-01.sh <<'EOF'
-   #!/usr/bin/env bash
-   set -euo pipefail
-
-   LAB_ROOT="/opt/elastic-labs"
-   WORK_DIR="${LAB_ROOT}/work"
-   BULK_FILE="${WORK_DIR}/incident-08-00-01.ndjson"
-   WINDOW_FILE="${WORK_DIR}/incident-08-00-01-window.txt"
-
-   set -a
-   . "${LAB_ROOT}/.env"
-   set +a
-
-   # La ventana inicia hace 35 minutos. Los eventos críticos ocurren
-   # aproximadamente entre los minutos +10 y +22 de la secuencia.
-   BASE_EPOCH="$(date -u -d '35 minutes ago' +%s)"
-
-   : > "${BULK_FILE}"
-
-   event() {
-     local offset="$1"
-     local level="$2"
-     local status="$3"
-     local host="$4"
-     local path="$5"
-     local trace="$6"
-     local error_type="$7"
-     local error_message="$8"
-     local message="$9"
-     local user_id="${10}"
-
-     local ts
-     ts="$(date -u -d "@$((BASE_EPOCH + offset * 60))" '+%Y-%m-%dT%H:%M:%SZ')"
-
-     jq -cn \
-       --arg ts "${ts}" \
-       --arg level "${level}" \
-       --arg host "${host}" \
-       --arg path "${path}" \
-       --arg trace "${trace}" \
-       --arg error_type "${error_type}" \
-       --arg error_message "${error_message}" \
-       --arg message "${message}" \
-       --arg user_id "${user_id}" \
-       --argjson status "${status}" \
-       '
-       {create:{_index:"logs-ops-lab"}},
-       {
-         "@timestamp": $ts,
-         "message": $message,
-         "log": {"level": $level},
-         "service": {"name": "payments-api"},
-         "event": {"dataset": "payments-api.log"},
-         "environment": "production",
-         "http": {"response": {"status_code": $status}},
-         "host": {"name": $host},
-         "url": {"path": $path},
-         "trace": {"id": $trace},
-         "error": {"type": $error_type, "message": $error_message},
-         "user": {"id": $user_id}
-       }
-       ' >> "${BULK_FILE}"
-   }
-
-   # Actividad previa normal.
-   event 0  "INFO"  200 "payments-app-01" "/v1/payments" "trace-baseline-001" "" "" "Payment request completed successfully" "customer-1001"
-   event 3  "INFO"  201 "payments-app-02" "/v1/payments" "trace-baseline-002" "" "" "Payment created successfully" "customer-1002"
-   event 6  "WARN"  401 "payments-app-01" "/v1/token"    "trace-auth-001" "AuthenticationError" "Invalid API token" "Authentication failed: invalid API token" "unknown"
-
-   # Inicio del incidente: errores intermitentes por timeout.
-   event 10 "ERROR" 504 "payments-app-01" "/v1/payments" "trace-pay-7f3a" "ConnectionTimeout" "Upstream gateway timeout after 30000ms" "Payment authorization timeout while contacting bank gateway" "customer-1003"
-   event 11 "ERROR" 502 "payments-app-02" "/v1/payments" "trace-pay-7f3a" "ConnectionTimeout" "Connection timeout to bank gateway" "Payment request failed: upstream timeout" "customer-1003"
-   event 12 "ERROR" 500 "payments-app-01" "/v1/payments" "trace-pay-8b91" "PaymentProviderError" "Provider response unavailable" "Payment processing failed after provider timeout" "customer-1004"
-   event 13 "ERROR" 503 "payments-app-02" "/v1/refunds"  "trace-pay-55cc" "ConnectionTimeout" "Timeout while obtaining provider connection" "Refund request rejected: dependency timeout" "customer-1005"
-   event 14 "ERROR" 504 "payments-app-01" "/v1/payments" "trace-pay-a201" "ConnectionTimeout" "Upstream gateway timeout after 30000ms" "Payment authorization timeout while contacting bank gateway" "customer-1006"
-   event 15 "ERROR" 401 "payments-app-01" "/v1/token"    "trace-auth-002" "AuthenticationError" "Expired service token" "Authentication failed: service token expired" "service-checkout"
-   event 16 "ERROR" 502 "payments-app-02" "/v1/payments" "trace-pay-c311" "ConnectionTimeout" "Connection timeout to bank gateway" "Payment request failed: upstream timeout" "customer-1007"
-   event 17 "ERROR" 500 "payments-app-01" "/v1/payments" "trace-pay-dd20" "PaymentProviderError" "Provider response unavailable" "Payment provider returned an unavailable response" "customer-1008"
-   event 18 "ERROR" 504 "payments-app-02" "/v1/payments" "trace-pay-ef31" "ConnectionTimeout" "Upstream gateway timeout after 30000ms" "Payment authorization timeout while contacting bank gateway" "customer-1009"
-   event 19 "WARN"  429 "payments-app-02" "/v1/payments" "trace-pay-rate-01" "RateLimitError" "Retry threshold reached" "Payment request retried after upstream failures" "customer-1010"
-   event 20 "ERROR" 503 "payments-app-01" "/v1/refunds"  "trace-pay-f010" "ConnectionTimeout" "Timeout while obtaining provider connection" "Refund request rejected: dependency timeout" "customer-1011"
-   event 22 "INFO"  200 "payments-app-02" "/v1/health"   "trace-health-001" "" "" "Payments API health check recovered" "system"
-
-   INCIDENT_START="$(date -u -d "@$((BASE_EPOCH + 10 * 60))" '+%Y-%m-%dT%H:%M:%SZ')"
-   INCIDENT_END="$(date -u -d "@$((BASE_EPOCH + 22 * 60))" '+%Y-%m-%dT%H:%M:%SZ')"
-
-   {
-     echo "LAB_ID=08-00-01"
-     echo "INCIDENT_START_UTC=${INCIDENT_START}"
-     echo "INCIDENT_END_UTC=${INCIDENT_END}"
-     echo "INCIDENT_SERVICE=payments-api"
-     echo "INCIDENT_DATASET=payments-api.log"
-     echo "INCIDENT_TRACE_EXAMPLE=trace-pay-7f3a"
-   } > "${WINDOW_FILE}"
-
-   curl --fail --silent --show-error -sk \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     -H 'Content-Type: application/x-ndjson' \
-     -X POST "https://localhost:9200/_bulk" \
-     --data-binary "@${BULK_FILE}" \
-     | tee "${WORK_DIR}/evidence/08-00-01-bulk-response.json"
-
-   curl --fail --silent --show-error -sk \
-     -u "elastic:${ELASTIC_PASSWORD}" \
-     -X POST "https://localhost:9200/logs-ops-lab/_refresh" \
-     > /dev/null
-
-   echo
-   echo "Ventana del incidente:"
-   cat "${WINDOW_FILE}"
-   EOF
-   ```
-
-2. Asigne permisos de ejecución al script:
-
-   ```bash
-   chmod 700 /opt/elastic-labs/work/inject_incident_08-00-01.sh
-   ```
-
-3. Ejecute el script:
-
-   ```bash
-   /opt/elastic-labs/work/inject_incident_08-00-01.sh
-   ```
-
-4. Consulte y conserve la ventana temporal exacta generada:
-
-   ```bash
-   cat /opt/elastic-labs/work/incident-08-00-01-window.txt
-   ```
-
-**Resultado esperado:**
-
-- La respuesta Bulk contiene `"errors":false`.
-- Se generan 15 documentos de prueba.
-- El archivo `incident-08-00-01-window.txt` muestra los límites UTC del incidente.
-- Los eventos críticos pertenecen a `payments-api`, al dataset `payments-api.log` y al entorno `production`.
-
-**Verificación:**
-
-```bash
-jq '.errors' /opt/elastic-labs/work/evidence/08-00-01-bulk-response.json
+``` console
+GET weblogs-live/_search?size=1&filter_path=hits.total.value,hits.hits._source.@timestamp
 ```
 
-La salida esperada es:
+**Resultado esperado:** `total.value` de 6 y un `@timestamp` con la fecha y hora actuales (UTC).
 
-```text
-false
+### Paso C3. Data view para los datos en vivo
+
+En **Stack Management** \> **Data Views**, crear el data view `weblogs-live` con el patrón `weblogs-live` y el campo de tiempo `@timestamp`. La regla de la parte D lo usará.
+
+## Parte D: conector y regla de alerta (15 min)
+
+### Paso D1. Crear un conector de tipo Index
+
+1.  Abrir **Stack Management** \> **Connectors** (en algunas versiones, dentro de **Rules**) y seleccionar **Create connector**.
+
+2.  Elegir el tipo **Index**. Nombre: `Alertas curso`. Índice: `alertas-curso`. Activar **Refresh index**.
+
+3.  Guardar y usar la pestaña **Test** para ejecutar el conector con el documento `{ "mensaje": "prueba" }`.
+
+``` console
+GET alertas-curso/_search
 ```
 
-Verifique el número de acciones procesadas:
+**Qué hace:** un conector es el canal de salida de una alerta (correo, Slack, un webhook, un índice). El tipo Index escribe cada notificación como un documento, sin necesitar un servicio externo, por lo que sirve para el laboratorio. **Resultado esperado:** un documento con `mensaje: prueba`.
 
-```bash
-jq '.items | length' /opt/elastic-labs/work/evidence/08-00-01-bulk-response.json
+### Paso D2. Crear la regla
+
+1.  Abrir **Stack Management** \> **Rules** y seleccionar **Create rule**.
+
+2.  Elegir el tipo **Elasticsearch query**. Nombre: `Errores 5xx en weblogs-live`. Intervalo de comprobación: **1 minute**.
+
+3.  En la definición de la consulta, elegir **KQL**, el data view `weblogs-live` y la consulta `status >= 500`.
+
+4.  Condición: cuando el **count** de documentos **is above** `4` durante los últimos **5 minutes**.
+
+5.  En las acciones, seleccionar el conector `Alertas curso`. Ejecutar la acción cuando se cumple la consulta (grupo **Query matched**) y con frecuencia **On status changes**.
+
+6.  En el cuerpo de la acción (documentos), escribir:
+
+``` console
+[{ "regla": "{{rule.name}}", "estado": "{{alert.actionGroupName}}", "valor": "{{context.value}}", "condicion": "{{context.conditions}}", "fecha": "{{context.date}}" }]
 ```
 
-La salida esperada es:
+7.  Agregar una segunda acción para el grupo **Recovered**, con el conector `Alertas curso` y el mismo cuerpo. El estado aparecerá como Recovered.
 
-```text
-15
+8.  Guardar la regla.
+
+- **Intervalo de comprobación** (1 minuto): cada cuánto se evalúa la regla. Conviene que sea menor que la ventana para no dejar huecos.
+
+- **Ventana de tiempo** (5 minutos): cuánto hacia atrás mira la consulta en cada ejecución.
+
+- **Umbral** (más de 4): una sola petición con error no genera alerta; evita ruido por fallos aislados.
+
+- **On status changes**: notifica cuando la alerta se activa o se recupera, no en cada ejecución. Reduce la fatiga de alertas.
+
+- `{{rule.name}}`, `{{context.value}}`: variables de plantilla (Mustache) que Kibana reemplaza al enviar la notificación.
+
+### Paso D3. Provocar la alerta
+
+``` console
+POST weblogs-live/_bulk?refresh=wait_for
+{ "index": {} }
+{ "service": "payments", "team": "pagos", "tier": "critical", "method": "POST", "url": "/api/pay", "status": 500, "response_time_ms": 1830.5, "detail": "upstream timeout", "message": "POST /api/pay 500 1830.5ms upstream timeout" }
+{ "index": {} }
+{ "service": "payments", "team": "pagos", "tier": "critical", "method": "POST", "url": "/api/pay", "status": 500, "response_time_ms": 2214.0, "detail": "upstream timeout", "message": "POST /api/pay 500 2214.0ms upstream timeout" }
+{ "index": {} }
+{ "service": "payments", "team": "pagos", "tier": "critical", "method": "POST", "url": "/api/pay", "status": 503, "response_time_ms": 512.7, "detail": "db connection refused", "message": "POST /api/pay 503 512.7ms db connection refused" }
+{ "index": {} }
+{ "service": "payments", "team": "pagos", "tier": "critical", "method": "POST", "url": "/api/pay", "status": 500, "response_time_ms": 1990.1, "detail": "upstream timeout", "message": "POST /api/pay 500 1990.1ms upstream timeout" }
+{ "index": {} }
+{ "service": "payments", "team": "pagos", "tier": "critical", "method": "POST", "url": "/api/pay", "status": 503, "response_time_ms": 604.3, "detail": "db connection refused", "message": "POST /api/pay 503 604.3ms db connection refused" }
+{ "index": {} }
+{ "service": "payments", "team": "pagos", "tier": "critical", "method": "POST", "url": "/api/pay", "status": 500, "response_time_ms": 2450.8, "detail": "upstream timeout", "message": "POST /api/pay 500 2450.8ms upstream timeout" }
 ```
 
----
+**Qué hace:** simula una falla de pagos: 6 errores 5xx, más que el umbral de 4.
 
-### Paso 3. Validar los eventos indexados mediante Elasticsearch Query DSL
+### Paso D4. Verificar la alerta
 
-**Objetivo:** confirmar que los datos están disponibles antes de comenzar la investigación visual en Discover.
+1.  Esperar hasta 2 minutos (la regla se evalúa cada minuto). Abrir **Stack Management** \> **Rules** y seleccionar la regla.
 
-**Instrucciones:**
+2.  En la página de la regla, revisar el estado (**Active** cuando la alerta está en curso), la pestaña de alertas y el historial de ejecuciones.
 
-1. Cree una consulta Query DSL que recupere los errores HTTP 5xx de `payments-api`:
+3.  Verificar la notificación en Dev Tools con el comando siguiente.
 
-   ```bash
-   cat > /opt/elastic-labs/work/payments-5xx-query.json <<'EOF'
-   {
-     "size": 50,
-     "sort": [
-       {
-         "@timestamp": {
-           "order": "asc"
-         }
-       }
-     ],
-     "_source": [
-       "@timestamp",
-       "service.name",
-       "event.dataset",
-       "log.level",
-       "http.response.status_code",
-       "host.name",
-       "url.path",
-       "trace.id",
-       "error.type",
-       "error.message",
-       "message"
-     ],
-     "query": {
-       "bool": {
-         "filter": [
-           {
-             "term": {
-               "service.name.keyword": "payments-api"
-             }
-           },
-           {
-             "range": {
-               "http.response.status_code": {
-                 "gte": 500
-               }
-             }
-           }
-         ]
-       }
-     }
-   }
-   EOF
-   ```
-
-2. Ejecute la consulta y guarde el resultado:
-
-   ```bash
-   curl -sk -u "elastic:${ELASTIC_PASSWORD}" \
-     -H 'Content-Type: application/json' \
-     -X POST "https://localhost:9200/logs-ops-lab/_search?pretty" \
-     -d @/opt/elastic-labs/work/payments-5xx-query.json \
-     > /opt/elastic-labs/work/evidence/08-00-01-payments-5xx.json
-   ```
-
-3. Muestre un resumen de los eventos devueltos:
-
-   ```bash
-   jq -r '
-     .hits.hits[]._source |
-     [
-       ."@timestamp",
-       .service.name,
-       .log.level,
-       .http.response.status_code,
-       .host.name,
-       .url.path,
-       .trace.id,
-       .error.type
-     ] | @tsv
-   ' /opt/elastic-labs/work/evidence/08-00-01-payments-5xx.json
-   ```
-
-4. Revise la primera y la última marca temporal de los errores 5xx:
-
-   ```bash
-   jq -r '
-     .hits.hits[]._source."@timestamp"
-   ' /opt/elastic-labs/work/evidence/08-00-01-payments-5xx.json \
-     | sort \
-     | sed -n '1p;$p'
-   ```
-
-**Resultado esperado:**
-
-- Se devuelven errores HTTP `500`, `502`, `503` y `504`.
-- Los hosts implicados son `payments-app-01` y `payments-app-02`.
-- Los endpoints más afectados son `/v1/payments` y `/v1/refunds`.
-- Los errores de tipo `ConnectionTimeout` aparecen repetidamente.
-
-**Verificación:**
-
-```bash
-jq '.hits.total' /opt/elastic-labs/work/evidence/08-00-01-payments-5xx.json
+``` console
+GET alertas-curso/_search?filter_path=hits.total.value,hits.hits._source
 ```
 
-La propiedad `value` debe ser mayor que cero. En esta carga controlada, se esperan varios eventos 5xx.
+**Resultado esperado:** además del documento de prueba, un documento con `regla` igual a `Errores 5xx en weblogs-live`, el estado `Query matched` y un `valor` de 6.
 
----
+### Paso D5. Recuperación
 
-### Paso 4. Crear o validar el data view en Kibana
+Sin nuevos errores, la alerta se recupera cuando los 6 errores salen de la ventana de 5 minutos. Mientras tanto se avanza con la Parte E. Después, volver a consultar `alertas-curso`: debe haber un documento con el estado `Recovered`. Si la regla nunca se recupera, revisar que no se hayan enviado más errores y que el reloj del navegador y del servidor coincidan en la hora UTC.
 
-**Objetivo:** disponer de una fuente de datos temporal para investigar `logs-ops-lab` en Discover.
+## Parte E: recorrido por Integraciones y Fleet (5 min)
 
-**Instrucciones:**
+El laboratorio no instala agentes. Se reconocen las piezas para decidir cómo entrarían los datos en un caso real.
 
-1. Abra Firefox o un navegador compatible.
+1.  Abrir **Integrations**. Buscar `nginx`, `system` y `apm`. Para cada una, anotar qué tipo de datos recoge (logs, métricas, trazas) y qué activos instala (data streams, dashboards, pipelines).
 
-2. Acceda a:
+2.  Abrir **Fleet** \> **Agent policies**. Anotar qué política existe y qué integraciones contiene. Esta política se asigna a los agentes que se enrolen.
 
-   ```text
-   https://localhost:5601
-   ```
+3.  En **Fleet** \> **Settings**, localizar los Fleet Server hosts y los outputs. Así se sabe a dónde conectan los agentes.
 
-3. Si el navegador advierte que el certificado TLS es de laboratorio o autofirmado, acepte la excepción de seguridad únicamente para este entorno local.
+4.  Anotar en la libreta qué integración usarías para recoger los logs de acceso de un servidor Nginx y por qué es preferible a escribir un grok propio.
 
-4. Inicie sesión con el usuario:
+Contexto: Elastic Agent es el agente único para logs, métricas y seguridad, administrado desde Fleet. Beats (Filebeat, Metricbeat) siguen soportados. Los datos de aplicaciones se envían con APM (Elastic Distributions of OpenTelemetry o agentes APM) y se ven en Observability.
 
-   ```text
-   analyst_lab
-   ```
+## Parte F: limpieza y cierre (4 min)
 
-   Use la contraseña configurada durante la Práctica 7.
+### Paso F1. Retirar la regla y el conector
 
-5. En el menú principal de Kibana, acceda a **Stack Management**.
+1.  Abrir **Stack Management** \> **Rules**, seleccionar la regla `Errores 5xx en weblogs-live` y eliminarla. Una regla activa sigue ejecutándose cada minuto.
 
-6. Abra **Index Patterns**. En algunas vistas o configuraciones puede aparecer como **Data Views**.
+2.  Abrir **Connectors** y eliminar `Alertas curso`.
 
-7. Busque un data view existente cuyo patrón sea:
-
-   ```text
-   logs-ops-lab*
-   ```
-
-8. Si existe, ábralo y confirme que el campo temporal configurado es:
-
-   ```text
-   @timestamp
-   ```
-
-9. Si no existe, seleccione **Create index pattern** o **Create data view** y configure:
-
-   | Campo | Valor |
-   |---|---|
-   | Patrón de índices | `logs-ops-lab*` |
-   | Nombre sugerido | `logs-ops-lab*` |
-   | Campo temporal | `@timestamp` |
-
-10. Guarde la configuración.
-
-11. Revise que estén disponibles, como mínimo, los siguientes campos:
-
-   ```text
-   @timestamp
-   service.name
-   event.dataset
-   environment
-   log.level
-   http.response.status_code
-   host.name
-   url.path
-   trace.id
-   error.type
-   error.message
-   message
-   ```
-
-**Resultado esperado:**
-
-- El data view `logs-ops-lab*` existe.
-- El campo temporal seleccionado es `@timestamp`.
-- Los campos ECS inyectados aparecen en la lista de campos disponibles.
-
-**Verificación:**
-
-Acceda a **Discover**, seleccione el data view `logs-ops-lab*` y confirme que se muestran documentos recientes cuando se elige un intervalo amplio, por ejemplo **Last 1 hour**.
-
----
-
-### Paso 5. Delimitar el incidente y configurar columnas operativas
-
-**Objetivo:** construir una vista de Discover que permita analizar cronológicamente el incidente.
-
-**Instrucciones:**
-
-1. En Kibana, abra **Discover**.
-
-2. Seleccione el data view:
-
-   ```text
-   logs-ops-lab*
-   ```
-
-3. Abra el archivo de ventana temporal en una terminal para consultar los valores exactos:
-
-   ```bash
-   cat /opt/elastic-labs/work/incident-08-00-01-window.txt
-   ```
-
-4. En Discover, abra el selector de tiempo y seleccione **Absolute**.
-
-5. Configure el intervalo usando los valores de:
-
-   ```text
-   INCIDENT_START_UTC
-   INCIDENT_END_UTC
-   ```
-
-6. Amplíe el intervalo un minuto antes y un minuto después para obtener contexto operativo. Por ejemplo:
-
-   - Inicio: un minuto antes de `INCIDENT_START_UTC`.
-   - Fin: un minuto después de `INCIDENT_END_UTC`.
-
-7. Añada las siguientes columnas a la tabla de documentos. Use la lista de campos y la opción **Add** o el icono `+`:
-
-   ```text
-   @timestamp
-   service.name
-   log.level
-   http.response.status_code
-   host.name
-   url.path
-   trace.id
-   error.type
-   message
-   ```
-
-8. Ordene inicialmente por `@timestamp` de forma ascendente para identificar el primer evento relevante.
-
-9. Revise el histograma temporal y observe la concentración de eventos de error dentro de la ventana del incidente.
-
-**Resultado esperado:**
-
-- La tabla muestra una secuencia temporal de actividad previa, errores y recuperación.
-- Se observa un aumento de eventos de error entre los minutos definidos como incidente.
-- Las columnas permiten relacionar tiempo, host, endpoint, código HTTP, trazabilidad y mensaje.
-
-**Verificación:**
-
-Identifique manualmente en la tabla:
-
-- Un evento previo exitoso con código `200` o `201`.
-- El primer evento `ERROR` con código HTTP 5xx.
-- Un evento de autenticación con código `401`.
-- El evento de recuperación con ruta `/v1/health` y código `200`.
-
----
-
-### Paso 6. Aplicar filtros estructurados y ejecutar consultas KQL
-
-**Objetivo:** aislar los eventos relevantes del incidente mediante campos ECS y consultas KQL.
-
-**Instrucciones:**
-
-1. Mantenga el mismo intervalo temporal absoluto configurado en el paso anterior.
-
-2. Agregue los siguientes filtros estructurados desde **Add filter**:
-
-   | Campo | Operador | Valor |
-   |---|---|---|
-   | `environment` | is | `production` |
-   | `event.dataset` | is | `payments-api.log` |
-   | `service.name` | is | `payments-api` |
-
-3. En la barra KQL, ejecute la consulta de triage:
-
-   ```kql
-   log.level: ERROR and (http.response.status_code >= 500 or error.message: "*timeout*")
-   ```
-
-4. Observe el número de resultados y el histograma.
-
-5. Añada temporalmente un filtro estructurado adicional:
-
-   | Campo | Operador | Valor |
-   |---|---|---|
-   | `host.name` | is | `payments-app-01` |
-
-6. Compare el número de eventos y los códigos de respuesta de `payments-app-01`.
-
-7. Deshabilite el filtro de `host.name` utilizando el control de activación del filtro, sin eliminarlo.
-
-8. Cambie el valor del filtro `host.name` a:
-
-   ```text
-   payments-app-02
-   ```
-
-9. Compare los eventos del segundo host.
-
-10. Elimine o deshabilite el filtro de host antes de continuar para recuperar la vista global del incidente.
-
-11. Ejecute la consulta KQL específica para impacto HTTP 5xx:
-
-   ```kql
-   http.response.status_code >= 500
-   ```
-
-12. Ejecute la consulta KQL específica para timeouts:
-
-   ```kql
-   error.type: "ConnectionTimeout" or message: "*timeout*"
-   ```
-
-13. Ejecute la consulta KQL de autenticación:
-
-   ```kql
-   http.response.status_code: 401 or error.type: "AuthenticationError"
-   ```
-
-**Resultado esperado:**
-
-- Los errores 5xx se concentran en `payments-api`.
-- Los dos hosts presentan errores, por lo que el incidente no se limita a una sola instancia.
-- Los mensajes de timeout se asocian principalmente con los endpoints `/v1/payments` y `/v1/refunds`.
-- Los eventos de autenticación `401` son distinguibles del grupo principal de errores 5xx.
-
-**Verificación:**
-
-Complete esta tabla en las notas del informe técnico:
-
-| Pregunta de investigación | Evidencia esperada |
-|---|---|
-| ¿Qué servicio presenta el incidente? | `payments-api` |
-| ¿Qué entorno está afectado? | `production` |
-| ¿Qué hosts están implicados? | `payments-app-01` y `payments-app-02` |
-| ¿Qué códigos HTTP predominan en los errores? | `500`, `502`, `503`, `504` |
-| ¿Cuál es el patrón de error predominante? | `ConnectionTimeout` / mensajes de timeout |
-| ¿Qué endpoints están afectados? | `/v1/payments` y `/v1/refunds` |
-| ¿Existe evidencia de recuperación? | Evento `200` en `/v1/health` |
-
----
-
-### Paso 7. Correlacionar la secuencia con `trace.id`
-
-**Objetivo:** utilizar un identificador de trazabilidad para correlacionar eventos relacionados y demostrar una investigación de detalle.
-
-**Instrucciones:**
-
-1. En la tabla de Discover, localice un evento con el siguiente valor de trazabilidad:
-
-   ```text
-   trace-pay-7f3a
-   ```
-
-2. Abra el documento y revise sus campos JSON o la vista detallada del documento.
-
-3. Confirme los siguientes valores:
-
-   | Campo | Valor esperado |
-   |---|---|
-   | `service.name` | `payments-api` |
-   | `http.response.status_code` | `504` o `502` |
-   | `error.type` | `ConnectionTimeout` |
-   | `url.path` | `/v1/payments` |
-   | `trace.id` | `trace-pay-7f3a` |
-
-4. Cierre el documento y reemplace la consulta KQL actual por:
-
-   ```kql
-   trace.id: "trace-pay-7f3a"
-   ```
-
-5. Ordene por `@timestamp` ascendente.
-
-6. Compare los dos eventos obtenidos. Deben reflejar el progreso de una misma operación entre hosts distintos.
-
-7. Tome una captura de pantalla donde se aprecien la consulta KQL, el intervalo temporal y las columnas relevantes.
-
-8. Guarde la captura con un nombre normalizado, por ejemplo:
-
-   ```text
-   /opt/elastic-labs/work/evidence/08-00-01-trace-pay-7f3a.png
-   ```
-
-**Resultado esperado:**
-
-- Se localizan varios eventos asociados al mismo `trace.id`.
-- Los eventos muestran un timeout de dependencia o gateway en hosts diferentes.
-- La correlación confirma que no se trata de eventos aislados sin relación.
-
-**Verificación:**
-
-La investigación debe permitir sostener la siguiente hipótesis técnica inicial:
-
-> El incidente afectó a `payments-api` en producción y presenta un patrón consistente con indisponibilidad o latencia excesiva de una dependencia externa, evidenciada por respuestas 5xx y errores `ConnectionTimeout` en ambos hosts de la aplicación.
-
-> Esta es una hipótesis basada en logs; no constituye una confirmación definitiva de la causa raíz sin métricas, trazas distribuidas completas o registros de la dependencia.
-
----
-
-### Paso 8. Guardar consultas operativas reutilizables
-
-**Objetivo:** crear consultas normalizadas que puedan reutilizarse durante triage, análisis de impacto y seguimiento posterior.
-
-**Instrucciones:**
-
-1. Mantenga seleccionados el data view `logs-ops-lab*` y el intervalo absoluto del incidente.
-
-2. Asegúrese de conservar estos filtros estructurados habilitados:
-
-   ```text
-   environment is production
-   event.dataset is payments-api.log
-   service.name is payments-api
-   ```
-
-3. Configure la siguiente consulta KQL de triage:
-
-   ```kql
-   log.level: ERROR and (http.response.status_code >= 500 or error.message: "*timeout*")
-   ```
-
-4. En el menú de consultas de Discover, seleccione **Save query**.
-
-5. Guarde la consulta con el nombre:
-
-   ```text
-   OPS-INC-08-00-01-PAYMENTS-TRIAGE
-   ```
-
-6. Si Kibana muestra la opción para incluir filtros y rango temporal, active ambas opciones para conservar el contexto de investigación.
-
-7. Configure la consulta de impacto:
-
-   ```kql
-   http.response.status_code >= 500
-   ```
-
-8. Guárdela con el nombre:
-
-   ```text
-   OPS-INC-08-00-01-PAYMENTS-IMPACT-5XX
-   ```
-
-9. Configure la consulta de seguimiento de timeouts:
-
-   ```kql
-   error.type: "ConnectionTimeout" or message: "*timeout*"
-   ```
-
-10. Guárdela con el nombre:
-
-    ```text
-    OPS-INC-08-00-01-PAYMENTS-SEGUIMIENTO-TIMEOUT
-    ```
-
-11. Como consulta adicional de autenticación, configure:
-
-    ```kql
-    http.response.status_code: 401 or error.type: "AuthenticationError"
-    ```
-
-12. Guarde la consulta adicional con el nombre:
-
-    ```text
-    OPS-INC-08-00-01-PAYMENTS-AUTH-401
-    ```
-
-13. Vuelva a cargar cada consulta guardada desde el menú de consultas y confirme que restaura la KQL y los filtros esperados.
-
-14. Para preservar columnas, data view y contexto de Discover, guarde también la sesión de Discover, si la interfaz presenta la opción **Save**:
-
-    ```text
-    OPS-INC-08-00-01-PAYMENTS-EVIDENCIA-DISCOVER
-    ```
-
-**Resultado esperado:**
-
-- Existen al menos tres consultas guardadas con nombres normalizados.
-- Las consultas conservan el contexto de `payments-api` en producción.
-- La consulta de impacto puede ser utilizada posteriormente como base de un dashboard o visualización.
-- La sesión guardada de Discover conserva las columnas seleccionadas para la evidencia funcional.
-
-**Verificación:**
-
-Abra el menú de consultas guardadas y confirme la presencia de, como mínimo:
-
-```text
-OPS-INC-08-00-01-PAYMENTS-TRIAGE
-OPS-INC-08-00-01-PAYMENTS-IMPACT-5XX
-OPS-INC-08-00-01-PAYMENTS-SEGUIMIENTO-TIMEOUT
+``` console
+DELETE alertas-curso
 ```
 
----
+**Qué hace:** elimina el índice donde el conector escribía las notificaciones.
 
-### Paso 9. Exportar evidencia JSON y documentar la línea temporal
+## Resumen de valores esperados
 
-**Objetivo:** conservar evidencia técnica independiente de la interfaz gráfica para el informe del incidente y las prácticas posteriores.
+| **Comprobación**                             | **Resultado**                                   |
+|----------------------------------------------|-------------------------------------------------|
+| Discover, 12 a 15 de octubre (UTC)           | 4976 documentos                                 |
+| KQL `service : "payments" and status >= 500` | 40                                              |
+| Panel 1: total de peticiones                 | 4976                                            |
+| Panel 3: errores 5xx por servicio            | payments 40, checkout 25, search 16, catalog 14 |
+| `weblogs-live` tras la Parte C               | 6 documentos con `@timestamp` actual            |
+| Alerta tras provocar la falla                | `valor` de 6 en `alertas-curso`                 |
+| Alerta tras 5 minutos sin errores            | Documento con estado Recovered                  |
 
-**Instrucciones:**
+## Estado final
 
-1. Consulte nuevamente los límites exactos del incidente:
+| **Elemento**                                                                                     | **Se conserva**  | **Lo reutiliza**                         |
+|--------------------------------------------------------------------------------------------------|------------------|------------------------------------------|
+| Dashboard `Operación weblogs` y búsqueda `Errores 5xx de payments`                               | Sí               | Laboratorio 10 (proyecto final)          |
+| Data views `weblogs` y `weblogs-live`, `live-pipeline`, `weblogs-live-template` y `weblogs-live` | Sí               | Laboratorio 9 (runbook) y proyecto final |
+| Regla, conector `Alertas curso` e índice `alertas-curso`                                         | No (se eliminan) | \-                                       |
 
-   ```bash
-   cat /opt/elastic-labs/work/incident-08-00-01-window.txt
-   ```
+## Preguntas de discusión
 
-2. Cree una consulta Query DSL acotada a la ventana del incidente. Sustituya los valores `gte` y `lte` por los valores obtenidos en el archivo anterior, ampliados un minuto si se desea contexto:
+- ¿Por qué la regla usa una ventana de 5 minutos con un intervalo de 1 minuto, y no una ventana de 1 minuto?
 
-   ```bash
-   cat > /opt/elastic-labs/work/incident-timeline-query.json <<'EOF'
-   {
-     "size": 100,
-     "sort": [
-       {
-         "@timestamp": {
-           "order": "asc"
-         }
-       }
-     ],
-     "_source": [
-       "@timestamp",
-       "service.name",
-       "event.dataset",
-       "environment",
-       "log.level",
-       "http.response.status_code",
-       "host.name",
-       "url.path",
-       "trace.id",
-       "error.type",
-       "error.message",
-       "message"
-     ],
-     "query": {
-       "bool": {
-         "filter": [
-           {
-             "term": {
-               "service.name.keyword": "payments-api"
-             }
-           },
-           {
-             "term": {
-               "environment.keyword": "production"
-             }
-           }
-         ]
-       }
-     }
-   }
-   EOF
-   ```
+- ¿Qué ocurriría con el umbral de 4 si el tráfico se multiplicara por 100? ¿Convendría una tasa de error en lugar de un conteo?
 
-3. Ejecute la consulta y guarde los resultados:
+- ¿Qué diferencia hay entre alertar por un síntoma (errores 5xx) y por una causa (CPU alta)? ¿Cuál despierta a alguien de noche?
 
-   ```bash
-   curl -sk -u "elastic:${ELASTIC_PASSWORD}" \
-     -H 'Content-Type: application/json' \
-     -X POST "https://localhost:9200/logs-ops-lab/_search?pretty" \
-     -d @/opt/elastic-labs/work/incident-timeline-query.json \
-     > /opt/elastic-labs/work/evidence/08-00-01-linea-temporal-payments.json
-   ```
+- Si el dashboard lo ven gerentes y también el equipo de guardia, ¿cuántos dashboards harías?
 
-4. Genere una versión tabular legible de la línea temporal:
+- ¿Qué cambia en el diseño de las alertas con 200 servicios en lugar de 4?
 
-   ```bash
-   jq -r '
-     .hits.hits[]._source |
-     [
-       ."@timestamp",
-       .log.level,
-       .http.response.status_code,
-       .host.name,
-       .url.path,
-       .trace.id,
-       .error.type,
-       .message
-     ] | @tsv
-   ' /opt/elastic-labs/work/evidence/08-00-01-linea-temporal-payments.json \
-     > /opt/elastic-labs/work/evidence/08-00-01-linea-temporal-payments.tsv
-   ```
+- ¿Por qué conviene que los datos entren con Elastic Agent y una integración, en vez de un script propio?
 
-5. Revise el archivo tabular:
+## Resultado final
 
-   ```bash
-   column -ts $'\t' \
-     /opt/elastic-labs/work/evidence/08-00-01-linea-temporal-payments.tsv
-   ```
+Al terminar el laboratorio, el entorno debe quedar como se muestra en la imagen: lo que se conserva, cómo verificarlo y lo que se elimina.
 
-6. Cree un archivo de notas para el informe técnico:
-
-   ```bash
-   cat > /opt/elastic-labs/work/evidence/08-00-01-hallazgos.md <<'EOF'
-   # Hallazgos iniciales del incidente
-
-   - Servicio afectado: payments-api
-   - Entorno: production
-   - Hosts observados: payments-app-01, payments-app-02
-   - Endpoints afectados: /v1/payments, /v1/refunds
-   - Patrón predominante: errores HTTP 5xx asociados a ConnectionTimeout.
-   - Eventos adicionales: errores de autenticación HTTP 401.
-   - Hipótesis inicial: una dependencia de pagos o gateway externo presentó latencia excesiva o indisponibilidad.
-   - Evidencia de recuperación: evento exitoso HTTP 200 en /v1/health.
-   - Limitación: los logs no demuestran por sí solos la causa raíz de la dependencia externa.
-   EOF
-   ```
-
-**Resultado esperado:**
-
-- Existen evidencias JSON y TSV en `/opt/elastic-labs/work/evidence`.
-- La línea temporal permite identificar actividad normal, inicio de errores, concentración de 5xx, eventos de autenticación y recuperación.
-- El informe contiene una hipótesis explícita y una limitación de la evidencia.
-
-**Verificación:**
-
-```bash
-find /opt/elastic-labs/work/evidence -maxdepth 1 -type f -printf '%f\n' | sort
-```
-
-Como mínimo, deben aparecer archivos similares a:
-
-```text
-08-00-01-bulk-response.json
-08-00-01-data-stream-inicial.json
-08-00-01-hallazgos.md
-08-00-01-linea-temporal-payments.json
-08-00-01-linea-temporal-payments.tsv
-08-00-01-payments-5xx.json
-```
-
-## Validación y pruebas
-
-Complete las siguientes comprobaciones antes de dar por finalizada la práctica.
-
-| Validación | Método | Resultado esperado |
-|---|---|---|
-| Data stream disponible | API `_data_stream/logs-ops-lab` | El data stream existe. |
-| Eventos inyectados | Respuesta Bulk | `"errors": false` y 15 acciones procesadas. |
-| Datos visibles en Discover | Data view `logs-ops-lab*` | Se observan documentos en el rango temporal absoluto. |
-| Triage de errores | Consulta KQL de triage | Se muestran eventos `ERROR` con 5xx o timeout. |
-| Impacto HTTP | Consulta KQL de impacto | Se muestran códigos 500, 502, 503 y 504. |
-| Correlación | Consulta por `trace.id` | Se recuperan eventos asociados a `trace-pay-7f3a`. |
-| Análisis por host | Filtro `host.name` | Se observan eventos en ambos hosts. |
-| Consultas reutilizables | Menú de consultas guardadas | Existen al menos tres consultas normalizadas. |
-| Evidencias técnicas | Archivos en `work/evidence` | Existen JSON, TSV y hallazgos documentados. |
-
-Ejecute esta comprobación final de datos 5xx:
-
-```bash
-jq -r '
-  .hits.hits[]._source.http.response.status_code
-' /opt/elastic-labs/work/evidence/08-00-01-payments-5xx.json \
-  | sort -n \
-  | uniq -c
-```
-
-La salida debe mostrar una distribución de códigos 5xx, por ejemplo:
-
-```text
-      2 500
-      2 502
-      2 503
-      3 504
-```
-
-Los conteos concretos pueden variar únicamente si se realizaron cargas adicionales de la práctica.
-
-## Solución de problemas
-
-### Problema 1: Discover no muestra eventos aunque la carga Bulk indica éxito
-
-**Síntomas:**
-
-- La respuesta Bulk contiene `"errors": false`.
-- El data view `logs-ops-lab*` existe.
-- Discover muestra el mensaje de que no hay resultados.
-
-**Causa probable:**
-
-El selector de tiempo no incluye la ventana temporal generada por el script. Los eventos se insertan con marcas temporales UTC situadas aproximadamente entre 35 y 13 minutos antes de la ejecución, por lo que un rango como “Last 15 minutes” puede excluir parte o todos los eventos.
-
-**Corrección:**
-
-1. Consulte la ventana real:
-
-   ```bash
-   cat /opt/elastic-labs/work/incident-08-00-01-window.txt
-   ```
-
-2. En Discover, seleccione un rango temporal absoluto que incluya `INCIDENT_START_UTC` e `INCIDENT_END_UTC`.
-
-3. Si aún no aparecen documentos, use temporalmente **Last 1 hour**.
-
-4. Confirme que el data view usa `@timestamp` como campo temporal.
-
-5. Fuerce una actualización del data view desde **Stack Management > Index Patterns/Data Views** si los campos fueron creados después del data view.
-
-### Problema 2: El usuario `analyst_lab` puede consultar datos, pero no puede crear data views o guardar consultas
-
-**Síntomas:**
-
-- El usuario puede abrir Discover y ver documentos.
-- Kibana muestra un error de permisos al crear el data view o al usar **Save query**.
-- Algunas opciones de guardado no están disponibles.
-
-**Causa probable:**
-
-El rol asignado durante la Práctica 7 no incluye privilegios suficientes sobre objetos guardados de Kibana, el espacio actual de Kibana, o la gestión de data views.
-
-**Corrección:**
-
-1. No cambie a `elastic` para realizar la investigación cotidiana, ya que el objetivo es validar los controles de mínimo privilegio.
-
-2. Documente el mensaje exacto del error y el usuario afectado.
-
-3. Solicite al instructor o al administrador de la Práctica 7 que revise el rol de `analyst_lab`. Debe disponer, como mínimo, de:
-   - Privilegios de lectura sobre `logs-ops-lab*`.
-   - Acceso a Discover.
-   - Privilegios sobre objetos guardados necesarios para consultas guardadas.
-   - Privilegios para crear o usar el data view definido para el laboratorio.
-
-4. Tras el ajuste, cierre sesión, vuelva a iniciar sesión como `analyst_lab` y repita el guardado de las consultas.
-
-## Limpieza
-
-No elimine el data stream, las consultas guardadas, el data view, las evidencias ni los volúmenes Docker. Estos elementos se utilizarán como evidencia funcional antes de la actualización de la Práctica 9 y durante el diagnóstico final de la Práctica 10.
-
-Realice únicamente las siguientes acciones de limpieza:
-
-1. Proteja los archivos de evidencia:
-
-   ```bash
-   chmod 700 /opt/elastic-labs/work/evidence
-   chmod 600 /opt/elastic-labs/work/evidence/*
-   ```
-
-2. Verifique que los archivos de trabajo permanezcan disponibles:
-
-   ```bash
-   ls -lh /opt/elastic-labs/work/evidence
-   ```
-
-3. Cierre la sesión de Kibana del usuario `analyst_lab` cuando termine la práctica.
-
-4. Mantenga los contenedores en ejecución si la siguiente práctica se realizará en el mismo equipo.
-
-> **No ejecute:** `docker compose down -v`  
-> **No elimine:** `es717-data`, `kibana717-data`, `logs-ops-lab` ni los objetos guardados de Kibana.
-
-## Resumen
-
-En esta práctica se investigó un incidente controlado de `payments-api` sobre el data stream `logs-ops-lab`. Se utilizó un data view temporal basado en `@timestamp`, filtros estructurados por entorno, dataset, servicio y host, y consultas KQL para separar triage, impacto HTTP 5xx, timeouts y autenticación.
-
-La evidencia indica un patrón de errores `ConnectionTimeout` distribuido entre `payments-app-01` y `payments-app-02`, con impacto principal sobre `/v1/payments` y `/v1/refunds`. Se guardaron consultas operativas reutilizables y se exportaron resultados JSON y TSV para respaldar el informe técnico y validar la continuidad funcional antes de la actualización de Elasticsearch.
-
-### Recursos opcionales
-
-- [Documentación oficial de Kibana Discover](https://www.elastic.co/docs/explore-analyze/discover)
-- [Documentación oficial de Kibana Query Language (KQL)](https://www.elastic.co/docs/explore-analyze/query-filter/languages/kql)
-- [Referencia de Elastic Common Schema (ECS)](https://www.elastic.co/guide/en/ecs/current/ecs-field-reference.html)
-- [Documentación de data views de Kibana](https://www.elastic.co/docs/explore-analyze/find-and-organize/data-views)
+![Resultado final del laboratorio 8: Construir dashboards y configurar alertas](imagenes/lab08_resultado_final.png)

@@ -1,0 +1,39 @@
+# =====================================================================
+# Actividad 0 · Preparación del entorno en Elastic Cloud Hosted
+# Archivo: cap00/lab00-preparacion.txt
+# Entorno: Kibana › Dev Tools › Console
+# Ejecuta cada solicitud con Ctrl+Enter (Cmd+Enter en macOS).
+# =====================================================================
+
+### 0.5 Primera conexión: ¿quién responde y en qué versión?
+GET /
+
+### 0.6 Estado general del clúster
+GET _cluster/health
+
+### 0.7 ¿Con qué identidad estoy trabajando?
+GET _security/_authenticate
+
+### 0.8 Crear el usuario personal de laboratorio rn_admin
+# Cambia la contraseña por una propia (mínimo 6 caracteres; usa una robusta).
+POST _security/user/rn_admin
+{
+  "password": "CambiaEstaClave-2026!",
+  "roles": [ "superuser" ],
+  "full_name": "Administrador de laboratorio RutaNorte",
+  "email": "rn_admin@rutanorte.example",
+  "metadata": {
+    "proyecto": "rutanorte-logs",
+    "creado_en": "actividad-0"
+  }
+}
+
+### 0.8b Comprobar que el usuario existe
+GET _security/user/rn_admin
+
+### 0.9 Verificación final, ya con la sesión de rn_admin
+GET _security/_authenticate?filter_path=username,roles,authentication_realm.name,authentication_type
+
+GET /?filter_path=version.number,version.build_flavor,cluster_name
+
+GET _cluster/health?filter_path=status,number_of_nodes,number_of_data_nodes

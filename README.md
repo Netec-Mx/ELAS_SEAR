@@ -46,7 +46,7 @@ Cada uno de estos laboratorios está diseñado para ofrecerte una experiencia pr
 
 ### [Práctica 5: Investigar errores y tendencias mediante Query DSL, KQL y ES\|QL](Capitulo05/README.md)
 
-- **Descripción**: Investiga errores y degradaciones de servicio mediante filtros, consultas y agregaciones. Compara Query DSL, KQL y ES|QL para identificar servicios afectados, códigos HTTP y tendencias temporales.
+- **Descripción**: Investiga errores y degradaciones de servicio mediante filtros, consultas y agregaciones. Compara Query DSL, KQL y ES\|QL para identificar servicios afectados, códigos HTTP y tendencias temporales.
 - ⏱️ **Duración estimada**: 95 min.
 
 ## Capítulo 6: Rendimiento y capacidad

@@ -1,0 +1,257 @@
+# =====================================================================
+# Lab 3 · Templates, mappings y data streams para los logs de RutaNorte
+# Archivo: cap03/lab03-templates.txt
+# Entorno: Kibana › Dev Tools › Console (sesión de rn_admin)
+# Los eventos de prueba están en cap03/lab03-bulk-eventos.txt (Paso 3.4)
+# =====================================================================
+
+### 3.1 Antes de crear: ¿qué plantillas ya existen para logs-*-*?
+GET _index_template/logs?filter_path=index_templates.name,index_templates.index_template.index_patterns,index_templates.index_template.priority,index_templates.index_template.composed_of
+
+### 3.2 Component template de settings
+PUT _component_template/rutanorte@settings
+{
+  "template": {
+    "settings": {
+      "index.number_of_shards": 1,
+      "index.number_of_replicas": 1,
+      "index.refresh_interval": "5s",
+      "index.codec": "best_compression",
+      "index.mapping.total_fields.limit": 500,
+      "index.mapping.ignore_malformed": false
+    }
+  },
+  "version": 1,
+  "_meta": {
+    "descripcion": "Settings comunes de los data streams de logs de RutaNorte",
+    "propietario": "equipo-plataforma",
+    "creado_en": "lab-03"
+  }
+}
+
+### 3.2b Component template de mappings
+PUT _component_template/rutanorte@mappings
+{
+  "template": {
+    "mappings": {
+      "dynamic": true,
+      "date_detection": false,
+      "dynamic_templates": [
+        {
+          "cadenas_como_keyword": {
+            "match_mapping_type": "string",
+            "mapping": { "type": "keyword", "ignore_above": 1024 }
+          }
+        }
+      ],
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "message":    { "type": "match_only_text" },
+        "log":     { "properties": { "level": { "type": "keyword" } } },
+        "service": { "properties": {
+          "name":        { "type": "keyword" },
+          "environment": { "type": "keyword" },
+          "version":     { "type": "keyword" }
+        } },
+        "host":    { "properties": { "name": { "type": "keyword" } } },
+        "event":   { "properties": {
+          "outcome":  { "type": "keyword" },
+          "duration": { "type": "long" }
+        } },
+        "http":    { "properties": {
+          "request":  { "properties": { "method": { "type": "keyword" } } },
+          "response": { "properties": { "status_code": { "type": "short" } } }
+        } },
+        "url":     { "properties": { "path": { "type": "keyword" } } },
+        "client":  { "properties": { "ip": { "type": "ip" } } },
+        "trace":   { "properties": { "id": { "type": "keyword" } } },
+        "error":   { "properties": {
+          "type":    { "type": "keyword" },
+          "message": { "type": "match_only_text" }
+        } },
+        "labels":  { "type": "flattened" },
+        "rutanorte": { "properties": {
+          "reserva_id":  { "type": "keyword" },
+          "corrida":     { "type": "keyword" },
+          "origen":      { "type": "keyword" },
+          "destino":     { "type": "keyword" },
+          "metodo_pago": { "type": "keyword" },
+          "monto_mxn":   { "type": "scaled_float", "scaling_factor": 100 }
+        } }
+      }
+    }
+  },
+  "version": 1,
+  "_meta": {
+    "descripcion": "Mappings ECS y de negocio para los logs de RutaNorte",
+    "propietario": "equipo-plataforma",
+    "creado_en": "lab-03"
+  }
+}
+
+### 3.2c Revisar los component templates creados
+GET _component_template/rutanorte@*?filter_path=component_templates.name,component_templates.component_template.version,component_templates.component_template._meta
+
+### 3.3 Index template que combina ambos componentes
+PUT _index_template/logs-rutanorte
+{
+  "index_patterns": [ "logs-rutanorte.*-*" ],
+  "data_stream": {},
+  "priority": 200,
+  "composed_of": [ "rutanorte@settings", "rutanorte@mappings" ],
+  "version": 1,
+  "_meta": {
+    "descripcion": "Data streams de logs de los servicios de RutaNorte",
+    "propietario": "equipo-plataforma",
+    "creado_en": "lab-03"
+  }
+}
+
+### 3.3b Simular el índice que se crearía para reservas-api
+POST _index_template/_simulate_index/logs-rutanorte.reservas-prod
+
+### 3.4 Cargar los eventos: ejecuta el archivo cap03/lab03-bulk-eventos.txt
+# (48 eventos de reservas-api, asientos-api y pagos-api)
+
+### 3.5 Revisar los data streams y sus índices de respaldo
+GET _data_stream/logs-rutanorte.*?filter_path=data_streams.name,data_streams.generation,data_streams.template,data_streams.index_mode,data_streams.status,data_streams.indices.index_name
+
+GET _cat/indices/.ds-logs-rutanorte.*?v&h=index,health,pri,rep,docs.count,store.size&s=index
+
+### 3.5b Mapping efectivo de campos clave
+GET logs-rutanorte.pagos-prod/_mapping/field/http.response.status_code,rutanorte.monto_mxn,client.ip,message
+
+### 3.5c Un campo no declarado en el template (dynamic template en acción)
+GET logs-rutanorte.reservas-prod/_mapping/field/user_agent.original
+
+### 3.5d Consultar los eventos indexados
+GET logs-rutanorte.pagos-prod/_search
+{
+  "size": 3,
+  "sort": [ { "@timestamp": "desc" } ],
+  "_source": [ "@timestamp", "log.level", "message", "rutanorte.monto_mxn", "http.response.status_code" ],
+  "query": {
+    "term": { "event.outcome": "failure" }
+  }
+}
+
+### 3.5e labels es flattened: claves nuevas sin crear campos nuevos
+POST logs-rutanorte.reservas-prod/_doc
+{
+  "@timestamp": "2026-03-27T18:20:00.000Z",
+  "service.name": "reservas-api",
+  "log.level": "info",
+  "message": "Reserva RN-100399 creada desde campaña de temporada",
+  "labels": { "canal": "app-ios", "campania": "verano-2026", "experimento": "checkout-b" }
+}
+
+GET logs-rutanorte.reservas-prod/_mapping/field/labels*
+
+GET logs-rutanorte.reservas-prod/_search
+{
+  "size": 1,
+  "_source": [ "message", "labels" ],
+  "query": { "term": { "labels.campania": "verano-2026" } }
+}
+
+### 3.6 Provocar un rechazo de mapping: el monto llega como texto con coma
+POST logs-rutanorte.pagos-prod/_doc
+{
+  "@timestamp": "2026-03-27T18:21:00.000Z",
+  "service.name": "pagos-api",
+  "log.level": "info",
+  "message": "Pago aprobado para la reserva RN-100400",
+  "http.response.status_code": 200,
+  "rutanorte": { "reserva_id": "RN-100400", "monto_mxn": "1,250.00", "metodo_pago": "tarjeta" }
+}
+
+### 3.6b El mismo evento corregido en el origen: el monto como número
+POST logs-rutanorte.pagos-prod/_doc
+{
+  "@timestamp": "2026-03-27T18:21:00.000Z",
+  "service.name": "pagos-api",
+  "log.level": "info",
+  "message": "Pago aprobado para la reserva RN-100400",
+  "http.response.status_code": 200,
+  "rutanorte": { "reserva_id": "RN-100400", "monto_mxn": 1250.00, "metodo_pago": "tarjeta" }
+}
+
+### 3.7 Evolucionar el diseño: versión 2 del template de mappings
+PUT _component_template/rutanorte@mappings
+{
+  "template": {
+    "mappings": {
+      "dynamic": true,
+      "date_detection": false,
+      "dynamic_templates": [
+        {
+          "cadenas_como_keyword": {
+            "match_mapping_type": "string",
+            "mapping": { "type": "keyword", "ignore_above": 1024 }
+          }
+        }
+      ],
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "message":    { "type": "match_only_text" },
+        "log":     { "properties": { "level": { "type": "keyword" } } },
+        "service": { "properties": {
+          "name":        { "type": "keyword" },
+          "environment": { "type": "keyword" },
+          "version":     { "type": "keyword" }
+        } },
+        "host":    { "properties": { "name": { "type": "keyword" } } },
+        "event":   { "properties": {
+          "outcome":  { "type": "keyword" },
+          "duration": { "type": "long" }
+        } },
+        "http":    { "properties": {
+          "request":  { "properties": { "method": { "type": "keyword" } } },
+          "response": { "properties": { "status_code": { "type": "short" } } }
+        } },
+        "url":     { "properties": { "path": { "type": "keyword" } } },
+        "client":  { "properties": { "ip": { "type": "ip" } } },
+        "trace":   { "properties": { "id": { "type": "keyword" } } },
+        "error":   { "properties": {
+          "type":    { "type": "keyword" },
+          "message": { "type": "match_only_text" }
+        } },
+        "labels":  { "type": "flattened" },
+        "rutanorte": { "properties": {
+          "reserva_id":  { "type": "keyword" },
+          "corrida":     { "type": "keyword" },
+          "origen":      { "type": "keyword" },
+          "destino":     { "type": "keyword" },
+          "metodo_pago": { "type": "keyword" },
+          "monto_mxn":   { "type": "scaled_float", "scaling_factor": 100 },
+          "pasajeros":   { "type": "byte" }
+        } }
+      }
+    }
+  },
+  "version": 2,
+  "_meta": {
+    "descripcion": "Mappings ECS y de negocio para los logs de RutaNorte",
+    "propietario": "equipo-plataforma",
+    "creado_en": "lab-03",
+    "cambio_v2": "Se agrega rutanorte.pasajeros (byte)"
+  }
+}
+
+### 3.7b El índice de respaldo actual NO cambia: el template solo aplica al crear índices
+GET logs-rutanorte.reservas-prod/_mapping/field/rutanorte.pasajeros
+
+### 3.7c Rollover: crear la generación 2 del data stream
+POST logs-rutanorte.reservas-prod/_rollover
+
+### 3.7d La nueva generación ya incluye el campo
+GET _data_stream/logs-rutanorte.reservas-prod?filter_path=data_streams.generation,data_streams.indices.index_name
+
+GET logs-rutanorte.reservas-prod/_mapping/field/rutanorte.pasajeros
+
+### 3.8 Resumen final: conteo por data stream
+GET _cat/count/logs-rutanorte.reservas-prod?v
+
+GET _cat/count/logs-rutanorte.asientos-prod?v
+
+GET _cat/count/logs-rutanorte.pagos-prod?v

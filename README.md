@@ -12,7 +12,7 @@ Te damos la bienvenida a la **plataforma de laboratorios** del curso **Administr
 
 Cada uno de estos laboratorios está diseñado para ofrecerte una experiencia práctica. Haz clic en los enlaces para comenzar y sigue el orden de los capítulos.
 
-Los nombres de los capítulos, los títulos de las prácticas y las duraciones indicadas corresponden al temario del curso.
+
 
 ## Capítulo 1: Arquitectura y operación distribuida
 

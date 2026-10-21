@@ -1,532 +1,656 @@
-# Lab 1 · Arquitectura, roles de nodos y salud de `rutanorte-logs`
+# Administración de Elasticsearch para gestión y análisis de logs
 
-| | |
-|---|---|
-| **Duración** | 55 minutos |
-| **Entorno** | Kibana › Dev Tools › Console, con la sesión de `rn_admin` |
-| **Archivos que usarás** | `cap01/lab01-arquitectura.txt` (comandos) · `cap01/hoja-arquitectura.md` (evidencia) |
-| **Requisitos** | Actividad 0 completa: deployment `rutanorte-logs` en estado `green` y usuario `rn_admin` |
-| **Deja listo para** | Lab 2 (inventario) y Lab 3 (diseño de data streams) |
+## Práctica 3. Creación de índices, operaciones CRUD con documentos, búsquedas simples y booleanas
 
----
+### Objetivo
 
-## Objetivo
+Al finalizar la práctica, serás capaz de:
 
-Analizar la arquitectura del deployment `rutanorte-logs` en Elastic Cloud Hosted:
-- identificar sus nodos, roles, zonas y maestro elegido;
-- observar cómo reparte Elasticsearch los shards primarios y las réplicas;
-- provocar un estado **yellow**, diagnosticarlo con `_cluster/allocation/explain` y corregirlo con la acción adecuada.
+- Crear y administrar índices: settings, aliases, cierre y apertura, y eliminación.
+- Ejecutar operaciones CRUD sobre documentos y cargas masivas con la Bulk API.
+- Construir búsquedas con Query DSL: `match`, `match_phrase`, `term`, `terms`, `range`, `exists` y `wildcard`.
+- Combinar condiciones con consultas `bool` y elegir correctamente entre `must`, `filter`, `should` y `must_not`.
+- Ordenar, paginar (`from`/`size`, `search_after` con PIT) y filtrar el `_source` de los resultados.
 
-## Contexto
+### Objetivo visual
 
-El deployment `rutanorte-logs` ya existe, pero para el equipo de Plataforma es una caja negra: Elastic eligió cuántas máquinas asignar, cómo llamarlas y dónde ubicarlas. Antes de diseñar cómo guardar los logs de los seis servicios (Lab 3), necesitas responder tres preguntas que te hará cualquier auditor o compañero de guardia:
+![Flujo de la práctica: índice, documentos y consultas](img/cap03.png)
 
-1. **¿De qué está hecho el clúster?** Nodos, roles y zonas.
-2. **¿Qué pasa si se cae una zona?** Dónde quedan los primarios y las réplicas.
-3. **¿Cómo sé si algo está mal y qué hago?** Estados de salud y su diagnóstico.
+### Duración aproximada
 
-La evidencia de este lab queda en la **hoja de arquitectura**, el primer documento de operación de RutaNorte.
+- 50 minutos.
 
-## Qué vas a hacer
+### Prerrequisitos
 
-| Paso | Actividad | Pregunta que responde |
-|---|---|---|
-| 1.1 | Listar nodos y roles con `_cat/nodes` | ¿Cuántos nodos hay y qué hace cada uno? |
-| 1.2 | Ver zonas y atributos con `_cat/nodeattrs` | ¿Dónde vive cada nodo? |
-| 1.3 | Identificar el maestro elegido y los nodos que votan | ¿Quién coordina el clúster y qué pasa si falla? |
-| 1.4 | Revisar la salud con `_cluster/health` y `_health_report` | ¿Está sano el clúster? |
-| 1.5 | Crear un data stream y observar el reparto de shards | ¿Cómo protege Elasticsearch los datos entre zonas? |
-| 1.6 | Provocar y diagnosticar un estado yellow | ¿Qué significa yellow y cuál es la acción correcta? |
-| 1.7 | Limpiar los recursos de práctica | ¿Cómo se borra de forma segura? |
+- Práctica 2 completada: Elasticsearch 8.19 en ejecución como servicio y Kibana accesible en `http://localhost:5601`.
+- Archivo `C:\labs\datos\cap03_app_logs.ndjson` (40 eventos de log de una tienda en línea).
 
 ---
 
-## Paso 1.1 · Inventario de nodos y sus roles
+### Instrucciones
 
-**Qué estás haciendo.** Usas la familia de APIs `_cat`, que devuelve tablas en texto para leerlas rápido en la consola. `_cat/nodes` lista cada nodo con las columnas que elijas.
+Todas las peticiones de esta práctica se ejecutan en **Kibana > Dev Tools (Console)**, salvo la carga del archivo, que se hace con curl desde PowerShell. Para ejecutar una petición en Console, coloca el cursor sobre ella y presiona `Ctrl + Enter` o haz clic en el triángulo ▶.
 
-Ejecuta el bloque **1.1**:
+**Escenario:** el equipo de operaciones de una tienda en línea necesita un índice para los logs de sus microservicios (`catalog-service`, `cart-service`, `checkout-service`, `payment-service`, `auth-service` e `inventory-service`) y consultas para responder preguntas operativas.
 
-```
-GET _cat/nodes?v&h=name,node.role,master,heap.percent,ram.percent,cpu,disk.used_percent&s=name
-```
+---
 
-| Parámetro | Explicación |
-|---|---|
-| `v` | *Verbose*: agrega la fila de encabezados |
-| `h=` | Columnas a mostrar, separadas por comas. El bloque **1.1b** (`GET _cat/nodes?help`) lista todas las disponibles |
-| `s=name` | Ordena por la columna `name` (agrega `:desc` para orden descendente) |
-| `node.role` | Roles del nodo, abreviados con una letra cada uno |
-| `master` | `*` marca al maestro elegido; `-` a los demás |
-| `heap.percent` | Porcentaje de memoria heap de la JVM en uso |
-| `disk.used_percent` | Porcentaje de disco usado; es clave para las marcas de agua (*watermarks*) |
+### Tarea 1. Gestionar índices
 
-**Resultado esperado** (ejemplo de un deployment de prueba de 2 zonas):
+#### Paso 1. Crea el índice con settings explícitos
 
-```
-name                  node.role master heap.percent ram.percent cpu disk.used_percent
-instance-0000000000   himrst    *                38          92   4              1.21
-instance-0000000001   himrst    -                31          91   3              1.19
-tiebreaker-0000000002 mv        -                22          88   1              0.35
-```
-
-**Cómo leer los roles**
-
-| Letra | Rol | Letra | Rol |
-|---|---|---|---|
-| `h` | data_hot | `m` | master (elegible como maestro) |
-| `i` | ingest | `v` | voting_only (vota, pero no puede ser maestro) |
-| `r` | remote_cluster_client | `s` | data_content |
-| `t` | transform | `w` / `c` / `f` | data_warm / data_cold / data_frozen |
-| `l` | ml (machine learning) | `d` | data (genérico, sin tiers) |
-
-**Interpretación.** Los nodos `instance-…` hacen casi todo: guardan datos del tier hot, ejecutan pipelines y son elegibles como maestro. El `tiebreaker-…` solo vota. ECH lo agrega en una tercera zona para que siempre haya mayoría en la elección del maestro. En producción, con deployments más grandes, ECH separa los maestros en nodos dedicados.
-
-> Anota cada nodo en la sección 1 de `hoja-arquitectura.md`.
-
-## Paso 1.2 · Zonas y atributos de cada nodo
-
-**Qué estás haciendo.** ECH etiqueta cada nodo con **atributos**: pares clave-valor que describen dónde y cómo corre. Elasticsearch usa el atributo de zona para **no poner dos copias del mismo shard en la misma zona** (*allocation awareness*).
-
-Ejecuta el bloque **1.2**:
-
-```
-GET _cat/nodeattrs?v&h=node,attr,value&s=node,attr
-```
-
-**Resultado esperado** (extracto):
-
-```
-node                  attr                       value
-instance-0000000000   availability_zone          us-east-1a
-instance-0000000000   data                       hot
-instance-0000000000   instance_configuration     aws.es.datahot.c6gd
-instance-0000000000   logical_availability_zone  zone-0
-instance-0000000000   region                     us-east-1
-instance-0000000001   availability_zone          us-east-1b
-instance-0000000001   logical_availability_zone  zone-1
-...
-tiebreaker-0000000002 logical_availability_zone  tiebreaker
-```
-
-| Atributo | Significado |
-|---|---|
-| `availability_zone` | Zona física del proveedor cloud |
-| `logical_availability_zone` | Zona lógica del deployment (`zone-0`, `zone-1`…). ECH la usa para el *awareness* |
-| `data` | Tier de datos del nodo (`hot`, `warm`, `cold`, `frozen`) |
-| `instance_configuration` | Tipo de instancia del catálogo de ECH |
-| `region` | Región del deployment |
-
-Para una vista compacta en JSON, ejecuta el bloque **1.2b**. Usa `filter_path` con el comodín `*`, que significa "cualquier ID de nodo":
-
-```
-GET _nodes?filter_path=nodes.*.name,nodes.*.roles,nodes.*.attributes.logical_availability_zone,nodes.*.attributes.availability_zone
-```
-
-> Los nombres de los atributos y de las instancias pueden variar por proveedor y región. Lo importante es que **cada nodo de datos está en una zona distinta**.
-
-## Paso 1.3 · Maestro elegido y quórum
-
-**Qué estás haciendo.** El nodo maestro mantiene el *estado del clúster* (índices, mappings, ubicación de shards) y lo publica a los demás. Solo hay un maestro elegido a la vez. Para elegirlo se necesita la **mayoría** de los nodos que votan.
-
-Ejecuta el bloque **1.3**:
-
-```
-GET _cat/master?v
-```
-
-```
-id                     host         ip           node
-Xk2pQ8rTS3m0aBcDeFgHiJ 10.42.1.17   10.42.1.17   instance-0000000000
-```
-
-Ejecuta el bloque **1.3b** para ver la configuración de votación que el clúster usa actualmente:
-
-```
-GET _cluster/state/metadata?filter_path=metadata.cluster_coordination.last_committed_config
-```
-
-La respuesta es una lista de IDs de nodo. Con 3 nodos que votan (dos `instance` y el `tiebreaker`), la mayoría es **2**.
-
-**Pregunta para tu hoja:** si falla la zona `zone-0` completa, ¿quedan votos suficientes para elegir maestro? ¿Y si fallan dos zonas?
-
-## Paso 1.4 · Salud del clúster
-
-**Qué estás haciendo.** Comparas dos APIs de salud. `_cluster/health` responde *qué tan bien están asignados los shards*. `_health_report` va más allá: evalúa indicadores como la estabilidad del maestro, el disco, la capacidad de shards, ILM o SLM, y propone diagnósticos con acciones concretas.
-
-Ejecuta el bloque **1.4**:
-
-```
-GET _cluster/health
-
-GET _health_report?verbose=false
-```
-
-| Parámetro / campo | Explicación |
-|---|---|
-| `_health_report?verbose=false` | Devuelve solo el estado y un resumen por indicador, sin el detalle de diagnóstico. Es más ligero para revisiones rutinarias |
-| `indicators.master_is_stable` | ¿El maestro ha cambiado de forma anómala? |
-| `indicators.shards_availability` | ¿Hay primarios o réplicas sin asignar? |
-| `indicators.disk` | ¿Algún nodo se acerca a las marcas de agua de disco? |
-| `indicators.shards_capacity` | ¿El clúster se acerca al límite de shards por nodo? |
-
-**Resultado esperado:** `"status": "green"` en ambas APIs. Si algún indicador aparece en `unknown` (por ejemplo `repository_integrity` o `slm` antes de configurar snapshots propios), anótalo: no es un error.
-
-## Paso 1.5 · Crear un data stream y observar el reparto de shards
-
-**Qué estás haciendo.** Escribes eventos de log de prueba de `reservas-api` en un **data stream**, el contenedor recomendado para datos con marca de tiempo que solo se agregan. Todavía no creas plantillas propias (eso es el Lab 3), así que aprovechas la **plantilla integrada `logs`**, que se aplica a todo nombre con el patrón `logs-*-*`.
-
-**1.5 · Primer evento.** Ejecuta el bloque **1.5**:
-
-```
-POST logs-lab01.reservas-default/_doc
-{
-  "@timestamp": "2026-03-27T18:00:00.000Z",
-  "service.name": "reservas-api",
-  "log.level": "info",
-  "message": "Reserva RN-100231 creada para la corrida MTY-SLT 18:30"
-}
-```
-
-| Parte | Explicación |
-|---|---|
-| `logs-lab01.reservas-default` | Nombre con el esquema `tipo-dataset-namespace`: `logs` · `lab01.reservas` · `default`. Coincide con `logs-*-*`, por eso Elasticsearch crea el data stream automáticamente |
-| `POST …/_doc` | Indexa un documento y deja que Elasticsearch genere el `_id`. En los data streams **no** se puede usar `PUT …/_doc/<id>` para crear documentos: solo se agregan |
-| `@timestamp` | Campo **obligatorio** en un data stream. Ordena los eventos en el tiempo |
-
-Respuesta: `"result": "created"`, con `_index` igual a algo como `.ds-logs-lab01.reservas-default-2026.10.19-000001`. Ese es el **índice de respaldo** (*backing index*) donde quedó el documento.
-
-**1.5b · Más eventos con `_bulk`.** Ejecuta el bloque **1.5b**. La API `_bulk` envía muchas operaciones en una sola solicitud:
-
-```
-POST logs-lab01.reservas-default/_bulk
-{ "create": {} }
-{ "@timestamp": "2026-03-27T18:00:05.000Z", "service.name": "reservas-api", "log.level": "info", "message": "..." }
-...
-```
-
-| Parte | Explicación |
-|---|---|
-| Formato NDJSON | Una línea de **acción** seguida de una línea de **documento**. Cada línea es un JSON completo, sin saltos de línea dentro |
-| `{ "create": {} }` | En data streams la única acción de escritura válida es `create`. El índice ya viene en la ruta |
-| `errors` en la respuesta | `false` si todas las operaciones tuvieron éxito. Revísalo siempre: `_bulk` responde HTTP 200 aunque falle algún documento |
-
-**1.5c · Anatomía del data stream.** Ejecuta el bloque **1.5c**:
-
-```
-GET _data_stream/logs-lab01.reservas-default
-```
-
-Registra en tu hoja:
-
-| Campo | Valor esperado | Qué significa |
-|---|---|---|
-| `indices[0].index_name` | `.ds-logs-lab01.reservas-default-AAAA.MM.DD-000001` | Índice de respaldo actual (generación 1) |
-| `template` | `logs` | Plantilla integrada que lo creó |
-| `ilm_policy` | `logs` | Política de ciclo de vida integrada (rollover y retención por defecto) |
-| `index_mode` | `logsdb` | Modo optimizado para logs, predeterminado en 9.x para `logs-*-*`: ordena y comprime para usar menos almacenamiento |
-| `status` | `GREEN` | Salud del data stream |
-
-**1.5d · ¿Dónde quedaron las copias?** Ejecuta el bloque **1.5d**:
-
-```
-GET _cat/shards/.ds-logs-lab01.reservas-default-*?v&h=index,shard,prirep,state,docs,store,node
-```
-
-```
-index                                               shard prirep state   docs store node
-.ds-logs-lab01.reservas-default-2026.10.19-000001   0     p      STARTED    5 9.8kb instance-0000000001
-.ds-logs-lab01.reservas-default-2026.10.19-000001   0     r      STARTED    5 9.8kb instance-0000000000
-```
-
-| Columna | Significado |
-|---|---|
-| `prirep` | `p` = primario, `r` = réplica |
-| `state` | `STARTED` (activo), `INITIALIZING`, `RELOCATING` o `UNASSIGNED` |
-| `docs` | Documentos en esa copia. El primario y la réplica deben coincidir |
-
-**1.5e · Reparto con varios primarios.** Ejecuta el bloque **1.5e**, que crea un índice clásico con 2 primarios y 1 réplica y luego muestra sus shards:
-
-```
-PUT lab01-reparto
+```http
+PUT app-logs-lab
 {
   "settings": {
-    "index.number_of_shards": 2,
-    "index.number_of_replicas": 1
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "refresh_interval": "5s"
   }
 }
 ```
 
-| Setting | Explicación |
-|---|---|
-| `index.number_of_shards` | Primarios del índice. **No se puede cambiar** después de crearlo (solo con *split*, *shrink* o reindexando) |
-| `index.number_of_replicas` | Réplicas por primario. **Sí se puede cambiar** en caliente |
+**Qué hace y por qué:**
 
-Cruza los nodos del resultado con las zonas del Paso 1.2. Vas a comprobar la regla: **el primario y la réplica de un mismo shard nunca comparten nodo ni zona**. Por eso, si falla una zona, la otra conserva una copia completa de los datos.
+- `number_of_shards: 1`: un volumen pequeño no necesita más shards. Cada shard consume memoria y descriptores de archivo, así que demasiados shards pequeños (*oversharding*) es uno de los problemas más comunes.
+- `number_of_replicas: 0`: el clúster tiene un solo nodo (ver Práctica 2) y así el índice queda `green`.
+- `refresh_interval: 5s`: los documentos se vuelven visibles para la búsqueda cada 5 segundos. El valor por defecto es 1 s; aumentarlo reduce el trabajo de indexación en cargas intensivas de logs.
 
-## Paso 1.6 · Provocar y diagnosticar un estado yellow
+#### Paso 2. Consulta y modifica los settings
 
-**Qué estás haciendo.** Reproduces de forma controlada una situación que verás en producción: un índice que pide más copias de las que el clúster puede alojar. Aprendes a diagnosticarla **con evidencia** y no por intuición.
+```http
+GET app-logs-lab/_settings
 
-**1.6 · Provocar.** Ejecuta el bloque **1.6**:
-
-```
-PUT lab01-amarillo
+PUT app-logs-lab/_settings
 {
-  "settings": {
-    "index.number_of_shards": 1,
-    "index.number_of_replicas": 2
-  }
+  "index": { "refresh_interval": "1s" }
 }
 
-GET _cluster/health?filter_path=status,number_of_data_nodes,active_shards,unassigned_shards
-
-GET _cat/shards/lab01-amarillo?v&h=index,shard,prirep,state,unassigned.reason,node
+GET app-logs-lab/_settings?filter_path=*.settings.index.refresh_interval,*.settings.index.number_of_*
 ```
 
-Pides 3 copias (1 primario + 2 réplicas) del shard 0, pero solo hay **2 nodos de datos**. Resultado:
+**Qué hace y por qué:** algunos settings son **dinámicos** (`refresh_interval`, `number_of_replicas`) y se cambian en caliente; otros son **estáticos** (`number_of_shards`) y solo se definen al crear el índice. `filter_path` reduce la respuesta a los campos que te interesan, algo útil cuando la salida JSON es larga.
 
-```json
-{ "status": "yellow", "number_of_data_nodes": 2, "active_shards": 24, "unassigned_shards": 1 }
-```
+#### Paso 3. Crea aliases, incluido un alias filtrado
 
-```
-index          shard prirep state      unassigned.reason node
-lab01-amarillo 0     p      STARTED                      instance-0000000000
-lab01-amarillo 0     r      STARTED                      instance-0000000001
-lab01-amarillo 0     r      UNASSIGNED INDEX_CREATED
-```
-
-**1.6b · Diagnosticar.** Ejecuta el bloque **1.6b**:
-
-```
-GET _cluster/allocation/explain
+```http
+POST _aliases
 {
-  "index": "lab01-amarillo",
-  "shard": 0,
-  "primary": false
-}
-```
-
-| Campo del cuerpo | Explicación |
-|---|---|
-| `index`, `shard` | Shard a explicar |
-| `primary` | `false` para preguntar por una réplica, `true` para el primario |
-| *(sin cuerpo)* | Elasticsearch explica el **primer** shard sin asignar que encuentre. Útil cuando no sabes cuál falla |
-
-**Resultado esperado** (extracto):
-
-```json
-{
-  "index": "lab01-amarillo",
-  "shard": 0,
-  "primary": false,
-  "current_state": "unassigned",
-  "unassigned_info": { "reason": "INDEX_CREATED", "last_allocation_status": "no_attempt" },
-  "can_allocate": "no",
-  "allocate_explanation": "Elasticsearch isn't allowed to allocate this shard to any of the nodes in the cluster...",
-  "node_allocation_decisions": [
-    {
-      "node_name": "instance-0000000000",
-      "node_decision": "no",
-      "deciders": [
-        { "decider": "same_shard", "decision": "NO",
-          "explanation": "a copy of this shard is already allocated to this node [[lab01-amarillo][0], ...]" }
-      ]
-    },
-    { "node_name": "instance-0000000001", "node_decision": "no", "deciders": [ { "decider": "same_shard", "decision": "NO" } ] }
+  "actions": [
+    { "add": { "index": "app-logs-lab", "alias": "app-logs" } },
+    { "add": { "index": "app-logs-lab", "alias": "app-logs-errores",
+               "filter": { "term": { "log.level.keyword": "ERROR" } } } }
   ]
 }
+
+GET _cat/aliases/app-logs*?v
 ```
 
-**Interpretación.** El *decider* `same_shard` prohíbe dos copias del mismo shard en un nodo. Ambos nodos ya tienen una copia, así que no hay dónde colocar la tercera. También puede aparecer el decider `awareness`, que aplica la misma lógica por zona.
+**Qué hace y por qué:** un **alias** es un nombre lógico que apunta a uno o varios índices. Las aplicaciones y los dashboards consultan el alias, y el administrador puede cambiar el índice real sin afectarlos (lo harás en la Práctica 4 con un reindex). El alias **filtrado** `app-logs-errores` aplica siempre una condición, de modo que un equipo puede consultar solo los errores sin escribir el filtro. Todas las acciones de `_aliases` se aplican de forma **atómica**.
 
-**1.6c · Segunda opinión.** Ejecuta el bloque **1.6c**:
+#### Paso 4. Cierra y vuelve a abrir el índice
 
-```
-GET _health_report/shards_availability
-```
+```http
+POST app-logs-lab/_close
+GET _cat/indices/app-logs-lab?v&h=index,status,health
+GET app-logs-lab/_search
 
-El indicador aparece en `yellow`. En `diagnosis` propone acciones concretas, como reducir réplicas o agregar nodos, y en `affected_resources` lista los índices afectados.
-
-**1.6d · Corregir con la acción correcta.** Ejecuta el bloque **1.6d**:
-
-```
-PUT lab01-amarillo/_settings
-{
-  "index.number_of_replicas": 1
-}
-
-GET _cluster/health?filter_path=status,unassigned_shards
+POST app-logs-lab/_open
+GET _cat/indices/app-logs-lab?v&h=index,status,health
 ```
 
-El estado vuelve a `green` y `unassigned_shards` a `0`.
+**Qué hace y por qué:** un índice **cerrado** conserva sus datos en disco, pero no consume memoria ni admite lecturas o escrituras: la búsqueda regresa el error `index_closed_exception`. Cerrar índices era una forma de "archivar" sin borrar, y también es necesario para cambiar ciertos settings estáticos, como los analizadores. En 8.x, para logs históricos se prefieren ILM y las fases cold y frozen (Práctica 10).
 
-> **¿Por qué no agregar un nodo?** Porque el problema no era de capacidad, sino de **configuración**: 2 réplicas no aportan protección adicional en un clúster de 2 zonas. Con 1 réplica, cada zona ya tiene una copia completa. Agregar nodos solo para que quepa una copia inútil aumenta el costo sin aumentar la disponibilidad.
+#### Paso 5. Comprueba la protección contra borrados masivos
 
-**Impacto de un yellow:** no se pierden datos y se puede escribir y buscar con normalidad, pero se **reduce la redundancia**. Si un nodo fallara en este momento, algún shard podría quedar sin copias. Con `red` (primario sin asignar), sí hay datos inaccesibles y escrituras rechazadas para ese índice.
+```http
+PUT borrar-prueba-1
+PUT borrar-prueba-2
 
-> Completa la sección 4 de `hoja-arquitectura.md`.
+DELETE borrar-prueba-*
 
-## Paso 1.7 · Limpieza
+GET _cluster/settings?include_defaults=true&filter_path=*.action.destructive_requires_name
 
-**Qué estás haciendo.** Borras los recursos de práctica. En Elasticsearch 9.x, `action.destructive_requires_name` vale `true` por defecto: **no se permiten comodines** al borrar índices, para evitar accidentes como `DELETE lab01-*` o `DELETE *`.
-
-Ejecuta el bloque **1.7**:
-
-```
-DELETE lab01-amarillo
-
-DELETE lab01-reparto
-
-DELETE _data_stream/logs-lab01.reservas-default
-
-GET _cluster/health?filter_path=status
+DELETE borrar-prueba-1,borrar-prueba-2
 ```
 
-| Comando | Explicación |
-|---|---|
-| `DELETE <índice>` | Borra el índice y sus datos de forma permanente |
-| `DELETE _data_stream/<nombre>` | Borra el data stream **y todos sus índices de respaldo**. Un índice de respaldo `.ds-…` no se puede borrar por separado mientras sea el índice de escritura |
+**Qué hace y por qué:** en Elasticsearch 8.x, `action.destructive_requires_name` vale `true` por defecto, por lo que un `DELETE` con comodines **falla** con un error. Es una salvaguarda contra borrados accidentales de muchos índices; para eliminar, debes nombrar cada índice explícitamente.
 
 ---
 
-## Verificación
+### Tarea 2. Operaciones CRUD sobre documentos
 
-- [ ] La hoja de arquitectura tiene completos los nodos, roles, zonas y el maestro elegido.
-- [ ] Explicaste por qué hay un nodo tiebreaker y cuántos votos forman la mayoría.
-- [ ] Documentaste en qué nodo y zona quedaron el primario y la réplica del data stream.
-- [ ] Explicaste el estado yellow: causa (`same_shard`), impacto (menos redundancia, sin pérdida) y acción (bajar a 1 réplica).
-- [ ] `GET _cluster/health` termina en `green` y no quedan índices `lab01-*`.
+#### Paso 6. Indexa (crea) documentos con y sin ID
 
-## Pantalla de resultado final
+```http
+PUT app-logs-lab/_doc/manual-1
+{
+  "@timestamp": "2026-10-20T08:00:00-06:00",
+  "service": { "name": "checkout-service" },
+  "host": { "name": "srv-app01" },
+  "log": { "level": "INFO" },
+  "message": "Documento de prueba creado manualmente",
+  "tags": ["manual"]
+}
 
-![Diagnóstico del estado yellow con allocation/explain en Kibana Dev Tools](img/lab01-resultado-final.png)
+POST app-logs-lab/_doc
+{
+  "@timestamp": "2026-10-20T08:01:00-06:00",
+  "service": { "name": "cart-service" },
+  "log": { "level": "WARN" },
+  "message": "Documento con ID generado por Elasticsearch",
+  "tags": ["manual"]
+}
+```
 
-*Pantalla de referencia del Paso 1.6b. La respuesta de `_cluster/allocation/explain` muestra `can_allocate: "no"` y el decider `same_shard` en cada nodo de datos. Los nombres de nodo e identificadores cambian en cada deployment.*
+**Qué hace y por qué:** `PUT .../_doc/<id>` crea el documento con un ID propio, o lo **reemplaza** si ya existe. `POST .../_doc` genera un ID automático; es la forma más eficiente para logs, porque Elasticsearch no necesita verificar si el ID ya existe. Observa en la respuesta `_id`, `_version`, `_seq_no`, `_primary_term` y `result` (`created`).
 
-## Preguntas de reflexión
+#### Paso 7. Usa `_create` para evitar sobrescrituras
 
-1. RutaNorte quiere sobrevivir a la caída de **una** zona sin perder escritura. ¿Basta con la topología actual? ¿Qué cambiaría con 3 zonas?
-2. ¿Por qué un patrón de búsqueda como `logs-*` es más costoso que `logs-rutanorte.pagos-*`? Relaciónalo con el patrón *scatter-gather*.
-3. ¿Qué tareas de esta práctica harías tú y cuáles hace Elastic en ECH? Completa la sección 5 de la hoja.
+```http
+PUT app-logs-lab/_create/manual-1
+{
+  "message": "Esto falla porque el ID ya existe"
+}
+```
 
-## Lo que dejas listo para el Lab 2
+**Qué hace y por qué:** `_create` solo indexa si el ID **no** existe; si existe, responde `409 version_conflict_engine_exception`. Garantiza que un evento no se sobrescriba por error, por ejemplo, al reprocesar logs.
 
-- La **hoja de arquitectura** con la topología real del deployment.
-- Un clúster limpio, en `green`.
+#### Paso 8. Lee el documento
 
-En el Lab 2 vas a completar el expediente del deployment: versión exacta, licencia, acceso seguro con API key y compatibilidad de los componentes que RutaNorte ya tiene funcionando.
+```http
+GET app-logs-lab/_doc/manual-1
+
+GET app-logs-lab/_source/manual-1
+
+HEAD app-logs-lab/_doc/no-existe
+```
+
+**Qué hace y por qué:** `GET _doc` regresa el documento con sus metadatos; `_source` regresa solo el JSON original, y `HEAD` solo verifica si existe (200 o 404). La lectura por ID es **en tiempo real**: no depende del `refresh_interval`.
+
+#### Paso 9. Actualiza parcialmente y con script
+
+```http
+POST app-logs-lab/_update/manual-1
+{
+  "doc": {
+    "log": { "level": "WARN" },
+    "response_time_ms": 1500
+  }
+}
+
+POST app-logs-lab/_update/manual-1
+{
+  "script": {
+    "source": "ctx._source.tags.add(params.etiqueta); ctx._source.response_time_ms += params.extra",
+    "params": { "etiqueta": "revisado", "extra": 100 }
+  }
+}
+
+GET app-logs-lab/_doc/manual-1
+```
+
+**Qué hace y por qué:** `_update` con `doc` fusiona los campos indicados con el documento existente. Con `script` (lenguaje Painless) se aplica lógica, como agregar una etiqueta o sumar un valor. Internamente, Elasticsearch **reindexa** el documento completo, porque los segmentos de Lucene son inmutables. Por eso los logs, que casi nunca se modifican, se tratan como datos *append-only*.
+
+#### Paso 10. Aplica control de concurrencia optimista
+
+```http
+GET app-logs-lab/_doc/manual-1?filter_path=_seq_no,_primary_term
+
+# Sustituye 3 y 1 por los valores de _seq_no y _primary_term que obtuviste
+PUT app-logs-lab/_doc/manual-1?if_seq_no=3&if_primary_term=1
+{
+  "@timestamp": "2026-10-20T08:00:00-06:00",
+  "message": "Reemplazo controlado",
+  "tags": ["manual"]
+}
+```
+
+Ejecuta el `PUT` dos veces. La segunda vez responde `409` porque `_seq_no` ya cambió.
+
+**Qué hace y por qué:** `if_seq_no` e `if_primary_term` aseguran que solo se modifique la versión que leíste. Si otro proceso cambió el documento entretanto, la operación falla en lugar de perder cambios.
+
+#### Paso 11. Usa la Bulk API con varias operaciones
+
+```http
+POST _bulk
+{ "index": { "_index": "app-logs-lab", "_id": "manual-2" } }
+{ "@timestamp": "2026-10-20T08:02:00-06:00", "log": { "level": "INFO" }, "message": "Alta por bulk", "tags": ["manual"] }
+{ "create": { "_index": "app-logs-lab", "_id": "manual-3" } }
+{ "@timestamp": "2026-10-20T08:03:00-06:00", "log": { "level": "ERROR" }, "message": "Creado por bulk", "tags": ["manual"] }
+{ "update": { "_index": "app-logs-lab", "_id": "manual-2" } }
+{ "doc": { "log": { "level": "WARN" } } }
+{ "delete": { "_index": "app-logs-lab", "_id": "manual-3" } }
+```
+
+**Qué hace y por qué:** `_bulk` ejecuta muchas operaciones en una sola petición HTTP, con el formato NDJSON (una línea de acción y, para `index`, `create` y `update`, una línea de datos). Es la forma en que Filebeat, Logstash y Elastic Agent envían los logs. Revisa en la respuesta `"errors": false` y el `status` de cada elemento: un bulk **no es transaccional**, y cada operación puede fallar o tener éxito por separado.
+
+#### Paso 12. Elimina los documentos de prueba
+
+```http
+DELETE app-logs-lab/_doc/manual-1
+
+POST app-logs-lab/_delete_by_query?refresh=true
+{
+  "query": { "term": { "tags.keyword": "manual" } }
+}
+
+GET app-logs-lab/_count
+```
+
+**Qué hace y por qué:** `DELETE` borra un documento por ID; `_delete_by_query` borra todos los que cumplen una consulta. Aquí elimina los documentos de prueba, incluido el de ID automático, para que el índice quede vacío (`count: 0`) antes de la carga masiva. En logs, el borrado selectivo es poco común; la retención se maneja borrando índices completos con ILM, que es mucho más eficiente.
+
+#### Paso 13. Carga el archivo de logs con curl
+
+En PowerShell:
+
+```powershell
+. C:\labs\scripts\entorno.ps1
+es POST "/app-logs-lab/_bulk?refresh=true&filter_path=errors,took" -File C:\labs\datos\cap03_app_logs.ndjson
+```
+
+Después, en Dev Tools:
+
+```http
+GET app-logs-lab/_count
+GET app-logs-lab/_search?size=2
+```
+
+**Qué hace y por qué:** el archivo tiene 80 líneas: 40 acciones `{"index":{}}` y 40 documentos. Como el índice va en la URL, las líneas de acción no repiten `_index`. `--data-binary` (dentro de la función `es`) envía el archivo sin alterar los saltos de línea, que son obligatorios en NDJSON. `refresh=true` hace visibles los documentos de inmediato. La respuesta esperada es `{"took":..,"errors":false}` y el conteo debe ser **40**.
+
+#### Paso 14. Revisa el mapping dinámico
+
+```http
+GET app-logs-lab/_mapping
+```
+
+**Qué hace y por qué:** no definiste un mapping, así que Elasticsearch lo **infirió**:
+
+- `@timestamp` es `date`, y `response_time_ms` y `http.response.status_code` son `long`.
+- Las cadenas (`message`, `log.level`, `service.name`, etc.) son `text` con un subcampo `keyword` (*multi-field*).
+- `source.ip` quedó como `text`/`keyword`, **no** como `ip`, porque la inferencia no detecta direcciones IP.
+
+Esta es la razón por la que en esta práctica usarás `campo.keyword` para comparaciones exactas. En la Práctica 4 diseñarás un mapping explícito que corrige estos tipos.
 
 ---
 
-## Archivo completo · `cap01/lab01-arquitectura.txt`
+### Tarea 3. Búsquedas simples con Query DSL
 
-```
-# =====================================================================
-# Lab 1 · Arquitectura, roles de nodos y salud de rutanorte-logs
-# Archivo: cap01/lab01-arquitectura.txt
-# Entorno: Kibana › Dev Tools › Console (sesión de rn_admin)
-# =====================================================================
+#### Paso 15. Busca texto completo con `match` y `match_phrase`
 
-### 1.1 Inventario de nodos y sus roles
-GET _cat/nodes?v&h=name,node.role,master,heap.percent,ram.percent,cpu,disk.used_percent&s=name
-
-### 1.1b Leyenda completa de columnas disponibles en _cat/nodes
-GET _cat/nodes?help
-
-### 1.2 Zonas y atributos que ECH asigna a cada nodo
-GET _cat/nodeattrs?v&h=node,attr,value&s=node,attr
-
-### 1.2b Vista compacta: solo la zona lógica y la física
-GET _nodes?filter_path=nodes.*.name,nodes.*.roles,nodes.*.attributes.logical_availability_zone,nodes.*.attributes.availability_zone
-
-### 1.3 Maestro elegido
-GET _cat/master?v
-
-### 1.3b Nodos que votan en la elección del maestro
-GET _cluster/state/metadata?filter_path=metadata.cluster_coordination.last_committed_config
-
-### 1.4 Salud: vista rápida y reporte detallado
-GET _cluster/health
-
-GET _health_report?verbose=false
-
-### 1.5 Crear un data stream de prueba (usa la plantilla integrada "logs")
-POST logs-lab01.reservas-default/_doc
+```http
+GET app-logs-lab/_search
 {
-  "@timestamp": "2026-03-27T18:00:00.000Z",
-  "service.name": "reservas-api",
-  "log.level": "info",
-  "message": "Reserva RN-100231 creada para la corrida MTY-SLT 18:30"
+  "query": { "match": { "message": "timeout" } }
 }
 
-### 1.5b Agregar más eventos con la API _bulk
-POST logs-lab01.reservas-default/_bulk
-{ "create": {} }
-{ "@timestamp": "2026-03-27T18:00:05.000Z", "service.name": "reservas-api", "log.level": "info", "message": "Reserva RN-100232 creada para la corrida MTY-CUU 21:00" }
-{ "create": {} }
-{ "@timestamp": "2026-03-27T18:00:09.000Z", "service.name": "reservas-api", "log.level": "warn", "message": "Asiento 14 ya bloqueado en la corrida MTY-SLT 18:30, se reintenta" }
-{ "create": {} }
-{ "@timestamp": "2026-03-27T18:00:12.000Z", "service.name": "reservas-api", "log.level": "info", "message": "Reserva RN-100233 creada para la corrida TIJ-HMO 07:15" }
-{ "create": {} }
-{ "@timestamp": "2026-03-27T18:00:20.000Z", "service.name": "reservas-api", "log.level": "error", "message": "Tiempo de espera agotado al consultar asientos-api (3000 ms)" }
-
-### 1.5c ¿Qué se creó? Data stream, índice de respaldo, plantilla y modo de índice
-GET _data_stream/logs-lab01.reservas-default
-
-### 1.5d ¿Dónde quedaron el primario y la réplica?
-GET _cat/shards/.ds-logs-lab01.reservas-default-*?v&h=index,shard,prirep,state,docs,store,node
-
-### 1.5e Índice con 2 primarios y 1 réplica para observar el reparto
-PUT lab01-reparto
+GET app-logs-lab/_count
 {
-  "settings": {
-    "index.number_of_shards": 2,
-    "index.number_of_replicas": 1
+  "query": { "match": { "message": "base de datos" } }
+}
+
+GET app-logs-lab/_count
+{
+  "query": { "match": { "message": { "query": "base de datos", "operator": "and" } } }
+}
+
+GET app-logs-lab/_count
+{
+  "query": { "match_phrase": { "message": "base de datos" } }
+}
+```
+
+**Qué hace y por qué:** `match` **analiza** el texto de búsqueda con el mismo analizador del campo (`standard`: minúsculas y separación por palabras) y busca los términos resultantes:
+
+| Consulta | Lógica | Resultado |
+|---|---|---|
+| `match "timeout"` | contiene el término `timeout` | 3 |
+| `match "base de datos"` | `base` **OR** `de` **OR** `datos` | 21 (la palabra común `de` aparece en muchos mensajes) |
+| `match ... operator: and` | contiene los tres términos, en cualquier orden | 5 |
+| `match_phrase` | los tres términos juntos y en ese orden | 5 |
+
+Para frases en logs, usa `match_phrase` u `operator: and`; un `match` simple con palabras comunes devuelve ruido.
+
+#### Paso 16. Compara `term` sobre `text` y sobre `keyword`
+
+```http
+GET app-logs-lab/_count
+{ "query": { "term": { "log.level": "ERROR" } } }
+
+GET app-logs-lab/_count
+{ "query": { "term": { "log.level.keyword": "ERROR" } } }
+```
+
+**Qué hace y por qué:** `term` **no analiza** el valor buscado. El campo `log.level` (tipo `text`) se indexó en minúsculas (`error`), así que buscar `ERROR` da **0**. El subcampo `log.level.keyword` guarda el valor exacto y da **8**. Regla práctica: usa `term`, `terms` y `range` sobre campos `keyword`, numéricos, de fecha o IP, y usa `match` sobre campos `text`.
+
+#### Paso 17. Busca varios valores exactos con `terms`
+
+```http
+GET app-logs-lab/_count
+{
+  "query": {
+    "terms": { "service.name.keyword": ["checkout-service", "payment-service"] }
+  }
+}
+```
+
+**Qué hace y por qué:** `terms` equivale a un `IN` de SQL: devuelve los documentos cuyo valor coincide con **cualquiera** de la lista. El resultado es **16** (9 de checkout y 7 de payment).
+
+#### Paso 18. Filtra por rangos numéricos y de fechas
+
+```http
+GET app-logs-lab/_count
+{
+  "query": { "range": { "response_time_ms": { "gte": 1000 } } }
+}
+
+GET app-logs-lab/_search
+{
+  "query": {
+    "range": {
+      "@timestamp": {
+        "gte": "2026-10-20T12:00:00-06:00",
+        "lt":  "2026-10-20T13:00:00-06:00"
+      }
+    }
+  },
+  "_source": ["@timestamp", "service.name", "message"]
+}
+```
+
+**Qué hace y por qué:** `range` admite `gt`, `gte`, `lt` y `lte`. Las fechas se guardan en UTC; al incluir la zona `-06:00` en el valor, la consulta se interpreta en hora de la Ciudad de México. Otra opción es usar el parámetro `"time_zone": "America/Mexico_City"`. Resultados: **9** eventos tardaron 1,000 ms o más, y **8** eventos ocurrieron entre las 12:00 y las 13:00. En logs, el rango de tiempo es el filtro más usado: Kibana lo agrega en cada consulta.
+
+#### Paso 19. Verifica la existencia de campos y usa comodines
+
+```http
+GET app-logs-lab/_count
+{ "query": { "exists": { "field": "user.name" } } }
+
+GET app-logs-lab/_search
+{
+  "query": { "wildcard": { "user.name.keyword": { "value": "*ez" } } },
+  "_source": ["user.name", "message"]
+}
+```
+
+**Qué hace y por qué:** `exists` devuelve los documentos que tienen un valor en el campo: **29** de 40 eventos tienen usuario, porque las consultas anónimas al catálogo no lo tienen. `wildcard` acepta `*` y `?` sobre campos `keyword`; devuelve **13** eventos de usuarios cuyo nombre termina en "ez". Los comodines al **inicio** del patrón (`*ez`) obligan a recorrer todo el diccionario de términos y son costosos en índices grandes; úsalos con moderación o prefiere el tipo `wildcard`, que se ve en la Práctica 4.
+
+---
+
+### Tarea 4. Consultas booleanas: `must`, `filter`, `should` y `must_not`
+
+La consulta `bool` combina otras consultas mediante cuatro cláusulas. Elegir la cláusula correcta afecta el **resultado**, la **relevancia** (`_score`) y el **rendimiento**.
+
+| Cláusula | ¿El documento debe cumplirla? | ¿Calcula `_score`? | Contexto | ¿Se puede cachear? | Uso recomendado en logs |
+|---|---|---|---|---|---|
+| `must` | Sí (AND) | **Sí**, suma relevancia | query | No | Búsqueda de texto completo donde importa qué tan bien coincide el texto, como un `match` sobre `message`. |
+| `filter` | Sí (AND) | **No** (score 0) | filter | **Sí** | Condiciones exactas: rango de tiempo, `service.name`, `log.level`, `host.name`, códigos HTTP o entorno. Es la cláusula **más usada** en análisis de logs. |
+| `should` | Opcional; con `minimum_should_match` se vuelve obligatoria (OR) | **Sí**, aumenta el score de lo que coincide | query | No | Expresar un OR (por ejemplo, "es 5xx **o** tardó más de 2 s") o dar prioridad a ciertos resultados sin excluir los demás. |
+| `must_not` | Debe **no** cumplirse (NOT) | **No** | filter | **Sí** | Excluir ruido: health checks, entorno de pruebas o servicios que no interesan. |
+
+> **Importante:** si una `bool` **no** tiene `must` ni `filter`, al menos una cláusula `should` debe cumplirse (`minimum_should_match` vale 1 de forma implícita). Si **sí** tiene `must` o `filter`, las `should` son opcionales y solo modifican el orden por relevancia, a menos que indiques `minimum_should_match`.
+
+#### Paso 20. Combina `must` y `filter`
+
+```http
+GET app-logs-lab/_search
+{
+  "query": {
+    "bool": {
+      "must": [
+        { "match": { "message": "pedido" } }
+      ],
+      "filter": [
+        { "term":  { "environment.keyword": "produccion" } },
+        { "range": { "response_time_ms": { "gte": 1000 } } }
+      ]
+    }
+  },
+  "_source": ["@timestamp", "service.name", "response_time_ms", "message"]
+}
+```
+
+**Qué hace y por qué:** `must` busca la palabra `pedido` en el mensaje y calcula relevancia; `filter` exige el entorno de producción y una latencia de 1 s o más, sin afectar el score. El resultado son **2** documentos: "Latencia alta al guardar el pedido…" y "Reintento de guardado de pedido…". Los mensajes "…base de datos de pedidos" **no** aparecen: `pedidos` es un término distinto de `pedido`, porque el analizador `standard` no reduce palabras a su raíz. En la Práctica 4 verás cómo un analizador en español lo resuelve.
+
+#### Paso 21. Excluye con `must_not`
+
+```http
+GET app-logs-lab/_search
+{
+  "query": {
+    "bool": {
+      "filter": [
+        { "term": { "log.level.keyword": "ERROR" } }
+      ],
+      "must_not": [
+        { "term": { "service.name.keyword": "catalog-service" } }
+      ]
+    }
+  },
+  "_source": ["service.name", "message"]
+}
+```
+
+**Qué hace y por qué:** obtiene los errores de todos los servicios **excepto** catálogo: **7** documentos. `must_not` se ejecuta en contexto de filtro, así que no calcula relevancia y su resultado puede cachearse.
+
+#### Paso 22. Expresa un OR con `should` y `minimum_should_match`
+
+```http
+GET app-logs-lab/_search
+{
+  "query": {
+    "bool": {
+      "filter": [
+        { "term": { "service.name.keyword": "checkout-service" } }
+      ],
+      "should": [
+        { "match": { "message": "timeout" } },
+        { "match": { "message": "latencia" } }
+      ],
+      "minimum_should_match": 1
+    }
+  },
+  "_source": ["@timestamp", "message", "response_time_ms"]
+}
+```
+
+Repite la consulta **sin** `"minimum_should_match": 1` y compara el número de resultados.
+
+**Qué hace y por qué:** con `minimum_should_match: 1`, el documento debe cumplir al menos una `should`: **3** resultados (dos timeouts y una latencia alta). Sin ese parámetro, como existe un `filter`, las `should` se vuelven opcionales y regresan **los 9** eventos de checkout. Los que coinciden con `timeout` o `latencia` aparecen primero por tener mayor score. Es el error más frecuente al construir consultas `bool`.
+
+#### Paso 23. Usa `should` para priorizar sin excluir
+
+```http
+GET app-logs-lab/_search
+{
+  "query": {
+    "bool": {
+      "must": [
+        { "match": { "message": "pedido" } }
+      ],
+      "should": [
+        { "term": { "log.level.keyword": { "value": "ERROR", "boost": 5 } } }
+      ]
+    }
+  },
+  "_source": ["log.level", "message"]
+}
+```
+
+**Qué hace y por qué:** regresa los **7** documentos con la palabra `pedido`, pero el de nivel `ERROR` aparece **primero** porque la `should` suma score (multiplicado por `boost`). Es útil en búsquedas interactivas: "muéstrame todo, pero los errores arriba".
+
+#### Paso 24. Construye una consulta operativa completa
+
+Pregunta: *"¿Qué eventos de producción entre las 09:00 y las 12:00 fueron errores del servidor (5xx) o tardaron 2 segundos o más?"*
+
+```http
+GET app-logs-lab/_search
+{
+  "query": {
+    "bool": {
+      "filter": [
+        { "term":  { "environment.keyword": "produccion" } },
+        { "range": { "@timestamp": { "gte": "2026-10-20T09:00:00", "lt": "2026-10-20T12:00:00", "time_zone": "America/Mexico_City" } } }
+      ],
+      "should": [
+        { "range": { "http.response.status_code": { "gte": 500 } } },
+        { "range": { "response_time_ms": { "gte": 2000 } } }
+      ],
+      "minimum_should_match": 1,
+      "must_not": [
+        { "term": { "service.name.keyword": "inventory-service" } }
+      ]
+    }
+  },
+  "sort": [ { "@timestamp": "asc" } ],
+  "_source": ["@timestamp", "service.name", "http.response.status_code", "response_time_ms", "message"]
+}
+```
+
+**Qué hace y por qué:** combina las cuatro cláusulas como se recomienda: las condiciones exactas van en `filter`, el OR en `should` con `minimum_should_match`, y la exclusión en `must_not`. El resultado son **6** eventos. Al ordenar por `@timestamp`, el score no se usa, así que no hace falta `must`: en análisis de logs, la mayoría de consultas son puramente de filtro.
+
+#### Paso 25. Compara el contexto query y el contexto filter
+
+```http
+GET app-logs-lab/_search
+{
+  "query": { "bool": { "must":   [ { "term": { "log.level.keyword": "ERROR" } } ] } },
+  "size": 3, "_source": false
+}
+
+GET app-logs-lab/_search
+{
+  "query": { "bool": { "filter": [ { "term": { "log.level.keyword": "ERROR" } } ] } },
+  "size": 3, "_source": false
+}
+```
+
+**Qué hace y por qué:** ambas regresan los mismos 8 documentos. Con `must`, cada resultado tiene un `_score` mayor que 0; con `filter`, el `_score` es **0.0**. El contexto filter evita el cálculo de relevancia y permite que Elasticsearch **cachee** el conjunto de documentos que cumplen la condición, lo que acelera consultas repetidas, como las de los dashboards que se actualizan cada minuto.
+
+---
+
+### Tarea 5. Ordenar, paginar y filtrar el `_source`
+
+#### Paso 26. Ordena y pagina con `from` y `size`
+
+```http
+GET app-logs-lab/_search
+{
+  "from": 0,
+  "size": 5,
+  "sort": [
+    { "response_time_ms": "desc" },
+    { "@timestamp": "asc" }
+  ],
+  "_source": ["service.name", "response_time_ms", "message"]
+}
+```
+
+Cambia `"from": 0` por `"from": 5` para ver la segunda página.
+
+**Qué hace y por qué:** muestra los 5 eventos más lentos (5000, 4200, 3010, 3005 y 2450 ms). El segundo criterio de orden desempata. `from`/`size` es sencillo, pero está limitado por `index.max_result_window` (10,000 por defecto), porque cada página profunda obliga a cada shard a ordenar `from + size` documentos.
+
+#### Paso 27. Pagina con `search_after` y un Point in Time (PIT)
+
+```http
+POST app-logs-lab/_pit?keep_alive=2m
+```
+
+Copia el `id` de la respuesta y úsalo en lugar de `<PIT_ID>`:
+
+```http
+GET _search
+{
+  "size": 10,
+  "pit": { "id": "<PIT_ID>", "keep_alive": "2m" },
+  "sort": [ { "@timestamp": "asc" } ],
+  "_source": ["@timestamp", "message"]
+}
+```
+
+En la respuesta, copia el arreglo `sort` del **último** resultado (por ejemplo, `[1760976067000, 9]`) y pide la siguiente página:
+
+```http
+GET _search
+{
+  "size": 10,
+  "pit": { "id": "<PIT_ID>", "keep_alive": "2m" },
+  "sort": [ { "@timestamp": "asc" } ],
+  "search_after": [1760976067000, 9],
+  "_source": ["@timestamp", "message"]
+}
+```
+
+Al terminar, libera el PIT:
+
+```http
+DELETE _pit
+{ "id": "<PIT_ID>" }
+```
+
+**Qué hace y por qué:** un **PIT** congela una vista consistente del índice, de modo que los documentos que llegan durante la paginación no desplazan las páginas. `search_after` continúa desde los valores de orden del último resultado, sin el costo de `from`, y no tiene límite de profundidad. Es el método recomendado para exportar o recorrer muchos logs. Con PIT, Elasticsearch agrega un desempate implícito (`_shard_doc`), por eso el arreglo `sort` tiene dos valores. La petición se hace a `_search` sin nombre de índice, porque el PIT ya lo incluye.
+
+#### Paso 28. Filtra los campos devueltos
+
+```http
+GET app-logs-lab/_search
+{
+  "size": 3,
+  "_source": {
+    "includes": ["@timestamp", "service.*", "log.level"],
+    "excludes": ["service.version"]
   }
 }
 
-GET _cat/shards/lab01-reparto?v&h=index,shard,prirep,state,node&s=shard,prirep
-
-### 1.6 Provocar un estado yellow: pedir más réplicas que nodos de datos
-PUT lab01-amarillo
+GET app-logs-lab/_search
 {
-  "settings": {
-    "index.number_of_shards": 1,
-    "index.number_of_replicas": 2
-  }
+  "size": 3,
+  "_source": false,
+  "fields": ["@timestamp", "service.name", "response_time_ms"]
 }
-
-GET _cluster/health?filter_path=status,number_of_data_nodes,active_shards,unassigned_shards
-
-GET _cat/shards/lab01-amarillo?v&h=index,shard,prirep,state,unassigned.reason,node
-
-### 1.6b Preguntar a Elasticsearch por qué no asigna la réplica
-GET _cluster/allocation/explain
-{
-  "index": "lab01-amarillo",
-  "shard": 0,
-  "primary": false
-}
-
-### 1.6c El indicador de disponibilidad de shards del health report
-GET _health_report/shards_availability
-
-### 1.6d Acción correcta: alinear las réplicas con la topología
-PUT lab01-amarillo/_settings
-{
-  "index.number_of_replicas": 1
-}
-
-GET _cluster/health?filter_path=status,unassigned_shards
-
-### 1.7 Limpieza (los nombres deben ser exactos: los comodines no se permiten al borrar)
-DELETE lab01-amarillo
-
-DELETE lab01-reparto
-
-DELETE _data_stream/logs-lab01.reservas-default
-
-GET _cluster/health?filter_path=status
 ```
+
+**Qué hace y por qué:** `_source` con `includes` y `excludes` (se permiten comodines) reduce el tamaño de la respuesta y el tráfico de red. `fields` devuelve los valores tal como están **mapeados**, por ejemplo, fechas normalizadas, y también funciona con runtime fields (Práctica 4). Kibana Discover usa `fields`.
+
+---
+
+### Resultado esperado
+
+- El índice `app-logs-lab` existe, está en estado `green`, tiene los aliases `app-logs` y `app-logs-errores` y contiene **40** documentos.
+
+```http
+GET _cat/indices/app-logs-lab?v&h=index,health,status,docs.count
+GET app-logs-errores/_count
+```
+
+```text
+index        health status docs.count
+app-logs-lab green  open           40
+```
+
+`app-logs-errores/_count` regresa **8**.
+
+- Resumen de resultados de las consultas:
+
+| Paso | Consulta | Resultado |
+|---|---|---|
+| 15 | `match` "timeout" / "base de datos" (OR) / (AND) / `match_phrase` | 3 / 21 / 5 / 5 |
+| 16 | `term` en `log.level` / `log.level.keyword` | 0 / 8 |
+| 17 | `terms` checkout o payment | 16 |
+| 18 | `range` ≥ 1000 ms / de 12:00 a 13:00 | 9 / 8 |
+| 19 | `exists user.name` / `wildcard *ez` | 29 / 13 |
+| 20 | `bool` must + filter | 2 |
+| 21 | `bool` filter + must_not | 7 |
+| 22 | `should` con / sin `minimum_should_match` | 3 / 9 |
+| 23 | `should` con boost | 7 (el ERROR primero) |
+| 24 | consulta operativa completa | 6 |
+
+- Puedes explicar con tus palabras cuándo usar `must`, `filter`, `should` y `must_not`, y por qué en el análisis de logs predominan `filter` y `must_not`.
+
+### Referencias
+
+- Elastic. *Index APIs [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/indices.html
+- Elastic. *Document APIs y Bulk API [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/docs-bulk.html
+- Elastic. *Boolean query [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/query-dsl-bool-query.html
+- Elastic. *Query and filter context [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/query-filter-context.html
+- Elastic. *Paginate search results [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/paginate-search-results.html

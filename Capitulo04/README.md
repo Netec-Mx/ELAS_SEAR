@@ -1,1394 +1,592 @@
-# Crear, probar y depurar un pipeline para logs JSON y no estructurados
+# Administración de Elasticsearch para gestión y análisis de logs
 
-## Metadatos
+## Práctica 4. Diseñar mappings y templates para logs de aplicación y validarlos con la API de simulación
 
-| Propiedad | Valor |
-|---|---|
-| Duración | 110 minutos |
-| Complejidad | Difícil |
-| Nivel de Bloom | Crear |
+### Objetivo
 
-## Descripción general
+Al finalizar la práctica, serás capaz de:
 
-En esta práctica se creará el pipeline de ingestión `logs-acme-api-v1` en Elasticsearch 9.3.0 para procesar eventos de una API de ACME. El pipeline distinguirá entre eventos JSON serializados en `message` y líneas no estructuradas, preservará el contenido original en `event.original`, y normalizará los datos hacia campos ECS.
+- Definir mappings explícitos con los tipos de campo adecuados para logs: `keyword`, `text`, `date`, `ip`, `long`, `boolean`, multi-fields y `flattened`.
+- Probar analizadores con la API `_analyze` y crear un analizador personalizado para mensajes en español.
+- Usar dynamic templates y runtime fields, y prevenir el *mapping explosion*.
+- Construir component templates e index templates componibles, y comprobar su prioridad y precedencia con la API de simulación.
+- Corregir un mapping mediante la Reindex API y un cambio atómico de alias.
 
-También se usarán `dissect`, `grok`, `date`, `set`, `rename`, `remove` y `convert`, junto con rutas `on_failure`, etiquetas de error y campos de diagnóstico. Finalmente, se validará el pipeline con la API `_simulate` e indexarán eventos en el data stream `logs-acme.api-default`.
+### Objetivo visual
 
-## Objetivos de aprendizaje
+![Composición de templates y reindexación](img/cap04.png)
 
-Al finalizar la práctica, podrá:
+### Duración aproximada
 
-- [ ] Crear un pipeline de ingestión versionado y reutilizable para logs JSON y texto no estructurado.
-- [ ] Aplicar `dissect` a formatos estables y `grok` a excepciones o formatos variables.
-- [ ] Normalizar fechas, tipos numéricos y nombres de campos hacia ECS.
-- [ ] Usar `_simulate` con ejecución detallada para inspeccionar resultados y depurar errores.
-- [ ] Indexar eventos procesados y eventos con fallos controlados en `logs-acme.api-default`.
+- 65 minutos.
 
-## Prerrequisitos
+### Prerrequisitos
 
-### Conocimientos
+- Práctica 3 completada: índice `app-logs-lab` con 40 documentos y los aliases `app-logs` y `app-logs-errores`.
+- Kibana > Dev Tools abierto.
 
-- Prácticas 1, 2 y 3 completadas.
-- Uso básico de `curl`, JSON y Elasticsearch Query DSL.
-- Comprensión de campos ECS, data streams e ingest pipelines.
-- Comprensión básica de expresiones regulares y patrones `grok`.
-- Conocimiento de la diferencia entre el timestamp de ingestión y el timestamp original del evento.
+---
 
-### Acceso y estado requerido
+### Instrucciones
 
-Debe disponer de:
+**Escenario:** en la Práctica 3 el mapping dinámico generó tipos poco adecuados: `source.ip` quedó como texto, `log.level` y `service.name` como `text` con subcampo `keyword`, y la búsqueda de `pedido` no encontró `pedidos`. Diseñarás un mapping correcto, lo empaquetarás en templates reutilizables, lo validarás con la API de simulación y migrarás los datos sin interrumpir a los usuarios del alias `app-logs`.
 
-- Elasticsearch 9.3.0 disponible en `http://localhost:9201`.
-- Kibana 9.3.0 disponible en `http://localhost:5602`.
-- Data stream existente: `logs-acme.api-default`.
-- Template existente: `logs-acme-api-template`.
-- Directorio de trabajo obligatorio: `/opt/elastic-labs`.
-- Archivo `/opt/elastic-labs/.env` con permisos `0600`.
-- Credenciales de laboratorio definidas mediante las variables `ELASTIC_USER` y `ELASTIC_PASSWORD`.
+---
 
-> **Importante:** esta práctica amplía los mappings y el data stream creados anteriormente. No elimine índices, templates, data streams ni volúmenes persistentes.
+### Tarea 1. Mappings explícitos y tipos de campo para logs
 
-## Entorno de laboratorio
+#### Paso 1. Revisa los problemas del mapping dinámico
 
-### Componentes utilizados
-
-| Componente | Valor |
-|---|---|
-| Elasticsearch objetivo | 9.3.0 |
-| Contenedor Elasticsearch | `es930-lab` |
-| Kibana objetivo | 9.3.0 |
-| Contenedor Kibana | `kibana930-lab` |
-| Endpoint Elasticsearch | `http://localhost:9201` |
-| Endpoint Kibana | `http://localhost:5602` |
-| Cluster | `es930-lab-cluster` |
-| Data stream | `logs-acme.api-default` |
-| Pipeline | `logs-acme-api-v1` |
-| Directorio de evidencias | `/opt/elastic-labs/work` |
-
-### Preparación inicial
-
-**Objetivo:** comprobar que Elasticsearch 9.3.0, el data stream y el entorno de trabajo están disponibles antes de crear el pipeline.
-
-**Instrucciones:**
-
-1. Abra una terminal y acceda al directorio obligatorio del laboratorio.
-
-   ```bash
-   cd /opt/elastic-labs
-   ```
-
-2. Cargue las credenciales del archivo `.env` sin mostrar la contraseña en pantalla.
-
-   ```bash
-   set -a
-   source /opt/elastic-labs/.env
-   set +a
-   ```
-
-3. Compruebe que el archivo de credenciales tiene permisos restrictivos.
-
-   ```bash
-   stat -c '%a %n' /opt/elastic-labs/.env
-   ```
-
-4. Inicie los servicios de Elasticsearch y Kibana 9.3.0 si no están activos.
-
-   ```bash
-   docker compose up -d es930-lab kibana930-lab
-   ```
-
-5. Espere hasta que Elasticsearch responda.
-
-   ```bash
-   until curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-     http://localhost:9201/_cluster/health \
-     | jq -e '.status == "yellow" or .status == "green"' >/dev/null; do
-     echo "Esperando Elasticsearch 9.3.0..."
-     sleep 3
-   done
-   ```
-
-6. Cree el directorio de trabajo para los archivos de la práctica.
-
-   ```bash
-   mkdir -p /opt/elastic-labs/work
-   ```
-
-7. Verifique el cluster, el data stream y el template creados en la práctica anterior.
-
-   ```bash
-   curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-     http://localhost:9201/ \
-     | jq '{cluster_name, version: .version.number, tagline}'
-
-   curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-     http://localhost:9201/_data_stream/logs-acme.api-default \
-     | jq '.data_streams[] | {name, generation, status, template}'
-
-   curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-     http://localhost:9201/_index_template/logs-acme-api-template \
-     | jq '.index_templates[].name'
-   ```
-
-**Salida esperada:**
-
-- El archivo `.env` muestra permisos `600`.
-- El cluster se identifica como `es930-lab-cluster`.
-- La versión de Elasticsearch es `9.3.0`.
-- El data stream `logs-acme.api-default` existe.
-- El template `logs-acme-api-template` existe.
-
-**Verificación:**
-
-Ejecute:
-
-```bash
-curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-  http://localhost:9201/_cluster/health?pretty
+```http
+GET app-logs-lab/_mapping/field/source.ip,log.level,message,response_time_ms
 ```
 
-El estado debe ser `yellow` o `green`. En un cluster de un solo nodo, `yellow` puede ser normal si existen réplicas no asignadas.
+**Qué hace y por qué:** la API `_mapping/field` muestra el tipo de campos específicos. Verás que `source.ip` y `log.level` son `text` con subcampo `keyword`. Esto causa tres problemas: no se pueden hacer consultas por rango o subred sobre la IP, se ocupa espacio indexando dos veces el nivel de log, y las consultas exactas exigen recordar el sufijo `.keyword`.
 
-## Procedimiento paso a paso
+#### Paso 2. Crea un índice con mapping explícito
 
-### Paso 1. Diseñar la estrategia de normalización
-
-**Objetivo:** definir el comportamiento esperado del pipeline antes de implementarlo.
-
-**Instrucciones:**
-
-1. Revise los dos formatos principales que procesará el pipeline.
-
-   Evento JSON serializado en el campo `message`:
-
-   ```json
-   {
-     "message": "{\"timestamp\":\"2026-08-24T14:35:12Z\",\"level\":\"INFO\",\"service\":\"api-gateway\",\"environment\":\"production\",\"request_id\":\"ab12-json\",\"method\":\"GET\",\"path\":\"/v1/orders\",\"status\":\"200\",\"duration_ms\":\"37\"}"
-   }
-   ```
-
-   Línea de acceso HTTP estable:
-
-   ```text
-   2026-08-24 14:35:12 INFO api-gateway request_id=ab12-access GET /v1/orders 200 37
-   ```
-
-2. Identifique las decisiones de diseño aplicadas:
-
-   | Necesidad | Decisión |
-   |---|---|
-   | Preservar la evidencia original | Copiar `message` a `event.original` antes de procesar. |
-   | Detectar JSON | Ejecutar el procesador `json` únicamente cuando `message` comienza por `{`. |
-   | Procesar accesos HTTP estables | Usar `dissect`, más eficiente para delimitadores fijos. |
-   | Procesar errores de aplicación | Usar `grok`, adecuado para contenido variable como excepciones y mensajes largos. |
-   | Normalizar hora del evento | Usar `date` para escribir la fecha en `@timestamp`. |
-   | Evitar fallos de indexación por timestamps inválidos | Establecer inicialmente `@timestamp` con `_ingest.timestamp`. |
-   | Normalizar tipos | Convertir códigos HTTP y duración a valores numéricos con `convert`. |
-   | Evitar pérdida silenciosa | Usar `on_failure`, `tags`, `error.type` y `error.message`. |
-   | Evitar conflictos de mapping | Eliminar un código HTTP inválido después de registrar su error de conversión. |
-
-3. Tome nota de los campos normalizados que se utilizarán posteriormente en investigaciones:
-
-   ```text
-   @timestamp
-   event.original
-   event.dataset
-   service.name
-   service.environment
-   log.level
-   trace.id
-   http.request.method
-   http.response.status_code
-   url.original
-   event.duration_ms
-   error.type
-   error.message
-   tags
-   ```
-
-**Salida esperada:**
-
-Debe poder distinguir claramente cuándo aplicar `dissect` y cuándo aplicar `grok`:
-
-- `dissect`: formato de acceso HTTP estable.
-- `grok`: errores de aplicación con contenido variable.
-- `json`: mensajes JSON serializados.
-- `on_failure`: valores malformados o patrones que no coinciden.
-
-**Verificación:**
-
-Confirme que el diseño conserva el evento original antes de eliminar `message`. Esto es esencial para la trazabilidad y la depuración posterior.
-
----
-
-### Paso 2. Crear el archivo de definición del pipeline
-
-**Objetivo:** construir un pipeline con normalización, rutas de error y limpieza de campos temporales.
-
-**Instrucciones:**
-
-1. Cree el archivo `/opt/elastic-labs/work/logs-acme-api-v1.json`.
-
-   ```bash
-   cat > /opt/elastic-labs/work/logs-acme-api-v1.json <<'EOF'
-   {
-     "description": "Pipeline v1 para normalizar logs JSON y no estructurados de ACME API",
-     "processors": [
-       {
-         "set": {
-           "field": "@timestamp",
-           "value": "{{{_ingest.timestamp}}}",
-           "override": false,
-           "tag": "set_fallback_ingest_timestamp"
-         }
-       },
-       {
-         "set": {
-           "field": "event.original",
-           "copy_from": "message",
-           "override": false,
-           "if": "ctx.message != null",
-           "tag": "preserve_original_message"
-         }
-       },
-       {
-         "set": {
-           "field": "event.kind",
-           "value": "event",
-           "override": false,
-           "tag": "set_event_kind"
-         }
-       },
-       {
-         "set": {
-           "field": "event.dataset",
-           "value": "acme.api",
-           "override": false,
-           "tag": "set_event_dataset"
-         }
-       },
-       {
-         "set": {
-           "field": "data_stream.type",
-           "value": "logs",
-           "override": false,
-           "tag": "set_data_stream_type"
-         }
-       },
-       {
-         "set": {
-           "field": "data_stream.dataset",
-           "value": "acme.api",
-           "override": false,
-           "tag": "set_data_stream_dataset"
-         }
-       },
-       {
-         "set": {
-           "field": "data_stream.namespace",
-           "value": "default",
-           "override": false,
-           "tag": "set_data_stream_namespace"
-         }
-       },
-       {
-         "json": {
-           "field": "message",
-           "target_field": "_json",
-           "add_to_root": false,
-           "if": "ctx.message != null && ctx.message.trim().startsWith('{')",
-           "tag": "parse_json_message",
-           "on_failure": [
-             {
-               "set": {
-                 "field": "tags",
-                 "value": [
-                   "json_parse_failure"
-                 ],
-                 "tag": "tag_json_parse_failure"
-               }
-             },
-             {
-               "set": {
-                 "field": "error.type",
-                 "value": "json_parse_failure",
-                 "tag": "set_json_error_type"
-               }
-             },
-             {
-               "set": {
-                 "field": "error.message",
-                 "value": "{{{_ingest.on_failure_message}}}",
-                 "tag": "set_json_error_message"
-               }
-             }
-           ]
-         }
-       },
-       {
-         "rename": {
-           "field": "_json.timestamp",
-           "target_field": "log.timestamp",
-           "ignore_missing": true,
-           "override": false,
-           "tag": "rename_json_timestamp"
-         }
-       },
-       {
-         "rename": {
-           "field": "_json.level",
-           "target_field": "log.level",
-           "ignore_missing": true,
-           "override": false,
-           "tag": "rename_json_level"
-         }
-       },
-       {
-         "rename": {
-           "field": "_json.service",
-           "target_field": "service.name",
-           "ignore_missing": true,
-           "override": false,
-           "tag": "rename_json_service"
-         }
-       },
-       {
-         "rename": {
-           "field": "_json.environment",
-           "target_field": "service.environment",
-           "ignore_missing": true,
-           "override": false,
-           "tag": "rename_json_environment"
-         }
-       },
-       {
-         "rename": {
-           "field": "_json.request_id",
-           "target_field": "trace.id",
-           "ignore_missing": true,
-           "override": false,
-           "tag": "rename_json_request_id"
-         }
-       },
-       {
-         "rename": {
-           "field": "_json.method",
-           "target_field": "http.request.method",
-           "ignore_missing": true,
-           "override": false,
-           "tag": "rename_json_method"
-         }
-       },
-       {
-         "rename": {
-           "field": "_json.path",
-           "target_field": "url.original",
-           "ignore_missing": true,
-           "override": false,
-           "tag": "rename_json_path"
-         }
-       },
-       {
-         "rename": {
-           "field": "_json.status",
-           "target_field": "http.response.status_code",
-           "ignore_missing": true,
-           "override": false,
-           "tag": "rename_json_status"
-         }
-       },
-       {
-         "rename": {
-           "field": "_json.duration_ms",
-           "target_field": "event.duration_ms",
-           "ignore_missing": true,
-           "override": false,
-           "tag": "rename_json_duration"
-         }
-       },
-       {
-         "rename": {
-           "field": "_json.error",
-           "target_field": "error.message",
-           "ignore_missing": true,
-           "override": false,
-           "tag": "rename_json_error"
-         }
-       },
-       {
-         "dissect": {
-           "field": "message",
-           "pattern": "%{log.timestamp} %{log.level} %{service.name} request_id=%{trace.id} %{http.request.method} %{url.original} %{http.response.status_code} %{event.duration_ms}",
-           "if": "ctx.message != null && !ctx.message.trim().startsWith('{') && ctx.message.contains('request_id=') && !ctx.message.contains(' exception=')",
-           "tag": "dissect_http_access",
-           "on_failure": [
-             {
-               "set": {
-                 "field": "tags",
-                 "value": [
-                   "dissect_parse_failure"
-                 ],
-                 "tag": "tag_dissect_failure"
-               }
-             },
-             {
-               "set": {
-                 "field": "error.type",
-                 "value": "dissect_parse_failure",
-                 "tag": "set_dissect_error_type"
-               }
-             },
-             {
-               "set": {
-                 "field": "error.message",
-                 "value": "{{{_ingest.on_failure_message}}}",
-                 "tag": "set_dissect_error_message"
-               }
-             }
-           ]
-         }
-       },
-       {
-         "grok": {
-           "field": "message",
-           "patterns": [
-             "%{TIMESTAMP_ISO8601:log.timestamp} %{LOGLEVEL:log.level} %{DATA:service.name} request_id=%{NOTSPACE:trace.id} exception=%{DATA:error.type} message=%{GREEDYDATA:error.message}"
-           ],
-           "trace_match": true,
-           "if": "ctx.message != null && !ctx.message.trim().startsWith('{') && ctx.message.contains(' exception=')",
-           "tag": "grok_application_error",
-           "on_failure": [
-             {
-               "set": {
-                 "field": "tags",
-                 "value": [
-                   "grok_parse_failure"
-                 ],
-                 "tag": "tag_grok_failure"
-               }
-             },
-             {
-               "set": {
-                 "field": "error.type",
-                 "value": "grok_parse_failure",
-                 "tag": "set_grok_error_type"
-               }
-             },
-             {
-               "set": {
-                 "field": "error.message",
-                 "value": "{{{_ingest.on_failure_message}}}",
-                 "tag": "set_grok_error_message"
-               }
-             }
-           ]
-         }
-       },
-       {
-         "set": {
-           "field": "service.name",
-           "value": "acme-api",
-           "override": false,
-           "tag": "set_default_service"
-         }
-       },
-       {
-         "set": {
-           "field": "service.environment",
-           "value": "production",
-           "override": false,
-           "tag": "set_default_environment"
-         }
-       },
-       {
-         "date": {
-           "field": "log.timestamp",
-           "target_field": "@timestamp",
-           "formats": [
-             "yyyy-MM-dd HH:mm:ss",
-             "ISO8601"
-           ],
-           "timezone": "UTC",
-           "if": "ctx.log != null && ctx.log.timestamp != null",
-           "tag": "normalize_event_timestamp",
-           "on_failure": [
-             {
-               "set": {
-                 "field": "tags",
-                 "value": [
-                   "date_parse_failure"
-                 ],
-                 "tag": "tag_date_failure"
-               }
-             },
-             {
-               "set": {
-                 "field": "error.type",
-                 "value": "date_parse_failure",
-                 "tag": "set_date_error_type"
-               }
-             },
-             {
-               "set": {
-                 "field": "error.message",
-                 "value": "{{{_ingest.on_failure_message}}}",
-                 "tag": "set_date_error_message"
-               }
-             }
-           ]
-         }
-       },
-       {
-         "convert": {
-           "field": "http.response.status_code",
-           "type": "long",
-           "ignore_missing": true,
-           "tag": "convert_http_status",
-           "on_failure": [
-             {
-               "set": {
-                 "field": "tags",
-                 "value": [
-                   "status_code_conversion_failure"
-                 ],
-                 "tag": "tag_status_conversion_failure"
-               }
-             },
-             {
-               "set": {
-                 "field": "error.type",
-                 "value": "status_code_conversion_failure",
-                 "tag": "set_status_conversion_error_type"
-               }
-             },
-             {
-               "set": {
-                 "field": "error.message",
-                 "value": "{{{_ingest.on_failure_message}}}",
-                 "tag": "set_status_conversion_error_message"
-               }
-             },
-             {
-               "remove": {
-                 "field": "http.response.status_code",
-                 "ignore_missing": true,
-                 "tag": "remove_invalid_status_code"
-               }
-             }
-           ]
-         }
-       },
-       {
-         "convert": {
-           "field": "event.duration_ms",
-           "type": "long",
-           "ignore_missing": true,
-           "tag": "convert_duration_ms",
-           "on_failure": [
-             {
-               "set": {
-                 "field": "tags",
-                 "value": [
-                   "duration_conversion_failure"
-                 ],
-                 "tag": "tag_duration_conversion_failure"
-               }
-             },
-             {
-               "set": {
-                 "field": "error.type",
-                 "value": "duration_conversion_failure",
-                 "tag": "set_duration_conversion_error_type"
-               }
-             },
-             {
-               "set": {
-                 "field": "error.message",
-                 "value": "{{{_ingest.on_failure_message}}}",
-                 "tag": "set_duration_conversion_error_message"
-               }
-             },
-             {
-               "remove": {
-                 "field": "event.duration_ms",
-                 "ignore_missing": true,
-                 "tag": "remove_invalid_duration"
-               }
-             }
-           ]
-         }
-       },
-       {
-         "set": {
-           "field": "tags",
-           "value": [
-             "unparsed_log"
-           ],
-           "if": "ctx.message != null && (ctx.log == null || ctx.log.timestamp == null) && (ctx.error == null || ctx.error.type == null)",
-           "tag": "tag_unparsed_log"
-         }
-       },
-       {
-         "set": {
-           "field": "error.type",
-           "value": "unparsed_log",
-           "if": "ctx.message != null && (ctx.log == null || ctx.log.timestamp == null) && (ctx.error == null || ctx.error.type == null)",
-           "tag": "set_unparsed_error_type"
-         }
-       },
-       {
-         "set": {
-           "field": "error.message",
-           "value": "La línea no coincide con los formatos JSON, acceso HTTP o error de aplicación esperados.",
-           "if": "ctx.message != null && (ctx.log == null || ctx.log.timestamp == null) && (ctx.error == null || ctx.error.type == null)",
-           "tag": "set_unparsed_error_message"
-         }
-       },
-       {
-         "remove": {
-           "field": "_json",
-           "ignore_missing": true,
-           "tag": "remove_json_temporary_object"
-         }
-       },
-       {
-         "remove": {
-           "field": "log.timestamp",
-           "ignore_missing": true,
-           "if": "ctx.log != null && ctx.log.timestamp != null && (ctx.error == null || ctx.error.type != 'date_parse_failure')",
-           "tag": "remove_normalized_timestamp_source"
-         }
-       },
-       {
-         "remove": {
-           "field": "message",
-           "ignore_missing": true,
-           "tag": "remove_processed_message"
-         }
-       }
-     ],
-     "on_failure": [
-       {
-         "set": {
-           "field": "tags",
-           "value": [
-             "pipeline_unhandled_failure"
-           ],
-           "tag": "tag_pipeline_failure"
-         }
-       },
-       {
-         "set": {
-           "field": "error.type",
-           "value": "pipeline_unhandled_failure",
-           "tag": "set_pipeline_error_type"
-         }
-       },
-       {
-         "set": {
-           "field": "error.message",
-           "value": "{{{_ingest.on_failure_message}}}",
-           "tag": "set_pipeline_error_message"
-         }
-       }
-     ]
-   }
-   EOF
-   ```
-
-2. Valide localmente que el archivo contiene JSON correcto.
-
-   ```bash
-   jq empty /opt/elastic-labs/work/logs-acme-api-v1.json
-   ```
-
-3. Revise los nombres de procesadores y sus etiquetas de depuración.
-
-   ```bash
-   jq -r '.processors[] | keys[0] as $p | .[$p].tag // "sin-tag" | "\($p): \(.)"' \
-     /opt/elastic-labs/work/logs-acme-api-v1.json
-   ```
-
-**Salida esperada:**
-
-El comando `jq empty` no debe mostrar errores. El segundo comando debe listar procesadores como `set`, `json`, `dissect`, `grok`, `date`, `convert`, `rename` y `remove`.
-
-**Verificación:**
-
-Compruebe que el pipeline:
-
-- Copia `message` en `event.original`.
-- Usa `dissect` para accesos HTTP.
-- Usa `grok` para líneas con `exception=`.
-- Conserva un `@timestamp` válido ante una fecha inválida.
-- Elimina `http.response.status_code` si no puede convertirse a `long`.
-- Elimina `message` solamente después de preservar su contenido original.
-
----
-
-### Paso 3. Crear el pipeline en Elasticsearch
-
-**Objetivo:** cargar la definición del pipeline en Elasticsearch 9.3.0.
-
-**Instrucciones:**
-
-1. Cree o actualice el pipeline mediante la Ingest API.
-
-   ```bash
-   curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-     -H 'Content-Type: application/json' \
-     -X PUT \
-     http://localhost:9201/_ingest/pipeline/logs-acme-api-v1 \
-     --data-binary @/opt/elastic-labs/work/logs-acme-api-v1.json \
-     | jq .
-   ```
-
-2. Recupere el pipeline desde Elasticsearch y guarde una evidencia.
-
-   ```bash
-   curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-     http://localhost:9201/_ingest/pipeline/logs-acme-api-v1 \
-     | tee /opt/elastic-labs/work/evidencia-pipeline-creado.json \
-     | jq '{pipeline_id: keys[0], description: .["logs-acme-api-v1"].description}'
-   ```
-
-3. Consulte las estadísticas de ingestión iniciales.
-
-   ```bash
-   curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-     http://localhost:9201/_nodes/stats/ingest?filter_path=nodes.*.ingest.pipelines.logs-acme-api-v1 \
-     | jq .
-   ```
-
-**Salida esperada:**
-
-La creación devuelve:
-
-```json
+```http
+PUT mapping-demo
 {
-  "acknowledged": true
-}
-```
-
-La consulta posterior debe devolver el pipeline `logs-acme-api-v1` con su descripción.
-
-**Verificación:**
-
-Ejecute:
-
-```bash
-curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-  http://localhost:9201/_ingest/pipeline/logs-acme-api-v1 \
-  | jq 'has("logs-acme-api-v1")'
-```
-
-El resultado debe ser:
-
-```json
-true
-```
-
----
-
-### Paso 4. Simular seis escenarios de procesamiento
-
-**Objetivo:** validar el pipeline sin indexar documentos y observar el comportamiento de éxito y fallo controlado.
-
-**Instrucciones:**
-
-1. Cree un archivo de simulación con seis casos.
-
-   ```bash
-   cat > /opt/elastic-labs/work/simulate-logs-acme-api-v1.json <<'EOF'
-   {
-     "docs": [
-       {
-         "_id": "sim-json-valido",
-         "_source": {
-           "message": "{\"timestamp\":\"2026-08-24T14:35:12Z\",\"level\":\"INFO\",\"service\":\"api-gateway\",\"environment\":\"production\",\"request_id\":\"ab12-json\",\"method\":\"GET\",\"path\":\"/v1/orders\",\"status\":\"200\",\"duration_ms\":\"37\"}"
-         }
-       },
-       {
-         "_id": "sim-acceso-http",
-         "_source": {
-           "message": "2026-08-24 14:36:02 INFO api-gateway request_id=ab12-access POST /v1/orders 201 52"
-         }
-       },
-       {
-         "_id": "sim-error-aplicacion",
-         "_source": {
-           "message": "2026-08-24 14:37:18 ERROR orders-api request_id=ab12-error exception=IllegalStateException message=Order cannot be confirmed because payment is pending"
-         }
-       },
-       {
-         "_id": "sim-timestamp-invalido",
-         "_source": {
-           "message": "2026-99-99 25:99:99 INFO api-gateway request_id=ab12-date GET /v1/health 200 3"
-         }
-       },
-       {
-         "_id": "sim-status-invalido",
-         "_source": {
-           "message": "2026-08-24 14:39:44 WARN api-gateway request_id=ab12-status GET /v1/orders ABC 44"
-         }
-       },
-       {
-         "_id": "sim-linea-no-coincide",
-         "_source": {
-           "message": "socket peer closed unexpectedly after receiving incomplete payload"
-         }
-       }
-     ]
-   }
-   EOF
-   ```
-
-2. Ejecute `_simulate` con `verbose=true` para obtener resultados intermedios de todos los procesadores.
-
-   ```bash
-   curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-     -H 'Content-Type: application/json' \
-     -X POST \
-     'http://localhost:9201/_ingest/pipeline/logs-acme-api-v1/_simulate?verbose=true' \
-     --data-binary @/opt/elastic-labs/work/simulate-logs-acme-api-v1.json \
-     | tee /opt/elastic-labs/work/evidencia-simulate-verbose.json \
-     | jq '.docs[] | {id: .doc._id, final_source: .doc._source}'
-   ```
-
-3. Obtenga un resumen compacto de los campos relevantes de los seis documentos simulados.
-
-   ```bash
-   jq '
-     .docs[] |
-     {
-       id: .doc._id,
-       timestamp: .doc._source["@timestamp"],
-       original: .doc._source.event.original,
-       service: .doc._source.service.name,
-       level: .doc._source.log.level,
-       method: .doc._source.http.request.method,
-       status: .doc._source.http.response.status_code,
-       duration_ms: .doc._source.event.duration_ms,
-       error_type: .doc._source.error.type,
-       error_message: .doc._source.error.message,
-       tags: .doc._source.tags
-     }
-   ' /opt/elastic-labs/work/evidencia-simulate-verbose.json
-   ```
-
-4. Inspeccione, específicamente, los pasos ejecutados para el documento de error de aplicación.
-
-   ```bash
-   jq '
-     .docs[2].processor_results[]
-     | {
-         processor: .processor_type,
-         tag: .tag,
-         status: (if .error then "error" else "ok" end)
-       }
-   ' /opt/elastic-labs/work/evidencia-simulate-verbose.json
-   ```
-
-**Salida esperada:**
-
-| Caso | Resultado esperado |
-|---|---|
-| JSON válido | Campos JSON normalizados, `@timestamp` igual al timestamp del evento, código HTTP `200` como número. |
-| Acceso HTTP | `dissect` extrae método, URL, código `201`, duración `52` y `trace.id`. |
-| Error de aplicación | `grok` extrae `IllegalStateException` en `error.type` y el detalle en `error.message`. |
-| Timestamp inválido | Se conserva el timestamp de ingestión en `@timestamp`; aparecen `date_parse_failure` y detalles en `error`. |
-| Código HTTP inválido | Aparece `status_code_conversion_failure`; el campo HTTP inválido se elimina para evitar conflicto de mapping. |
-| Línea no coincidente | Aparecen `unparsed_log`, `error.type: unparsed_log` y `event.original`. |
-
-**Verificación:**
-
-Compruebe que todos los documentos incluyen `event.original`:
-
-```bash
-jq -r '.docs[] | [.doc._id, (.doc._source.event.original != null)] | @tsv' \
-  /opt/elastic-labs/work/evidencia-simulate-verbose.json
-```
-
-Todos los valores de la segunda columna deben ser `true`.
-
----
-
-### Paso 5. Analizar los resultados de depuración
-
-**Objetivo:** interpretar la simulación detallada y confirmar que los fallos son controlados.
-
-**Instrucciones:**
-
-1. Revise el documento de timestamp inválido.
-
-   ```bash
-   jq '
-     .docs[]
-     | select(.doc._id == "sim-timestamp-invalido")
-     | .doc._source
-     | {
-         "@timestamp": .["@timestamp"],
-         log,
-         error,
-         tags,
-         event
-       }
-   ' /opt/elastic-labs/work/evidencia-simulate-verbose.json
-   ```
-
-2. Revise el documento con código HTTP inválido.
-
-   ```bash
-   jq '
-     .docs[]
-     | select(.doc._id == "sim-status-invalido")
-     | .doc._source
-     | {
-         http,
-         error,
-         tags,
-         event
-       }
-   ' /opt/elastic-labs/work/evidencia-simulate-verbose.json
-   ```
-
-3. Revise el documento que no coincide con ningún patrón.
-
-   ```bash
-   jq '
-     .docs[]
-     | select(.doc._id == "sim-linea-no-coincide")
-     | .doc._source
-     | {
-         "@timestamp": .["@timestamp"],
-         event,
-         error,
-         tags,
-         service
-       }
-   ' /opt/elastic-labs/work/evidencia-simulate-verbose.json
-   ```
-
-4. Explique en sus notas técnicas por qué el pipeline no descarta estos documentos:
-
-   - Los errores de fecha no bloquean la indexación porque `@timestamp` tiene un valor inicial de `_ingest.timestamp`.
-   - Los códigos HTTP inválidos se eliminan después de registrar la falla; de este modo, un texto como `ABC` no intenta indexarse en un campo `long`.
-   - Las líneas no reconocidas conservan `event.original` y reciben etiquetas de diagnóstico.
-   - El operador puede buscar posteriormente documentos con `tags` o `error.type` para investigar problemas de formato.
-
-**Salida esperada:**
-
-Los documentos problemáticos contienen evidencia suficiente para investigación y no se silencian mediante `ignore_failure` sin contexto.
-
-**Verificación:**
-
-El caso de código HTTP inválido no debe contener `http.response.status_code`:
-
-```bash
-jq '
-  .docs[]
-  | select(.doc._id == "sim-status-invalido")
-  | .doc._source.http.response.status_code
-' /opt/elastic-labs/work/evidencia-simulate-verbose.json
-```
-
-La salida esperada es `null`.
-
----
-
-### Paso 6. Indexar los eventos procesados en el data stream
-
-**Objetivo:** enviar eventos reales al data stream usando explícitamente el pipeline creado.
-
-**Instrucciones:**
-
-1. Indexe los seis eventos usando el parámetro `pipeline=logs-acme-api-v1`.
-
-   ```bash
-   curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-     -H 'Content-Type: application/json' \
-     -X POST \
-     'http://localhost:9201/logs-acme.api-default/_doc/lab04-json-valido?pipeline=logs-acme-api-v1' \
-     -d '{
-       "message": "{\"timestamp\":\"2026-08-24T14:35:12Z\",\"level\":\"INFO\",\"service\":\"api-gateway\",\"environment\":\"production\",\"request_id\":\"lab04-json\",\"method\":\"GET\",\"path\":\"/v1/orders\",\"status\":\"200\",\"duration_ms\":\"37\"}"
-     }' | jq .
-
-   curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-     -H 'Content-Type: application/json' \
-     -X POST \
-     'http://localhost:9201/logs-acme.api-default/_doc/lab04-acceso-http?pipeline=logs-acme-api-v1' \
-     -d '{
-       "message": "2026-08-24 14:36:02 INFO api-gateway request_id=lab04-access POST /v1/orders 201 52"
-     }' | jq .
-
-   curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-     -H 'Content-Type: application/json' \
-     -X POST \
-     'http://localhost:9201/logs-acme.api-default/_doc/lab04-error-aplicacion?pipeline=logs-acme-api-v1' \
-     -d '{
-       "message": "2026-08-24 14:37:18 ERROR orders-api request_id=lab04-error exception=IllegalStateException message=Order cannot be confirmed because payment is pending"
-     }' | jq .
-
-   curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-     -H 'Content-Type: application/json' \
-     -X POST \
-     'http://localhost:9201/logs-acme.api-default/_doc/lab04-timestamp-invalido?pipeline=logs-acme-api-v1' \
-     -d '{
-       "message": "2026-99-99 25:99:99 INFO api-gateway request_id=lab04-date GET /v1/health 200 3"
-     }' | jq .
-
-   curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-     -H 'Content-Type: application/json' \
-     -X POST \
-     'http://localhost:9201/logs-acme.api-default/_doc/lab04-status-invalido?pipeline=logs-acme-api-v1' \
-     -d '{
-       "message": "2026-08-24 14:39:44 WARN api-gateway request_id=lab04-status GET /v1/orders ABC 44"
-     }' | jq .
-
-   curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-     -H 'Content-Type: application/json' \
-     -X POST \
-     'http://localhost:9201/logs-acme.api-default/_doc/lab04-linea-no-coincide?pipeline=logs-acme-api-v1' \
-     -d '{
-       "message": "socket peer closed unexpectedly after receiving incomplete payload"
-     }' | jq .
-   ```
-
-2. Fuerce una actualización de visibilidad para las búsquedas.
-
-   ```bash
-   curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-     -X POST \
-     'http://localhost:9201/logs-acme.api-default/_refresh' \
-     | jq .
-   ```
-
-3. Consulte los seis documentos indexados.
-
-   ```bash
-   curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-     -H 'Content-Type: application/json' \
-     -X POST \
-     'http://localhost:9201/logs-acme.api-default/_search' \
-     -d '{
-       "size": 10,
-       "sort": [
-         {
-           "_id": "asc"
-         }
-       ],
-       "query": {
-         "prefix": {
-           "_id": "lab04-"
-         }
-       },
-       "_source": [
-         "@timestamp",
-         "event.original",
-         "event.dataset",
-         "service.name",
-         "service.environment",
-         "log.level",
-         "trace.id",
-         "http.request.method",
-         "http.response.status_code",
-         "url.original",
-         "event.duration_ms",
-         "error.type",
-         "error.message",
-         "tags"
-       ]
-     }' \
-     | tee /opt/elastic-labs/work/evidencia-documentos-indexados.json \
-     | jq '.hits.hits[] | {_id, _source}'
-   ```
-
-**Salida esperada:**
-
-Cada operación de indexación debe devolver una respuesta con:
-
-```json
-{
-  "result": "created"
-}
-```
-
-La búsqueda debe devolver seis documentos con identificadores que empiezan por `lab04-`.
-
-**Verificación:**
-
-Ejecute:
-
-```bash
-jq '.hits.total.value' /opt/elastic-labs/work/evidencia-documentos-indexados.json
-```
-
-El valor esperado es:
-
-```text
-6
-```
-
----
-
-## Validación y pruebas
-
-### Validación mediante Elasticsearch Query DSL
-
-**Objetivo:** comprobar que los eventos normalizados y los fallos controlados pueden investigarse desde Elasticsearch.
-
-1. Consulte eventos HTTP exitosos con código 2xx.
-
-   ```bash
-   curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-     -H 'Content-Type: application/json' \
-     -X POST \
-     'http://localhost:9201/logs-acme.api-default/_search' \
-     -d '{
-       "query": {
-         "range": {
-           "http.response.status_code": {
-             "gte": 200,
-             "lt": 300
-           }
-         }
-       },
-       "aggs": {
-         "por_metodo": {
-           "terms": {
-             "field": "http.request.method"
-           }
-         }
-       }
-     }' \
-     | jq '{total: .hits.total.value, por_metodo: .aggregations.por_metodo.buckets}'
-   ```
-
-2. Consulte todos los documentos con errores de parsing o conversión.
-
-   ```bash
-   curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-     -H 'Content-Type: application/json' \
-     -X POST \
-     'http://localhost:9201/logs-acme.api-default/_search' \
-     -d '{
-       "query": {
-         "exists": {
-           "field": "error.type"
-         }
-       },
-       "_source": [
-         "@timestamp",
-         "event.original",
-         "error.type",
-         "error.message",
-         "tags"
-       ]
-     }' \
-     | jq '.hits.hits[] | ._source'
-   ```
-
-### Validación mediante KQL en Kibana
-
-**Objetivo:** verificar visualmente los resultados en Discover.
-
-1. Abra Kibana en:
-
-   ```text
-   http://localhost:5602
-   ```
-
-2. Acceda a **Discover**.
-
-3. Seleccione o cree un data view para:
-
-   ```text
-   logs-acme.api-default
-   ```
-
-4. Use `@timestamp` como campo temporal.
-
-5. Amplíe el rango temporal para incluir la fecha de los eventos de prueba, por ejemplo desde el 24 de agosto de 2026 hasta el momento actual.
-
-6. Ejecute las siguientes consultas KQL:
-
-   Eventos con errores controlados:
-
-   ```text
-   error.type: *
-   ```
-
-   Eventos no procesados:
-
-   ```text
-   tags: "unparsed_log"
-   ```
-
-   Errores de conversión HTTP:
-
-   ```text
-   error.type: "status_code_conversion_failure"
-   ```
-
-   Eventos del servicio `api-gateway`:
-
-   ```text
-   service.name: "api-gateway"
-   ```
-
-### Validación mediante ES|QL
-
-**Objetivo:** resumir los resultados operativos del pipeline.
-
-Ejecute desde Kibana Dev Tools o mediante la API de consultas:
-
-```bash
-curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-  -H 'Content-Type: application/json' \
-  -X POST \
-  'http://localhost:9201/_query' \
-  -d '{
-    "query": "FROM logs-acme.api-default | WHERE event.dataset == \"acme.api\" | STATS eventos = COUNT(*) BY error.type | SORT eventos DESC"
-  }' | jq .
-```
-
-La consulta debe mostrar una agrupación para eventos sin error y agrupaciones como:
-
-- `date_parse_failure`
-- `status_code_conversion_failure`
-- `unparsed_log`
-- `IllegalStateException`
-
-### Comprobación de estadísticas del pipeline
-
-Ejecute:
-
-```bash
-curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-  'http://localhost:9201/_nodes/stats/ingest?filter_path=nodes.*.ingest.pipelines.logs-acme-api-v1' \
-  | jq .
-```
-
-Verifique que el contador de ingestión del pipeline aumentó después de la simulación y de la indexación. Documente en su informe técnico:
-
-- Número de documentos procesados.
-- Número de fallos de procesador.
-- Tipo de eventos que generan cada etiqueta de error.
-- Evidencia almacenada en `/opt/elastic-labs/work`.
-
-## Solución de problemas
-
-### Problema 1: la indexación falla con un error de mapping para `http.response.status_code`
-
-**Síntoma:**
-
-La respuesta de indexación contiene un error similar a:
-
-```text
-mapper_parsing_exception
-failed to parse field [http.response.status_code]
-```
-
-**Causa:**
-
-Un valor no numérico, por ejemplo `ABC`, intenta indexarse en un campo definido como `long`. Esto ocurre si el procesador `convert` no tiene una ruta `on_failure` que elimine el valor inválido o si el pipeline no se aplicó realmente durante la indexación.
-
-**Corrección:**
-
-1. Verifique que la petición de indexación incluye:
-
-   ```text
-   ?pipeline=logs-acme-api-v1
-   ```
-
-2. Revise que el bloque `on_failure` del procesador `convert` para `http.response.status_code` contiene un procesador `remove`.
-
-3. Actualice el pipeline si fue modificado:
-
-   ```bash
-   curl -sS -u "$ELASTIC_USER:$ELASTIC_PASSWORD" \
-     -H 'Content-Type: application/json' \
-     -X PUT \
-     http://localhost:9201/_ingest/pipeline/logs-acme-api-v1 \
-     --data-binary @/opt/elastic-labs/work/logs-acme-api-v1.json \
-     | jq .
-   ```
-
-4. Pruebe nuevamente el caso inválido con `_simulate` antes de volver a indexarlo.
-
-### Problema 2: todos los documentos aparecen como `unparsed_log`
-
-**Síntoma:**
-
-Las búsquedas muestran documentos con:
-
-```json
-{
-  "tags": ["unparsed_log"],
-  "error": {
-    "type": "unparsed_log"
+  "settings": { "number_of_shards": 1, "number_of_replicas": 0 },
+  "mappings": {
+    "dynamic": "strict",
+    "properties": {
+      "@timestamp":       { "type": "date" },
+      "service":          { "properties": { "name": { "type": "keyword" } } },
+      "host":             { "properties": { "name": { "type": "keyword" } } },
+      "log":              { "properties": { "level": { "type": "keyword" } } },
+      "message": {
+        "type": "text",
+        "fields": { "raw": { "type": "keyword", "ignore_above": 1024 } }
+      },
+      "source":           { "properties": { "ip": { "type": "ip" } } },
+      "http":             { "properties": { "response": { "properties": { "status_code": { "type": "long" } } } } },
+      "response_time_ms": { "type": "long" },
+      "error":            { "properties": { "handled": { "type": "boolean" } } },
+      "tags":             { "type": "keyword" }
+    }
   }
 }
 ```
 
-incluso para líneas que deberían ser accesos HTTP válidos.
+**Qué hace y por qué:**
 
-**Causa:**
+| Tipo | Campos | Razón |
+|---|---|---|
+| `keyword` | `service.name`, `host.name`, `log.level`, `tags` | Valores exactos y de baja cardinalidad: filtros, agregaciones `terms` y ordenamiento. No se analizan. |
+| `text` | `message` | Texto libre para búsqueda de texto completo; se analiza en tokens. |
+| multi-field `message.raw` | `message` | El mismo valor indexado además como `keyword` para agrupar mensajes idénticos. `ignore_above` evita indexar mensajes enormes, como los stack traces. |
+| `date` | `@timestamp` | Rangos de tiempo, `date_histogram`, ordenamiento. |
+| `ip` | `source.ip` | Consultas por subred (CIDR) y rangos de IP. Ocupa menos espacio que el texto. |
+| `long` | códigos HTTP, latencias | Rangos y métricas (`avg`, `percentiles`). |
+| `boolean` | `error.handled` | Valores verdadero o falso. |
 
-La línea de entrada no coincide exactamente con el patrón `dissect`. `dissect` depende de delimitadores literales y orden fijo. Espacios adicionales, ausencia de `request_id=`, orden distinto de los campos o una URL con espacios provocan que no se extraiga `log.timestamp`.
+`"dynamic": "strict"` rechaza cualquier documento que traiga un campo no declarado. Es la opción más estricta; en el Paso 11 verás alternativas menos rígidas.
 
-**Corrección:**
+#### Paso 3. Prueba la validación del mapping
 
-1. Compare la línea recibida con el patrón configurado:
+```http
+POST mapping-demo/_doc
+{
+  "@timestamp": "2026-10-20T10:00:00-06:00",
+  "service": { "name": "auth-service" },
+  "log": { "level": "WARN" },
+  "message": "Intento de inicio de sesion fallido",
+  "source": { "ip": "148.240.10.20" },
+  "error": { "handled": true }
+}
 
-   ```text
-   %{log.timestamp} %{log.level} %{service.name} request_id=%{trace.id} %{http.request.method} %{url.original} %{http.response.status_code} %{event.duration_ms}
-   ```
+POST mapping-demo/_doc
+{
+  "@timestamp": "2026-10-20T10:01:00-06:00",
+  "source": { "ip": "no-es-una-ip" }
+}
 
-2. Ejecute `_simulate?verbose=true` y revise el procesador con etiqueta `dissect_http_access`.
+POST mapping-demo/_doc
+{
+  "@timestamp": "2026-10-20T10:02:00-06:00",
+  "campo_nuevo": "valor"
+}
+```
 
-3. Si el formato es estable pero cambió, ajuste el patrón `dissect`.
+**Qué hace y por qué:** el primer documento se indexa. El segundo falla con `document_parsing_exception` (causa: `failed to parse field [source.ip] of type [ip]`) porque `no-es-una-ip` no es una IP válida. El tercero falla con `strict_dynamic_mapping_exception` porque `campo_nuevo` no está declarado. Un mapping explícito protege la calidad de los datos. Para no perder eventos con algún campo malformado, existe el parámetro `ignore_malformed: true`: el documento se indexa y el valor inválido se omite del índice.
 
-4. Si el formato tiene variantes reales, cree un patrón alternativo `grok` o una nueva versión del pipeline, por ejemplo `logs-acme-api-v2`, en lugar de modificar sin validación el pipeline usado por producción.
+#### Paso 4. Aprovecha el tipo `ip`
 
-## Limpieza
+```http
+GET mapping-demo/_search
+{
+  "query": { "term": { "source.ip": "148.240.0.0/16" } }
+}
+```
 
-**Objetivo:** conservar el estado requerido para las prácticas posteriores sin eliminar volúmenes, data streams ni evidencias.
+**Qué hace y por qué:** con el tipo `ip`, una consulta `term` acepta notación **CIDR** y encuentra todas las direcciones de la subred `148.240.x.x`. Con un campo de texto esto sería imposible. Es fundamental para el análisis de seguridad, por ejemplo, para buscar todo el tráfico de una red sospechosa.
 
-1. Mantenga los siguientes archivos como evidencia:
+---
 
-   ```text
-   /opt/elastic-labs/work/logs-acme-api-v1.json
-   /opt/elastic-labs/work/simulate-logs-acme-api-v1.json
-   /opt/elastic-labs/work/evidencia-pipeline-creado.json
-   /opt/elastic-labs/work/evidencia-simulate-verbose.json
-   /opt/elastic-labs/work/evidencia-documentos-indexados.json
-   ```
+### Tarea 2. Analizadores y la API `_analyze`
 
-2. No ejecute el siguiente comando:
+Un **analizador** transforma el texto en tokens al indexar y al buscar. Se compone de *character filters* (opcionales), un **tokenizer** y *token filters* (minúsculas, stop words, raíces, etc.).
 
-   ```bash
-   docker compose down -v
-   ```
+#### Paso 5. Compara el analizador `standard` con el analizador `spanish`
 
-   Este comando eliminaría volúmenes persistentes necesarios para la continuidad del laboratorio.
+```http
+POST _analyze
+{
+  "analyzer": "standard",
+  "text": "Timeout al conectar con la Base de Datos de pedidos"
+}
 
-3. Si necesita liberar recursos temporalmente, detenga los contenedores sin borrar volúmenes:
+POST _analyze
+{
+  "analyzer": "spanish",
+  "text": "Timeout al conectar con la Base de Datos de pedidos"
+}
+```
 
-   ```bash
-   docker compose stop es930-lab kibana930-lab
-   ```
+**Qué hace y por qué:** `standard` separa por palabras y convierte a minúsculas: `timeout`, `al`, `conectar`, `con`, `la`, `base`, `de`, `datos`, `de`, `pedidos`. `spanish` además elimina *stop words* (`al`, `con`, `la`, `de`) y reduce las palabras a su raíz (`pedidos` → `pedid`, `conectar` → `conect`). Así, una búsqueda de `pedido` también encuentra `pedidos`.
 
-4. Para continuar en la siguiente práctica, vuelva a iniciarlos:
+#### Paso 6. Arma un analizador a la medida y pruébalo
 
-   ```bash
-   docker compose start es930-lab kibana930-lab
-   ```
+```http
+POST _analyze
+{
+  "tokenizer": "standard",
+  "filter": [
+    "lowercase",
+    "asciifolding",
+    { "type": "stop", "stopwords": "_spanish_" },
+    { "type": "stemmer", "language": "light_spanish" }
+  ],
+  "text": "Sesión expirada: no se pudo actualizar los pedidos del carrito"
+}
+```
 
-> No elimine el pipeline `logs-acme-api-v1` ni los documentos `lab04-*`. Estos eventos serán la fuente principal de consultas e investigaciones en la práctica siguiente.
+**Qué hace y por qué:** `asciifolding` quita acentos (`sesión` → `sesion`). Es importante porque muchos logs se escriben sin acentos y los usuarios buscan con ellos, o al revés. `light_spanish` es un *stemmer* menos agresivo que el del analizador `spanish`, lo que reduce falsos positivos. Probar con `_analyze` antes de crear el índice evita reindexar por un analizador mal diseñado.
 
-## Resumen
+#### Paso 7. Prueba un tokenizer especializado para rutas URL
 
-En esta práctica se creó el pipeline `logs-acme-api-v1` para procesar logs de ACME API en Elasticsearch 9.3.0. El pipeline preserva el contenido original, detecta JSON serializado, procesa accesos HTTP estables con `dissect`, analiza excepciones con `grok`, normaliza fechas con `date` y convierte valores numéricos con `convert`.
+```http
+POST _analyze
+{
+  "tokenizer": "path_hierarchy",
+  "text": "/api/catalog/items/1452"
+}
+```
 
-También se implementaron controles de fallo mediante `on_failure`, etiquetas y campos `error.*`, evitando la pérdida silenciosa de eventos y reduciendo errores de mapping. Los documentos procesados y los documentos con fallos controlados quedaron indexados en `logs-acme.api-default`, listos para investigaciones con Query DSL, KQL y ES|QL.
+**Qué hace y por qué:** `path_hierarchy` genera `/api`, `/api/catalog`, `/api/catalog/items` y `/api/catalog/items/1452`. Permite contar o filtrar logs web por cualquier nivel de la ruta; por ejemplo, todo lo que esté bajo `/api/catalog`.
+
+---
+
+### Tarea 3. Dynamic templates, runtime fields y prevención del mapping explosion
+
+#### Paso 8. Define dynamic templates
+
+```http
+PUT dyn-demo
+{
+  "settings": { "number_of_shards": 1, "number_of_replicas": 0 },
+  "mappings": {
+    "dynamic_templates": [
+      { "ips":         { "path_match": "*.ip", "match_mapping_type": "string", "mapping": { "type": "ip" } } },
+      { "etiquetas":   { "path_match": "labels.*", "match_mapping_type": "string", "mapping": { "type": "keyword" } } },
+      { "cadenas_como_keyword": { "match_mapping_type": "string", "mapping": { "type": "keyword", "ignore_above": 1024 } } }
+    ]
+  }
+}
+
+POST dyn-demo/_doc?refresh=true
+{
+  "client": { "ip": "201.141.20.5" },
+  "labels": { "equipo": "pagos", "region": "centro" },
+  "environment": "produccion",
+  "retries": 3
+}
+
+GET dyn-demo/_mapping
+```
+
+**Qué hace y por qué:** los dynamic templates deciden el tipo de los campos **nuevos** según reglas: por nombre (`match`), por ruta (`path_match`) o por tipo detectado (`match_mapping_type`). Se evalúan **en orden** y gana la primera regla que coincide. El resultado es `client.ip` → `ip`, `labels.*` → `keyword` y `environment` → `keyword` (en lugar de `text` + `keyword`). `retries` no coincide con ninguna regla y queda como `long`. Es el mecanismo que usan las integraciones de Elastic (`ecs@mappings`) para normalizar millones de campos sin declararlos uno por uno.
+
+#### Paso 9. Crea runtime fields en la consulta
+
+```http
+GET app-logs-lab/_search
+{
+  "runtime_mappings": {
+    "response_time_s": {
+      "type": "double",
+      "script": "if (doc['response_time_ms'].size() > 0) { emit(doc['response_time_ms'].value / 1000.0); }"
+    },
+    "status_class": {
+      "type": "keyword",
+      "script": "if (doc['http.response.status_code'].size() > 0) { emit((doc['http.response.status_code'].value / 100) + 'xx'); }"
+    }
+  },
+  "query": { "term": { "status_class": "5xx" } },
+  "fields": ["response_time_s", "status_class", "service.name"],
+  "_source": false
+}
+```
+
+**Qué hace y por qué:** un **runtime field** se calcula al consultar ("schema on read") y no ocupa espacio en el índice. Permite agregar campos sin reindexar, por ejemplo, para corregir o derivar datos de logs ya almacenados. Su costo es que cada consulta ejecuta el script, por lo que conviene volverlo un campo indexado si se usa con frecuencia. La consulta devuelve los 6 eventos 5xx con la latencia en segundos.
+
+#### Paso 10. Extrae datos del mensaje con un runtime field con grok
+
+```http
+GET app-logs-lab/_search
+{
+  "runtime_mappings": {
+    "producto_id": {
+      "type": "keyword",
+      "script": """
+        if (doc['message.keyword'].size() > 0) {
+          def m = grok('%{GREEDYDATA} producto %{NUMBER:id}').extract(doc['message.keyword'].value);
+          if (m != null) { emit(m.id); }
+        }
+      """
+    }
+  },
+  "query": { "exists": { "field": "producto_id" } },
+  "fields": ["producto_id", "message"],
+  "_source": false
+}
+```
+
+**Qué hace y por qué:** `grok` dentro de un runtime field extrae partes de un texto con patrones, aquí el número de producto de los mensajes "Stock bajo para el producto 1452". Las triples comillas `"""` de Console permiten escribir scripts de varias líneas. Es una forma rápida de investigar un dato que no se extrajo al ingerir. En la Práctica 5 harás lo mismo de forma permanente con un ingest pipeline.
+
+#### Paso 11. Provoca y previene un mapping explosion
+
+```http
+PUT explosion-demo
+{
+  "settings": {
+    "number_of_shards": 1, "number_of_replicas": 0,
+    "index.mapping.total_fields.limit": 10
+  }
+}
+
+POST explosion-demo/_doc
+{
+  "a1":"x","a2":"x","a3":"x","a4":"x","a5":"x","a6":"x","a7":"x","a8":"x"
+}
+```
+
+El documento falla con `Limit of total fields [10] has been exceeded`. Ahora corrige el diseño:
+
+```http
+DELETE explosion-demo
+
+PUT explosion-demo
+{
+  "settings": { "number_of_shards": 1, "number_of_replicas": 0, "index.mapping.total_fields.limit": 10 },
+  "mappings": {
+    "properties": {
+      "@timestamp": { "type": "date" },
+      "labels":     { "type": "flattened" }
+    }
+  }
+}
+
+POST explosion-demo/_doc?refresh=true
+{
+  "@timestamp": "2026-10-20T10:00:00-06:00",
+  "labels": { "a1":"x","a2":"x","a3":"x","a4":"x","a5":"x","a6":"x","a7":"x","a8":"x","a9":"x","a10":"x","a11":"x" }
+}
+
+GET explosion-demo/_search
+{ "query": { "term": { "labels.a11": "x" } } }
+```
+
+**Qué hace y por qué:** cada campo nuevo agrega una entrada al mapping, que vive en el *cluster state* y se replica a todos los nodos. Logs con claves arbitrarias (IDs como nombres de campo, encabezados HTTP, etiquetas de contenedores) pueden generar miles de campos y degradar todo el clúster: eso es el **mapping explosion**. Defensas disponibles:
+
+- `index.mapping.total_fields.limit` (1000 por defecto), como límite de seguridad.
+- Tipo `flattened`: todo el objeto ocupa **un solo** campo en el mapping y sus claves siguen siendo consultables como `keyword`.
+- `"dynamic": false`: los campos nuevos se guardan en `_source`, pero no se indexan.
+- `"dynamic": "runtime"`: los campos nuevos se crean como runtime fields.
+- `index.mapping.total_fields.ignore_dynamic_beyond_limit: true`: ignora los campos que exceden el límite en lugar de rechazar el documento.
+
+---
+
+### Tarea 4. Component templates e index templates componibles
+
+Un **index template** define settings, mappings y aliases que se aplican automáticamente al **crear** un índice cuyo nombre coincide con sus `index_patterns`. Los **component templates** son bloques reutilizables que un index template combina con `composed_of`.
+
+#### Paso 12. Crea el component template de configuración base
+
+```http
+PUT _component_template/ct-tienda-base
+{
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0,
+      "refresh_interval": "5s",
+      "index.mapping.total_fields.limit": 500
+    },
+    "mappings": {
+      "dynamic_templates": [
+        { "ips":     { "path_match": "*.ip", "match_mapping_type": "string", "mapping": { "type": "ip" } } },
+        { "cadenas": { "match_mapping_type": "string", "mapping": { "type": "keyword", "ignore_above": 1024 } } }
+      ],
+      "properties": {
+        "@timestamp":       { "type": "date" },
+        "service":          { "properties": { "name": { "type": "keyword" } } },
+        "host":             { "properties": { "name": { "type": "keyword" } } },
+        "log":              { "properties": { "level": { "type": "keyword" } } },
+        "user":             { "properties": { "name": { "type": "keyword" } } },
+        "source":           { "properties": { "ip": { "type": "ip" } } },
+        "http":             { "properties": { "response": { "properties": { "status_code": { "type": "long" } } } } },
+        "response_time_ms": { "type": "long" },
+        "tags":             { "type": "keyword" },
+        "labels":           { "type": "flattened" }
+      },
+      "runtime": {
+        "status_class": {
+          "type": "keyword",
+          "script": "if (doc['http.response.status_code'].size() > 0) { emit((doc['http.response.status_code'].value / 100) + 'xx'); }"
+        }
+      }
+    }
+  },
+  "_meta": { "descripcion": "Settings y campos comunes de logs de la tienda", "version": 1 }
+}
+```
+
+**Qué hace y por qué:** agrupa lo que comparten todos los índices de logs de la tienda: settings, campos ECS con su tipo correcto, dynamic templates y un runtime field. Si mañana cambia una regla, se actualiza **un** component template y todos los index templates que lo usan heredan el cambio en los **nuevos** índices.
+
+#### Paso 13. Crea el component template de análisis de texto
+
+```http
+PUT _component_template/ct-tienda-texto
+{
+  "template": {
+    "settings": {
+      "analysis": {
+        "filter": {
+          "es_stop": { "type": "stop", "stopwords": "_spanish_" },
+          "es_stem": { "type": "stemmer", "language": "light_spanish" }
+        },
+        "analyzer": {
+          "analizador_logs_es": {
+            "type": "custom",
+            "tokenizer": "standard",
+            "filter": ["lowercase", "asciifolding", "es_stop", "es_stem"]
+          }
+        }
+      }
+    },
+    "mappings": {
+      "properties": {
+        "message": {
+          "type": "text",
+          "analyzer": "analizador_logs_es",
+          "fields": { "raw": { "type": "keyword", "ignore_above": 1024 } }
+        }
+      }
+    }
+  }
+}
+```
+
+**Qué hace y por qué:** el analizador y el campo que lo usa se definen en el **mismo** component template, porque cada component template se valida por separado y un mapping no puede referirse a un analizador que no conoce.
+
+#### Paso 14. Crea el index template
+
+```http
+PUT _index_template/it-tienda-logs
+{
+  "index_patterns": ["tienda-logs-*"],
+  "priority": 200,
+  "composed_of": ["ct-tienda-base", "ct-tienda-texto"],
+  "template": {
+    "settings": { "refresh_interval": "2s" },
+    "aliases": { "tienda-logs": {} }
+  },
+  "_meta": { "responsable": "equipo-operaciones" }
+}
+```
+
+**Qué hace y por qué:** el template se aplica a cualquier índice nuevo cuyo nombre empiece con `tienda-logs-`. **Precedencia** al construir el índice, de menor a mayor:
+
+1. Los component templates, en el orden de `composed_of`: un componente posterior sobrescribe a uno anterior.
+2. El bloque `template` del propio index template.
+3. El cuerpo de la petición de creación del índice, si se crea manualmente.
+
+Por eso el `refresh_interval` final será `2s` y no `5s`.
+
+#### Paso 15. Simula el índice resultante antes de crearlo
+
+```http
+POST _index_template/_simulate_index/tienda-logs-2026.10.20
+```
+
+**Qué hace y por qué:** la API de **simulación** devuelve los settings, mappings y aliases que tendría el índice **sin crearlo**. Verifica en la respuesta:
+
+- `settings.index.refresh_interval` = `"2s"` (sobrescrito por el index template).
+- `settings.index.analysis.analyzer.analizador_logs_es` presente.
+- `mappings.properties.source.ip.type` = `"ip"` y `message.analyzer` = `"analizador_logs_es"`.
+- `aliases.tienda-logs`.
+
+Valida siempre un template con `_simulate_index` antes de que lleguen datos reales. Un error en un template de logs se descubre, si no, con el primer rollover a medianoche.
+
+#### Paso 16. Comprueba la prioridad entre templates que se traslapan
+
+```http
+PUT _index_template/it-tienda-logs-pagos
+{
+  "index_patterns": ["tienda-logs-pagos-*"],
+  "priority": 300,
+  "composed_of": ["ct-tienda-base", "ct-tienda-texto"],
+  "template": {
+    "settings": { "refresh_interval": "30s" },
+    "mappings": {
+      "properties": {
+        "payment": { "properties": { "amount": { "type": "scaled_float", "scaling_factor": 100 } } }
+      }
+    }
+  }
+}
+
+POST _index_template/_simulate_index/tienda-logs-pagos-2026.10.20
+```
+
+Ahora intenta crear un template con la **misma prioridad** y patrones que se traslapan:
+
+```http
+PUT _index_template/it-conflicto
+{
+  "index_patterns": ["tienda-logs-*"],
+  "priority": 200,
+  "template": { "settings": { "number_of_replicas": 1 } }
+}
+```
+
+**Qué hace y por qué:** el índice `tienda-logs-pagos-2026.10.20` coincide con **ambos** templates. Elasticsearch aplica **solo uno**, el de mayor `priority` (300); los index templates **no** se mezclan entre sí. En la simulación, el campo `overlapping` lista el template de menor prioridad que fue ignorado. El último `PUT` falla porque dos templates con patrones traslapados no pueden tener la misma prioridad: el resultado sería ambiguo. Una buena convención es usar prioridades separadas por decenas o centenas y documentarlas.
+
+---
+
+### Tarea 5. Cambios de mapping y Reindex API
+
+#### Paso 17. Intenta cambiar el tipo de un campo existente
+
+```http
+PUT app-logs-lab/_mapping
+{
+  "properties": { "source": { "properties": { "ip": { "type": "ip" } } } }
+}
+
+PUT app-logs-lab/_mapping
+{
+  "properties": { "pipeline_version": { "type": "keyword" } }
+}
+```
+
+**Qué hace y por qué:** el primer cambio falla (`mapper [source.ip] cannot be changed from type [text] to [ip]`): el tipo de un campo existente **no** se puede modificar, porque los datos ya están indexados con la estructura anterior. Sí se permiten cambios compatibles, como **agregar** campos nuevos (segundo `PUT`), agregar multi-fields o cambiar `ignore_above`. Para cambiar un tipo hay que crear un índice nuevo y **reindexar**.
+
+#### Paso 18. Reindexa hacia un índice gobernado por el template
+
+```http
+POST _reindex?wait_for_completion=true
+{
+  "source": { "index": "app-logs-lab" },
+  "dest":   { "index": "tienda-logs-2026.10.20", "op_type": "create" }
+}
+
+GET tienda-logs-2026.10.20/_count
+GET tienda-logs-2026.10.20/_mapping/field/source.ip,log.level,environment,message
+```
+
+**Qué hace y por qué:** `_reindex` lee los documentos (`_source`) del índice origen y los indexa en el destino. Como el destino no existe y su nombre coincide con `tienda-logs-*`, se crea **con el template**: `source.ip` es `ip`, `log.level` es `keyword`, `environment` es `keyword` (por el dynamic template) y `message` usa el analizador en español. `op_type: create` evita sobrescribir si el documento ya existía. Para volúmenes grandes se ejecuta con `wait_for_completion=false` y se sigue con la API `_tasks`.
+
+#### Paso 19. Cambia los aliases de forma atómica
+
+```http
+POST _aliases
+{
+  "actions": [
+    { "remove": { "index": "app-logs-lab", "alias": "app-logs" } },
+    { "add":    { "index": "tienda-logs-2026.10.20", "alias": "app-logs" } },
+    { "remove": { "index": "app-logs-lab", "alias": "app-logs-errores" } },
+    { "add":    { "index": "tienda-logs-2026.10.20", "alias": "app-logs-errores",
+                  "filter": { "term": { "log.level": "ERROR" } } } }
+  ]
+}
+
+GET _cat/aliases/app-logs*,tienda-logs?v
+```
+
+**Qué hace y por qué:** quien consulta `app-logs` empieza a leer el nuevo índice **sin cambiar nada** y sin un instante en que el alias no exista, porque todas las acciones se aplican juntas. El filtro del alias de errores ahora usa `log.level` directamente, ya que el campo es `keyword`.
+
+#### Paso 20. Comprueba las mejoras sobre el alias
+
+```http
+GET app-logs/_count
+{ "query": { "match": { "message": "pedido" } } }
+
+GET app-logs/_count
+{ "query": { "term": { "log.level": "ERROR" } } }
+
+GET app-logs/_search
+{
+  "query": { "term": { "source.ip": "89.160.20.0/24" } },
+  "_source": ["user.name", "message", "source.ip"]
+}
+
+GET app-logs/_search
+{
+  "size": 0,
+  "aggs": { "por_clase": { "terms": { "field": "status_class" } } }
+}
+```
+
+**Qué hace y por qué:**
+
+- La búsqueda de `pedido` ahora regresa **9** documentos (en la Práctica 3 eran 7), porque el analizador en español también encuentra `pedidos`.
+- `term log.level: ERROR` regresa **8** sin el sufijo `.keyword`.
+- La consulta CIDR encuentra los **2** intentos de inicio de sesión de la red `89.160.20.0/24` (usuarios `admin` y `root`).
+- La agregación usa el runtime field `status_class` definido en el component template: 28 `2xx`, 6 `4xx` y 6 `5xx`, sin haberlo indexado.
+
+#### Paso 21. Limpia los índices de prueba
+
+```http
+DELETE mapping-demo
+DELETE dyn-demo
+DELETE explosion-demo
+DELETE _index_template/it-tienda-logs-pagos
+```
+
+**Qué hace y por qué:** elimina los objetos que solo sirvieron para experimentar. Conserva `app-logs-lab`, `tienda-logs-2026.10.20`, los component templates y el template `it-tienda-logs`: se usan en prácticas posteriores.
+
+---
+
+### Resultado esperado
+
+- Los component templates `ct-tienda-base` y `ct-tienda-texto` y el index template `it-tienda-logs` existen:
+
+```http
+GET _component_template/ct-tienda-*?filter_path=component_templates.name
+GET _index_template/it-tienda-logs?filter_path=index_templates.name,index_templates.index_template.composed_of
+```
+
+- `POST _index_template/_simulate_index/tienda-logs-2026.10.20` muestra `source.ip` de tipo `ip`, el analizador `analizador_logs_es` y el alias `tienda-logs`.
+- El índice `tienda-logs-2026.10.20` contiene **40** documentos y los aliases `app-logs`, `app-logs-errores` y `tienda-logs` apuntan a él:
+
+```text
+alias            index                  filter
+app-logs         tienda-logs-2026.10.20 -
+app-logs-errores tienda-logs-2026.10.20 *
+tienda-logs      tienda-logs-2026.10.20 -
+```
+
+- Puedes explicar por qué el tipo de un campo no puede cambiarse en sitio, cómo se resuelve con reindex y alias, y cómo se decide qué template se aplica cuando hay traslapes.
+
+### Referencias
+
+- Elastic. *Mapping [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/mapping.html
+- Elastic. *Text analysis [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/analysis.html
+- Elastic. *Dynamic templates [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/dynamic-templates.html
+- Elastic. *Runtime fields [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/runtime.html
+- Elastic. *Index templates y Simulate index API [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/index-templates.html
+- Elastic. *Reindex API [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/docs-reindex.html

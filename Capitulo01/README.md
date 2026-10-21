@@ -1,656 +1,201 @@
 # Administración de Elasticsearch para gestión y análisis de logs
 
-## Práctica 3. Creación de índices, operaciones CRUD con documentos, búsquedas simples y booleanas
+## Práctica 1. Cuestionario de comprobación de conocimientos
 
 ### Objetivo
 
-Al finalizar la práctica, serás capaz de:
-
-- Crear y administrar índices: settings, aliases, cierre y apertura, y eliminación.
-- Ejecutar operaciones CRUD sobre documentos y cargas masivas con la Bulk API.
-- Construir búsquedas con Query DSL: `match`, `match_phrase`, `term`, `terms`, `range`, `exists` y `wildcard`.
-- Combinar condiciones con consultas `bool` y elegir correctamente entre `must`, `filter`, `should` y `must_not`.
-- Ordenar, paginar (`from`/`size`, `search_after` con PIT) y filtrar el `_source` de los resultados.
+Al finalizar la práctica, serás capaz de verificar tu comprensión de los fundamentos del Elastic Stack: motores de búsqueda e índice invertido, gestión centralizada de logs, componentes del stack, cambios relevantes de la serie 8.x y uso de la API REST con JSON, curl y Kibana Dev Tools.
 
 ### Objetivo visual
 
-![Flujo de la práctica: índice, documentos y consultas](img/cap03.png)
+![Componentes del Elastic Stack en una plataforma de logs](img/cap01.png)
 
 ### Duración aproximada
 
-- 50 minutos.
+- 20 minutos.
 
 ### Prerrequisitos
 
-- Práctica 2 completada: Elasticsearch 8.19 en ejecución como servicio y Kibana accesible en `http://localhost:5601`.
-- Archivo `C:\labs\datos\cap03_app_logs.ndjson` (40 eventos de log de una tienda en línea).
+- Haber revisado los temas 1.1 a 1.4 del Capítulo 1.
+- Papel y lápiz, o un editor de texto, para registrar tus respuestas.
+- No se requiere tener instalado Elasticsearch (la instalación se hace en la Práctica 2).
 
 ---
 
 ### Instrucciones
 
-Todas las peticiones de esta práctica se ejecutan en **Kibana > Dev Tools (Console)**, salvo la carga del archivo, que se hace con curl desde PowerShell. Para ejecutar una petición en Console, coloca el cursor sobre ella y presiona `Ctrl + Enter` o haz clic en el triángulo ▶.
-
-**Escenario:** el equipo de operaciones de una tienda en línea necesita un índice para los logs de sus microservicios (`catalog-service`, `cart-service`, `checkout-service`, `payment-service`, `auth-service` e `inventory-service`) y consultas para responder preguntas operativas.
+Esta práctica es individual. Responde primero las 15 preguntas **sin consultar** el material. Después compara tus respuestas con la clave de la sección **Resultado esperado** y lee la justificación de cada una. Las preguntas que falles te indican qué subtema repasar antes de continuar con la Práctica 2.
 
 ---
 
-### Tarea 1. Gestionar índices
+### Tarea 1. Responder el cuestionario
 
-#### Paso 1. Crea el índice con settings explícitos
+En esta tarea contestas preguntas de opción múltiple y de relación. El objetivo no es memorizar, sino confirmar que entiendes **por qué** cada componente existe y qué problema resuelve en una plataforma de logs.
 
-```http
-PUT app-logs-lab
-{
-  "settings": {
-    "number_of_shards": 1,
-    "number_of_replicas": 0,
-    "refresh_interval": "5s"
-  }
-}
-```
+#### Paso 1. Responde las preguntas del tema 1.1: motores de búsqueda, índice invertido y gestión centralizada de logs
 
-**Qué hace y por qué:**
+Elige **una** respuesta por pregunta.
 
-- `number_of_shards: 1`: un volumen pequeño no necesita más shards. Cada shard consume memoria y descriptores de archivo, así que demasiados shards pequeños (*oversharding*) es uno de los problemas más comunes.
-- `number_of_replicas: 0`: el clúster tiene un solo nodo (ver Práctica 2) y así el índice queda `green`.
-- `refresh_interval: 5s`: los documentos se vuelven visibles para la búsqueda cada 5 segundos. El valor por defecto es 1 s; aumentarlo reduce el trabajo de indexación en cargas intensivas de logs.
+**1.** ¿Qué es un índice invertido?
 
-#### Paso 2. Consulta y modifica los settings
+- a) Una copia de seguridad del índice ordenada de forma descendente.
+- b) Una estructura que asocia cada término con la lista de documentos que lo contienen.
+- c) Una tabla relacional con una fila por documento y una columna por palabra.
+- d) Un índice que almacena los documentos en orden cronológico inverso.
 
-```http
-GET app-logs-lab/_settings
+**2.** ¿Cuál es la razón principal para centralizar los logs de muchos servidores en una sola plataforma?
 
-PUT app-logs-lab/_settings
-{
-  "index": { "refresh_interval": "1s" }
-}
+- a) Reducir el tamaño de los archivos de log en cada servidor.
+- b) Poder buscar, correlacionar y analizar eventos de distintas fuentes en un solo lugar y con una misma línea de tiempo.
+- c) Evitar que las aplicaciones escriban logs en disco.
+- d) Sustituir la rotación de logs del sistema operativo.
 
-GET app-logs-lab/_settings?filter_path=*.settings.index.refresh_interval,*.settings.index.number_of_*
-```
+**3.** Un analista busca la palabra `timeout` en millones de líneas de log. ¿Por qué un motor como Elasticsearch responde en milisegundos, mientras que `findstr` o `grep` sobre los archivos tardaría minutos?
 
-**Qué hace y por qué:** algunos settings son **dinámicos** (`refresh_interval`, `number_of_replicas`) y se cambian en caliente; otros son **estáticos** (`number_of_shards`) y solo se definen al crear el índice. `filter_path` reduce la respuesta a los campos que te interesan, algo útil cuando la salida JSON es larga.
+- a) Porque Elasticsearch comprime los archivos de texto.
+- b) Porque Elasticsearch ya analizó el texto al indexarlo y consulta el índice invertido en lugar de leer cada línea.
+- c) Porque Elasticsearch solo guarda las últimas 24 horas de logs.
+- d) Porque Elasticsearch usa una base de datos relacional optimizada.
 
-#### Paso 3. Crea aliases, incluido un alias filtrado
+#### Paso 2. Responde las preguntas del tema 1.2: componentes del Elastic Stack
 
-```http
-POST _aliases
-{
-  "actions": [
-    { "add": { "index": "app-logs-lab", "alias": "app-logs" } },
-    { "add": { "index": "app-logs-lab", "alias": "app-logs-errores",
-               "filter": { "term": { "log.level.keyword": "ERROR" } } } }
-  ]
-}
+**4.** Relaciona cada componente con su función principal (escribe la letra junto al número):
 
-GET _cat/aliases/app-logs*?v
-```
-
-**Qué hace y por qué:** un **alias** es un nombre lógico que apunta a uno o varios índices. Las aplicaciones y los dashboards consultan el alias, y el administrador puede cambiar el índice real sin afectarlos (lo harás en la Práctica 4 con un reindex). El alias **filtrado** `app-logs-errores` aplica siempre una condición, de modo que un equipo puede consultar solo los errores sin escribir el filtro. Todas las acciones de `_aliases` se aplican de forma **atómica**.
-
-#### Paso 4. Cierra y vuelve a abrir el índice
-
-```http
-POST app-logs-lab/_close
-GET _cat/indices/app-logs-lab?v&h=index,status,health
-GET app-logs-lab/_search
-
-POST app-logs-lab/_open
-GET _cat/indices/app-logs-lab?v&h=index,status,health
-```
-
-**Qué hace y por qué:** un índice **cerrado** conserva sus datos en disco, pero no consume memoria ni admite lecturas o escrituras: la búsqueda regresa el error `index_closed_exception`. Cerrar índices era una forma de "archivar" sin borrar, y también es necesario para cambiar ciertos settings estáticos, como los analizadores. En 8.x, para logs históricos se prefieren ILM y las fases cold y frozen (Práctica 10).
-
-#### Paso 5. Comprueba la protección contra borrados masivos
-
-```http
-PUT borrar-prueba-1
-PUT borrar-prueba-2
-
-DELETE borrar-prueba-*
-
-GET _cluster/settings?include_defaults=true&filter_path=*.action.destructive_requires_name
-
-DELETE borrar-prueba-1,borrar-prueba-2
-```
-
-**Qué hace y por qué:** en Elasticsearch 8.x, `action.destructive_requires_name` vale `true` por defecto, por lo que un `DELETE` con comodines **falla** con un error. Es una salvaguarda contra borrados accidentales de muchos índices; para eliminar, debes nombrar cada índice explícitamente.
-
----
-
-### Tarea 2. Operaciones CRUD sobre documentos
-
-#### Paso 6. Indexa (crea) documentos con y sin ID
-
-```http
-PUT app-logs-lab/_doc/manual-1
-{
-  "@timestamp": "2026-10-20T08:00:00-06:00",
-  "service": { "name": "checkout-service" },
-  "host": { "name": "srv-app01" },
-  "log": { "level": "INFO" },
-  "message": "Documento de prueba creado manualmente",
-  "tags": ["manual"]
-}
-
-POST app-logs-lab/_doc
-{
-  "@timestamp": "2026-10-20T08:01:00-06:00",
-  "service": { "name": "cart-service" },
-  "log": { "level": "WARN" },
-  "message": "Documento con ID generado por Elasticsearch",
-  "tags": ["manual"]
-}
-```
-
-**Qué hace y por qué:** `PUT .../_doc/<id>` crea el documento con un ID propio, o lo **reemplaza** si ya existe. `POST .../_doc` genera un ID automático; es la forma más eficiente para logs, porque Elasticsearch no necesita verificar si el ID ya existe. Observa en la respuesta `_id`, `_version`, `_seq_no`, `_primary_term` y `result` (`created`).
-
-#### Paso 7. Usa `_create` para evitar sobrescrituras
-
-```http
-PUT app-logs-lab/_create/manual-1
-{
-  "message": "Esto falla porque el ID ya existe"
-}
-```
-
-**Qué hace y por qué:** `_create` solo indexa si el ID **no** existe; si existe, responde `409 version_conflict_engine_exception`. Garantiza que un evento no se sobrescriba por error, por ejemplo, al reprocesar logs.
-
-#### Paso 8. Lee el documento
-
-```http
-GET app-logs-lab/_doc/manual-1
-
-GET app-logs-lab/_source/manual-1
-
-HEAD app-logs-lab/_doc/no-existe
-```
-
-**Qué hace y por qué:** `GET _doc` regresa el documento con sus metadatos; `_source` regresa solo el JSON original, y `HEAD` solo verifica si existe (200 o 404). La lectura por ID es **en tiempo real**: no depende del `refresh_interval`.
-
-#### Paso 9. Actualiza parcialmente y con script
-
-```http
-POST app-logs-lab/_update/manual-1
-{
-  "doc": {
-    "log": { "level": "WARN" },
-    "response_time_ms": 1500
-  }
-}
-
-POST app-logs-lab/_update/manual-1
-{
-  "script": {
-    "source": "ctx._source.tags.add(params.etiqueta); ctx._source.response_time_ms += params.extra",
-    "params": { "etiqueta": "revisado", "extra": 100 }
-  }
-}
-
-GET app-logs-lab/_doc/manual-1
-```
-
-**Qué hace y por qué:** `_update` con `doc` fusiona los campos indicados con el documento existente. Con `script` (lenguaje Painless) se aplica lógica, como agregar una etiqueta o sumar un valor. Internamente, Elasticsearch **reindexa** el documento completo, porque los segmentos de Lucene son inmutables. Por eso los logs, que casi nunca se modifican, se tratan como datos *append-only*.
-
-#### Paso 10. Aplica control de concurrencia optimista
-
-```http
-GET app-logs-lab/_doc/manual-1?filter_path=_seq_no,_primary_term
-
-# Sustituye 3 y 1 por los valores de _seq_no y _primary_term que obtuviste
-PUT app-logs-lab/_doc/manual-1?if_seq_no=3&if_primary_term=1
-{
-  "@timestamp": "2026-10-20T08:00:00-06:00",
-  "message": "Reemplazo controlado",
-  "tags": ["manual"]
-}
-```
-
-Ejecuta el `PUT` dos veces. La segunda vez responde `409` porque `_seq_no` ya cambió.
-
-**Qué hace y por qué:** `if_seq_no` e `if_primary_term` aseguran que solo se modifique la versión que leíste. Si otro proceso cambió el documento entretanto, la operación falla en lugar de perder cambios.
-
-#### Paso 11. Usa la Bulk API con varias operaciones
-
-```http
-POST _bulk
-{ "index": { "_index": "app-logs-lab", "_id": "manual-2" } }
-{ "@timestamp": "2026-10-20T08:02:00-06:00", "log": { "level": "INFO" }, "message": "Alta por bulk", "tags": ["manual"] }
-{ "create": { "_index": "app-logs-lab", "_id": "manual-3" } }
-{ "@timestamp": "2026-10-20T08:03:00-06:00", "log": { "level": "ERROR" }, "message": "Creado por bulk", "tags": ["manual"] }
-{ "update": { "_index": "app-logs-lab", "_id": "manual-2" } }
-{ "doc": { "log": { "level": "WARN" } } }
-{ "delete": { "_index": "app-logs-lab", "_id": "manual-3" } }
-```
-
-**Qué hace y por qué:** `_bulk` ejecuta muchas operaciones en una sola petición HTTP, con el formato NDJSON (una línea de acción y, para `index`, `create` y `update`, una línea de datos). Es la forma en que Filebeat, Logstash y Elastic Agent envían los logs. Revisa en la respuesta `"errors": false` y el `status` de cada elemento: un bulk **no es transaccional**, y cada operación puede fallar o tener éxito por separado.
-
-#### Paso 12. Elimina los documentos de prueba
-
-```http
-DELETE app-logs-lab/_doc/manual-1
-
-POST app-logs-lab/_delete_by_query?refresh=true
-{
-  "query": { "term": { "tags.keyword": "manual" } }
-}
-
-GET app-logs-lab/_count
-```
-
-**Qué hace y por qué:** `DELETE` borra un documento por ID; `_delete_by_query` borra todos los que cumplen una consulta. Aquí elimina los documentos de prueba, incluido el de ID automático, para que el índice quede vacío (`count: 0`) antes de la carga masiva. En logs, el borrado selectivo es poco común; la retención se maneja borrando índices completos con ILM, que es mucho más eficiente.
-
-#### Paso 13. Carga el archivo de logs con curl
-
-En PowerShell:
-
-```powershell
-. C:\labs\scripts\entorno.ps1
-es POST "/app-logs-lab/_bulk?refresh=true&filter_path=errors,took" -File C:\labs\datos\cap03_app_logs.ndjson
-```
-
-Después, en Dev Tools:
-
-```http
-GET app-logs-lab/_count
-GET app-logs-lab/_search?size=2
-```
-
-**Qué hace y por qué:** el archivo tiene 80 líneas: 40 acciones `{"index":{}}` y 40 documentos. Como el índice va en la URL, las líneas de acción no repiten `_index`. `--data-binary` (dentro de la función `es`) envía el archivo sin alterar los saltos de línea, que son obligatorios en NDJSON. `refresh=true` hace visibles los documentos de inmediato. La respuesta esperada es `{"took":..,"errors":false}` y el conteo debe ser **40**.
-
-#### Paso 14. Revisa el mapping dinámico
-
-```http
-GET app-logs-lab/_mapping
-```
-
-**Qué hace y por qué:** no definiste un mapping, así que Elasticsearch lo **infirió**:
-
-- `@timestamp` es `date`, y `response_time_ms` y `http.response.status_code` son `long`.
-- Las cadenas (`message`, `log.level`, `service.name`, etc.) son `text` con un subcampo `keyword` (*multi-field*).
-- `source.ip` quedó como `text`/`keyword`, **no** como `ip`, porque la inferencia no detecta direcciones IP.
-
-Esta es la razón por la que en esta práctica usarás `campo.keyword` para comparaciones exactas. En la Práctica 4 diseñarás un mapping explícito que corrige estos tipos.
-
----
-
-### Tarea 3. Búsquedas simples con Query DSL
-
-#### Paso 15. Busca texto completo con `match` y `match_phrase`
-
-```http
-GET app-logs-lab/_search
-{
-  "query": { "match": { "message": "timeout" } }
-}
-
-GET app-logs-lab/_count
-{
-  "query": { "match": { "message": "base de datos" } }
-}
-
-GET app-logs-lab/_count
-{
-  "query": { "match": { "message": { "query": "base de datos", "operator": "and" } } }
-}
-
-GET app-logs-lab/_count
-{
-  "query": { "match_phrase": { "message": "base de datos" } }
-}
-```
-
-**Qué hace y por qué:** `match` **analiza** el texto de búsqueda con el mismo analizador del campo (`standard`: minúsculas y separación por palabras) y busca los términos resultantes:
-
-| Consulta | Lógica | Resultado |
+| Componente | | Función |
 |---|---|---|
-| `match "timeout"` | contiene el término `timeout` | 3 |
-| `match "base de datos"` | `base` **OR** `de` **OR** `datos` | 21 (la palabra común `de` aparece en muchos mensajes) |
-| `match ... operator: and` | contiene los tres términos, en cualquier orden | 5 |
-| `match_phrase` | los tres términos juntos y en ese orden | 5 |
+| 4.1 Elasticsearch | | A. Agente unificado administrado centralmente con Fleet que recolecta logs, métricas y datos de seguridad |
+| 4.2 Kibana | | B. Motor distribuido que almacena, indexa y busca los datos |
+| 4.3 Logstash | | C. Recolector ligero especializado en leer archivos de log y enviarlos |
+| 4.4 Filebeat | | D. Interfaz web para explorar, visualizar, crear dashboards, alertas y administrar el stack |
+| 4.5 Elastic Agent | | E. Motor de procesamiento con pipelines input-filter-output para transformar y enrutar eventos |
 
-Para frases en logs, usa `match_phrase` u `operator: and`; un `match` simple con palabras comunes devuelve ruido.
+**5.** ¿Qué componente administra de forma centralizada las políticas y la actualización de muchos Elastic Agents?
 
-#### Paso 16. Compara `term` sobre `text` y sobre `keyword`
+- a) Logstash.
+- b) Fleet (a través de Fleet Server).
+- c) Metricbeat.
+- d) Kibana Dev Tools.
 
-```http
-GET app-logs-lab/_count
-{ "query": { "term": { "log.level": "ERROR" } } }
+**6.** Una organización necesita enriquecer eventos con datos de una base de datos externa y enviarlos a dos destinos distintos (Elasticsearch y un sistema de archivo). ¿Qué componente es el más adecuado?
 
-GET app-logs-lab/_count
-{ "query": { "term": { "log.level.keyword": "ERROR" } } }
-```
+- a) Filebeat.
+- b) Logstash.
+- c) Kibana.
+- d) Elastic Agent sin integraciones.
 
-**Qué hace y por qué:** `term` **no analiza** el valor buscado. El campo `log.level` (tipo `text`) se indexó en minúsculas (`error`), así que buscar `ERROR` da **0**. El subcampo `log.level.keyword` guarda el valor exacto y da **8**. Regla práctica: usa `term`, `terms` y `range` sobre campos `keyword`, numéricos, de fecha o IP, y usa `match` sobre campos `text`.
+#### Paso 3. Responde las preguntas del tema 1.3: evolución de versiones y serie 8.x
 
-#### Paso 17. Busca varios valores exactos con `terms`
+**7.** ¿Qué cambio importante introdujo Elasticsearch 8.0 en la configuración inicial de un nodo nuevo?
 
-```http
-GET app-logs-lab/_count
-{
-  "query": {
-    "terms": { "service.name.keyword": ["checkout-service", "payment-service"] }
-  }
-}
-```
+- a) Eliminó la necesidad de Java.
+- b) Activó la seguridad por defecto: autenticación, TLS en las capas HTTP y transporte, y generación automática de la contraseña del usuario `elastic`.
+- c) Eliminó la API REST en favor de gRPC.
+- d) Obligó a usar Elastic Cloud.
 
-**Qué hace y por qué:** `terms` equivale a un `IN` de SQL: devuelve los documentos cuyo valor coincide con **cualquiera** de la lista. El resultado es **16** (9 de checkout y 7 de payment).
+**8.** En Elasticsearch 8.x, ¿cuál es la forma recomendada de almacenar datos de logs que solo se agregan (append-only) y tienen marca de tiempo?
 
-#### Paso 18. Filtra por rangos numéricos y de fechas
+- a) Un único índice gigante sin rollover.
+- b) Data streams, respaldados por índices ocultos y con rollover automático.
+- c) Un índice por cada línea de log.
+- d) Tipos de mapping múltiples dentro de un índice.
 
-```http
-GET app-logs-lab/_count
-{
-  "query": { "range": { "response_time_ms": { "gte": 1000 } } }
-}
+**9.** ¿Qué es ES|QL?
 
-GET app-logs-lab/_search
-{
-  "query": {
-    "range": {
-      "@timestamp": {
-        "gte": "2026-10-20T12:00:00-06:00",
-        "lt":  "2026-10-20T13:00:00-06:00"
-      }
-    }
-  },
-  "_source": ["@timestamp", "service.name", "message"]
-}
-```
+- a) Un conector JDBC para bases de datos relacionales.
+- b) Un lenguaje de consulta con comandos encadenados por tuberías (`|`), disponible en la serie 8.x, que permite filtrar, transformar y agregar datos.
+- c) Un plugin de pago para exportar a Excel.
+- d) El nuevo nombre de Query DSL.
 
-**Qué hace y por qué:** `range` admite `gt`, `gte`, `lt` y `lte`. Las fechas se guardan en UTC; al incluir la zona `-06:00` en el valor, la consulta se interpreta en hora de la Ciudad de México. Otra opción es usar el parámetro `"time_zone": "America/Mexico_City"`. Resultados: **9** eventos tardaron 1,000 ms o más, y **8** eventos ocurrieron entre las 12:00 y las 13:00. En logs, el rango de tiempo es el filtro más usado: Kibana lo agrega en cada consulta.
+#### Paso 4. Responde las preguntas del tema 1.4: API REST, JSON, curl y Dev Tools
 
-#### Paso 19. Verifica la existencia de campos y usa comodines
+**10.** ¿Qué verbo HTTP y ruta usarías para **obtener** el documento con ID `42` del índice `logs-app`?
 
-```http
-GET app-logs-lab/_count
-{ "query": { "exists": { "field": "user.name" } } }
+- a) `POST /logs-app/_search/42`
+- b) `GET /logs-app/_doc/42`
+- c) `PUT /logs-app/_doc/42`
+- d) `DELETE /logs-app/42`
 
-GET app-logs-lab/_search
-{
-  "query": { "wildcard": { "user.name.keyword": { "value": "*ez" } } },
-  "_source": ["user.name", "message"]
-}
-```
+**11.** En Windows 11, en PowerShell 5.1, ¿por qué conviene escribir `curl.exe` en lugar de `curl`?
 
-**Qué hace y por qué:** `exists` devuelve los documentos que tienen un valor en el campo: **29** de 40 eventos tienen usuario, porque las consultas anónimas al catálogo no lo tienen. `wildcard` acepta `*` y `?` sobre campos `keyword`; devuelve **13** eventos de usuarios cuyo nombre termina en "ez". Los comodines al **inicio** del patrón (`*ez`) obligan a recorrer todo el diccionario de términos y son costosos en índices grandes; úsalos con moderación o prefiere el tipo `wildcard`, que se ve en la Práctica 4.
+- a) Porque `curl` no existe en Windows.
+- b) Porque en PowerShell 5.1 `curl` es un alias de `Invoke-WebRequest`, que usa otra sintaxis; `curl.exe` invoca el curl real incluido en Windows.
+- c) Porque `curl.exe` es más rápido.
+- d) No hay diferencia.
 
----
+**12.** ¿Qué ventaja ofrece Kibana Dev Tools (Console) frente a curl para aprender la API?
 
-### Tarea 4. Consultas booleanas: `must`, `filter`, `should` y `must_not`
+- a) Ejecuta comandos del sistema operativo.
+- b) Autocompleta rutas y parámetros, da formato al JSON, maneja la autenticación con la sesión de Kibana y permite guardar el historial de peticiones.
+- c) No requiere que Elasticsearch esté en ejecución.
+- d) Permite editar los archivos `elasticsearch.yml` remotamente.
 
-La consulta `bool` combina otras consultas mediante cuatro cláusulas. Elegir la cláusula correcta afecta el **resultado**, la **relevancia** (`_score`) y el **rendimiento**.
+**13.** ¿Qué formato espera la Bulk API (`_bulk`) en el cuerpo de la petición?
 
-| Cláusula | ¿El documento debe cumplirla? | ¿Calcula `_score`? | Contexto | ¿Se puede cachear? | Uso recomendado en logs |
-|---|---|---|---|---|---|
-| `must` | Sí (AND) | **Sí**, suma relevancia | query | No | Búsqueda de texto completo donde importa qué tan bien coincide el texto, como un `match` sobre `message`. |
-| `filter` | Sí (AND) | **No** (score 0) | filter | **Sí** | Condiciones exactas: rango de tiempo, `service.name`, `log.level`, `host.name`, códigos HTTP o entorno. Es la cláusula **más usada** en análisis de logs. |
-| `should` | Opcional; con `minimum_should_match` se vuelve obligatoria (OR) | **Sí**, aumenta el score de lo que coincide | query | No | Expresar un OR (por ejemplo, "es 5xx **o** tardó más de 2 s") o dar prioridad a ciertos resultados sin excluir los demás. |
-| `must_not` | Debe **no** cumplirse (NOT) | **No** | filter | **Sí** | Excluir ruido: health checks, entorno de pruebas o servicios que no interesan. |
+- a) Un arreglo JSON con todos los documentos.
+- b) NDJSON: una línea de acción seguida, cuando aplica, por una línea con el documento; cada línea termina con salto de línea, incluida la última.
+- c) CSV con encabezados.
+- d) XML.
 
-> **Importante:** si una `bool` **no** tiene `must` ni `filter`, al menos una cláusula `should` debe cumplirse (`minimum_should_match` vale 1 de forma implícita). Si **sí** tiene `must` o `filter`, las `should` son opcionales y solo modifican el orden por relevancia, a menos que indiques `minimum_should_match`.
+**14.** La respuesta de una petición regresa el código HTTP `401`. ¿Qué significa?
 
-#### Paso 20. Combina `must` y `filter`
+- a) El índice no existe.
+- b) La petición no se autenticó (faltan credenciales o son incorrectas).
+- c) El clúster está en estado rojo.
+- d) La consulta tiene un error de sintaxis.
 
-```http
-GET app-logs-lab/_search
-{
-  "query": {
-    "bool": {
-      "must": [
-        { "match": { "message": "pedido" } }
-      ],
-      "filter": [
-        { "term":  { "environment.keyword": "produccion" } },
-        { "range": { "response_time_ms": { "gte": 1000 } } }
-      ]
-    }
-  },
-  "_source": ["@timestamp", "service.name", "response_time_ms", "message"]
-}
-```
+**15.** ¿Cuál de las siguientes peticiones devuelve el estado de salud del clúster?
 
-**Qué hace y por qué:** `must` busca la palabra `pedido` en el mensaje y calcula relevancia; `filter` exige el entorno de producción y una latencia de 1 s o más, sin afectar el score. El resultado son **2** documentos: "Latencia alta al guardar el pedido…" y "Reintento de guardado de pedido…". Los mensajes "…base de datos de pedidos" **no** aparecen: `pedidos` es un término distinto de `pedido`, porque el analizador `standard` no reduce palabras a su raíz. En la Práctica 4 verás cómo un analizador en español lo resuelve.
-
-#### Paso 21. Excluye con `must_not`
-
-```http
-GET app-logs-lab/_search
-{
-  "query": {
-    "bool": {
-      "filter": [
-        { "term": { "log.level.keyword": "ERROR" } }
-      ],
-      "must_not": [
-        { "term": { "service.name.keyword": "catalog-service" } }
-      ]
-    }
-  },
-  "_source": ["service.name", "message"]
-}
-```
-
-**Qué hace y por qué:** obtiene los errores de todos los servicios **excepto** catálogo: **7** documentos. `must_not` se ejecuta en contexto de filtro, así que no calcula relevancia y su resultado puede cachearse.
-
-#### Paso 22. Expresa un OR con `should` y `minimum_should_match`
-
-```http
-GET app-logs-lab/_search
-{
-  "query": {
-    "bool": {
-      "filter": [
-        { "term": { "service.name.keyword": "checkout-service" } }
-      ],
-      "should": [
-        { "match": { "message": "timeout" } },
-        { "match": { "message": "latencia" } }
-      ],
-      "minimum_should_match": 1
-    }
-  },
-  "_source": ["@timestamp", "message", "response_time_ms"]
-}
-```
-
-Repite la consulta **sin** `"minimum_should_match": 1` y compara el número de resultados.
-
-**Qué hace y por qué:** con `minimum_should_match: 1`, el documento debe cumplir al menos una `should`: **3** resultados (dos timeouts y una latencia alta). Sin ese parámetro, como existe un `filter`, las `should` se vuelven opcionales y regresan **los 9** eventos de checkout. Los que coinciden con `timeout` o `latencia` aparecen primero por tener mayor score. Es el error más frecuente al construir consultas `bool`.
-
-#### Paso 23. Usa `should` para priorizar sin excluir
-
-```http
-GET app-logs-lab/_search
-{
-  "query": {
-    "bool": {
-      "must": [
-        { "match": { "message": "pedido" } }
-      ],
-      "should": [
-        { "term": { "log.level.keyword": { "value": "ERROR", "boost": 5 } } }
-      ]
-    }
-  },
-  "_source": ["log.level", "message"]
-}
-```
-
-**Qué hace y por qué:** regresa los **7** documentos con la palabra `pedido`, pero el de nivel `ERROR` aparece **primero** porque la `should` suma score (multiplicado por `boost`). Es útil en búsquedas interactivas: "muéstrame todo, pero los errores arriba".
-
-#### Paso 24. Construye una consulta operativa completa
-
-Pregunta: *"¿Qué eventos de producción entre las 09:00 y las 12:00 fueron errores del servidor (5xx) o tardaron 2 segundos o más?"*
-
-```http
-GET app-logs-lab/_search
-{
-  "query": {
-    "bool": {
-      "filter": [
-        { "term":  { "environment.keyword": "produccion" } },
-        { "range": { "@timestamp": { "gte": "2026-10-20T09:00:00", "lt": "2026-10-20T12:00:00", "time_zone": "America/Mexico_City" } } }
-      ],
-      "should": [
-        { "range": { "http.response.status_code": { "gte": 500 } } },
-        { "range": { "response_time_ms": { "gte": 2000 } } }
-      ],
-      "minimum_should_match": 1,
-      "must_not": [
-        { "term": { "service.name.keyword": "inventory-service" } }
-      ]
-    }
-  },
-  "sort": [ { "@timestamp": "asc" } ],
-  "_source": ["@timestamp", "service.name", "http.response.status_code", "response_time_ms", "message"]
-}
-```
-
-**Qué hace y por qué:** combina las cuatro cláusulas como se recomienda: las condiciones exactas van en `filter`, el OR en `should` con `minimum_should_match`, y la exclusión en `must_not`. El resultado son **6** eventos. Al ordenar por `@timestamp`, el score no se usa, así que no hace falta `must`: en análisis de logs, la mayoría de consultas son puramente de filtro.
-
-#### Paso 25. Compara el contexto query y el contexto filter
-
-```http
-GET app-logs-lab/_search
-{
-  "query": { "bool": { "must":   [ { "term": { "log.level.keyword": "ERROR" } } ] } },
-  "size": 3, "_source": false
-}
-
-GET app-logs-lab/_search
-{
-  "query": { "bool": { "filter": [ { "term": { "log.level.keyword": "ERROR" } } ] } },
-  "size": 3, "_source": false
-}
-```
-
-**Qué hace y por qué:** ambas regresan los mismos 8 documentos. Con `must`, cada resultado tiene un `_score` mayor que 0; con `filter`, el `_score` es **0.0**. El contexto filter evita el cálculo de relevancia y permite que Elasticsearch **cachee** el conjunto de documentos que cumplen la condición, lo que acelera consultas repetidas, como las de los dashboards que se actualizan cada minuto.
+- a) `GET /_cluster/health`
+- b) `GET /_health/cluster`
+- c) `POST /_cluster/status`
+- d) `GET /_cat/health_report`
 
 ---
 
-### Tarea 5. Ordenar, paginar y filtrar el `_source`
+### Tarea 2. Autoevaluar y registrar temas de repaso
 
-#### Paso 26. Ordena y pagina con `from` y `size`
+Una vez que contestes todo, revisa tus respuestas con la clave. La justificación explica la idea central que se espera que domines.
 
-```http
-GET app-logs-lab/_search
-{
-  "from": 0,
-  "size": 5,
-  "sort": [
-    { "response_time_ms": "desc" },
-    { "@timestamp": "asc" }
-  ],
-  "_source": ["service.name", "response_time_ms", "message"]
-}
-```
+#### Paso 5. Compara tus respuestas con la clave
 
-Cambia `"from": 0` por `"from": 5` para ver la segunda página.
+Consulta la tabla de la sección **Resultado esperado**. Asigna 1 punto por respuesta correcta. En la pregunta 4 asigna 1 punto solo si las cinco relaciones son correctas.
 
-**Qué hace y por qué:** muestra los 5 eventos más lentos (5000, 4200, 3010, 3005 y 2450 ms). El segundo criterio de orden desempata. `from`/`size` es sencillo, pero está limitado por `index.max_result_window` (10,000 por defecto), porque cada página profunda obliga a cada shard a ordenar `from + size` documentos.
+**Qué hace y por qué:** comparar contra una clave con justificación convierte el error en aprendizaje: no basta con saber que una respuesta es incorrecta, sino entender el concepto que la hace correcta.
 
-#### Paso 27. Pagina con `search_after` y un Point in Time (PIT)
+#### Paso 6. Registra los temas que debes repasar
 
-```http
-POST app-logs-lab/_pit?keep_alive=2m
-```
+Anota en una lista los números de las preguntas que fallaste y el subtema asociado (1.1, 1.2, 1.3 o 1.4). Repasa esos subtemas antes de iniciar la Práctica 2.
 
-Copia el `id` de la respuesta y úsalo en lugar de `<PIT_ID>`:
-
-```http
-GET _search
-{
-  "size": 10,
-  "pit": { "id": "<PIT_ID>", "keep_alive": "2m" },
-  "sort": [ { "@timestamp": "asc" } ],
-  "_source": ["@timestamp", "message"]
-}
-```
-
-En la respuesta, copia el arreglo `sort` del **último** resultado (por ejemplo, `[1760976067000, 9]`) y pide la siguiente página:
-
-```http
-GET _search
-{
-  "size": 10,
-  "pit": { "id": "<PIT_ID>", "keep_alive": "2m" },
-  "sort": [ { "@timestamp": "asc" } ],
-  "search_after": [1760976067000, 9],
-  "_source": ["@timestamp", "message"]
-}
-```
-
-Al terminar, libera el PIT:
-
-```http
-DELETE _pit
-{ "id": "<PIT_ID>" }
-```
-
-**Qué hace y por qué:** un **PIT** congela una vista consistente del índice, de modo que los documentos que llegan durante la paginación no desplazan las páginas. `search_after` continúa desde los valores de orden del último resultado, sin el costo de `from`, y no tiene límite de profundidad. Es el método recomendado para exportar o recorrer muchos logs. Con PIT, Elasticsearch agrega un desempate implícito (`_shard_doc`), por eso el arreglo `sort` tiene dos valores. La petición se hace a `_search` sin nombre de índice, porque el PIT ya lo incluye.
-
-#### Paso 28. Filtra los campos devueltos
-
-```http
-GET app-logs-lab/_search
-{
-  "size": 3,
-  "_source": {
-    "includes": ["@timestamp", "service.*", "log.level"],
-    "excludes": ["service.version"]
-  }
-}
-
-GET app-logs-lab/_search
-{
-  "size": 3,
-  "_source": false,
-  "fields": ["@timestamp", "service.name", "response_time_ms"]
-}
-```
-
-**Qué hace y por qué:** `_source` con `includes` y `excludes` (se permiten comodines) reduce el tamaño de la respuesta y el tráfico de red. `fields` devuelve los valores tal como están **mapeados**, por ejemplo, fechas normalizadas, y también funciona con runtime fields (Práctica 4). Kibana Discover usa `fields`.
+**Qué hace y por qué:** las prácticas siguientes suponen que dominas estos conceptos. Por ejemplo, la Práctica 3 usa la API REST y la Bulk API, y la Práctica 5 usa data streams, Filebeat y Logstash.
 
 ---
 
 ### Resultado esperado
 
-- El índice `app-logs-lab` existe, está en estado `green`, tiene los aliases `app-logs` y `app-logs-errores` y contiene **40** documentos.
+Al terminar deberás tener tu calificación y la lista de temas por repasar. Se considera aprobado con **12 o más** aciertos de 15.
 
-```http
-GET _cat/indices/app-logs-lab?v&h=index,health,status,docs.count
-GET app-logs-errores/_count
-```
+| # | Respuesta | Justificación | Subtema |
+|---|---|---|---|
+| 1 | b | El índice invertido relaciona cada término (token) con la lista de documentos y posiciones donde aparece. Es la base de la búsqueda de texto completo. | 1.1 |
+| 2 | b | Centralizar permite buscar y correlacionar eventos de muchas fuentes con una sola línea de tiempo, retener los logs aunque el servidor falle y controlar el acceso. | 1.1 |
+| 3 | b | El texto se analiza (tokeniza) al indexar; en la búsqueda solo se consulta el diccionario de términos del índice invertido. | 1.1 |
+| 4 | 4.1-B, 4.2-D, 4.3-E, 4.4-C, 4.5-A | Cada componente cumple un papel: almacenar y buscar (Elasticsearch), visualizar y administrar (Kibana), transformar (Logstash), recolectar archivos (Filebeat) y recolección unificada administrada (Elastic Agent). | 1.2 |
+| 5 | b | Fleet, servido por Fleet Server, administra de forma central las políticas, integraciones y actualizaciones de los Elastic Agents. | 1.2 |
+| 6 | b | Logstash es el componente indicado para enriquecimiento complejo y para enviar a múltiples salidas. | 1.2 |
+| 7 | b | A partir de 8.0 la seguridad viene activada por defecto: TLS, autenticación y contraseña de `elastic` generada en el primer arranque. | 1.3 |
+| 8 | b | Los data streams son el mecanismo nativo para series de tiempo append-only, con backing indices y rollover. | 1.3 |
+| 9 | b | ES\|QL es un lenguaje con tuberías (`FROM ... \| WHERE ... \| STATS ...`), disponible de forma general en la serie 8.x. | 1.3 |
+| 10 | b | `GET /<índice>/_doc/<id>` recupera un documento por su ID. | 1.4 |
+| 11 | b | En Windows PowerShell 5.1, `curl` es alias de `Invoke-WebRequest`; para usar la sintaxis de curl se invoca `curl.exe`. | 1.4 |
+| 12 | b | Dev Tools autocompleta, da formato, reutiliza la sesión autenticada de Kibana y conserva el historial. | 1.4 |
+| 13 | b | La Bulk API recibe NDJSON (JSON delimitado por saltos de línea), y la última línea también debe terminar con salto de línea. | 1.4 |
+| 14 | b | 401 Unauthorized indica que faltan credenciales o son inválidas; 403 indica que el usuario sí se autenticó, pero no tiene permisos. | 1.4 |
+| 15 | a | `GET /_cluster/health` regresa el estado `green`, `yellow` o `red` y el conteo de shards. | 1.4 |
 
-```text
-index        health status docs.count
-app-logs-lab green  open           40
-```
-
-`app-logs-errores/_count` regresa **8**.
-
-- Resumen de resultados de las consultas:
-
-| Paso | Consulta | Resultado |
-|---|---|---|
-| 15 | `match` "timeout" / "base de datos" (OR) / (AND) / `match_phrase` | 3 / 21 / 5 / 5 |
-| 16 | `term` en `log.level` / `log.level.keyword` | 0 / 8 |
-| 17 | `terms` checkout o payment | 16 |
-| 18 | `range` ≥ 1000 ms / de 12:00 a 13:00 | 9 / 8 |
-| 19 | `exists user.name` / `wildcard *ez` | 29 / 13 |
-| 20 | `bool` must + filter | 2 |
-| 21 | `bool` filter + must_not | 7 |
-| 22 | `should` con / sin `minimum_should_match` | 3 / 9 |
-| 23 | `should` con boost | 7 (el ERROR primero) |
-| 24 | consulta operativa completa | 6 |
-
-- Puedes explicar con tus palabras cuándo usar `must`, `filter`, `should` y `must_not`, y por qué en el análisis de logs predominan `filter` y `must_not`.
+> **Importante:** si obtuviste menos de 12 aciertos, repasa los subtemas indicados antes de la Práctica 2. La instalación y las prácticas siguientes dan por entendidos estos conceptos.
 
 ### Referencias
 
-- Elastic. *Index APIs [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/indices.html
-- Elastic. *Document APIs y Bulk API [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/docs-bulk.html
-- Elastic. *Boolean query [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/query-dsl-bool-query.html
-- Elastic. *Query and filter context [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/query-filter-context.html
-- Elastic. *Paginate search results [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/paginate-search-results.html
+- Elastic. *Elasticsearch Guide [8.19]: What is Elasticsearch?* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/elasticsearch-intro.html
+- Elastic. *Elastic Stack and product documentation.* https://www.elastic.co/guide/index.html
+- Elastic. *ES|QL [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/esql.html

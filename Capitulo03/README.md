@@ -1,718 +1,656 @@
-# Lab 3 · Templates, mappings y data streams para los logs de RutaNorte
+# Administración de Elasticsearch para gestión y análisis de logs
 
-| | |
-|---|---|
-| **Duración** | 1 hora 5 minutos |
-| **Entorno** | Kibana › Dev Tools › Console (sesión de `rn_admin`) |
-| **Archivos que usarás** | `cap03/lab03-templates.txt` (comandos) · `cap03/lab03-bulk-eventos.txt` (carga de eventos) · `cap03/eventos-rutanorte.ndjson` (datos de origen) |
-| **Requisitos** | Labs 0 a 2 completos; clúster en `green` |
-| **Deja listo para** | Lab 4 (ingest pipelines), Lab 5 (consultas) y Lab 7 (ILM) |
+## Práctica 3. Creación de índices, operaciones CRUD con documentos, búsquedas simples y booleanas
 
----
+### Objetivo
 
-## Objetivo
+Al finalizar la práctica, serás capaz de:
 
-Diseñar el almacenamiento de los logs de RutaNorte:
-- crear **component templates** reutilizables para settings y mappings;
-- combinarlos en un **index template** y simular el resultado antes de escribir datos;
-- crear los **data streams** de tres servicios con eventos reales;
-- provocar un **rechazo de mapping** para entender su causa y cómo evitarlo;
-- evolucionar el diseño con un **rollover**.
+- Crear y administrar índices: settings, aliases, cierre y apertura, y eliminación.
+- Ejecutar operaciones CRUD sobre documentos y cargas masivas con la Bulk API.
+- Construir búsquedas con Query DSL: `match`, `match_phrase`, `term`, `terms`, `range`, `exists` y `wildcard`.
+- Combinar condiciones con consultas `bool` y elegir correctamente entre `must`, `filter`, `should` y `must_not`.
+- Ordenar, paginar (`from`/`size`, `search_after` con PIT) y filtrar el `_source` de los resultados.
 
-## Contexto
+### Objetivo visual
 
-Con la plataforma entregada y documentada (Labs 0 a 2), RutaNorte está lista para recibir logs. Si cada servicio escribiera "como sea", en pocas semanas habría:
-- un `status_code` guardado como texto en un servicio y como número en otro;
-- montos imposibles de sumar;
-- miles de campos creados por accidente que inflan el estado del clúster.
+![Flujo de la práctica: índice, documentos y consultas](img/cap03.png)
 
-El equipo de Plataforma define hoy **el contrato de datos**: cómo se llaman los data streams, qué tipo tiene cada campo y qué pasa con los campos inesperados. Lo harás con piezas reutilizables, porque en el Lab 4 se sumarán los tres servicios restantes con el mismo diseño.
+### Duración aproximada
 
-**Decisiones de diseño de RutaNorte**
+- 50 minutos.
 
-| Decisión | Elección | Justificación |
-|---|---|---|
-| Contenedor | Un **data stream** por servicio y ambiente: `logs-rutanorte.<servicio>-prod` | Los logs solo se agregan y tienen fecha; el data stream gestiona el rollover y el índice de escritura. Separar por servicio permite permisos y retención distintos (Lab 7) |
-| Shards | 1 primario + 1 réplica | Volumen de laboratorio pequeño; la réplica protege contra la caída de una zona (Lab 1) |
-| Campos conocidos | Mapping explícito con nombres **ECS** | Tipos correctos desde el primer evento y consultas uniformes entre servicios |
-| Campos desconocidos | Se aceptan como `keyword`, con un límite de 500 campos | Flexibilidad sin riesgo de *mapping explosion* |
-| Etiquetas libres | `labels` como `flattened` | Claves arbitrarias sin crear un campo por clave |
+### Prerrequisitos
 
-## Qué vas a hacer
-
-| Paso | Actividad | Recurso que crea o modifica |
-|---|---|---|
-| 3.1 | Revisar la plantilla integrada `logs` | — |
-| 3.2 | Crear los component templates de settings y mappings | `rutanorte@settings`, `rutanorte@mappings` |
-| 3.3 | Crear el index template y simular el índice resultante | `logs-rutanorte` |
-| 3.4 | Cargar 48 eventos con `_bulk` | 3 data streams |
-| 3.5 | Revisar los data streams, los mappings y los campos `flattened` | — |
-| 3.6 | Provocar un rechazo de mapping y corregirlo | — |
-| 3.7 | Evolucionar el template y hacer rollover | `rutanorte@mappings` v2, generación 2 |
-| 3.8 | Verificar los conteos finales | — |
+- Práctica 2 completada: Elasticsearch 8.19 en ejecución como servicio y Kibana accesible en `http://localhost:5601`.
+- Archivo `C:\labs\datos\cap03_app_logs.ndjson` (40 eventos de log de una tienda en línea).
 
 ---
 
-## Paso 3.1 · Revisar la plantilla integrada `logs`
+### Instrucciones
 
-**Qué estás haciendo.** En el Lab 1 el data stream `logs-lab01…` se creó con la plantilla integrada `logs`. Antes de crear la tuya, revisas qué patrón cubre y con qué prioridad, para que la de RutaNorte **gane** sobre ella.
+Todas las peticiones de esta práctica se ejecutan en **Kibana > Dev Tools (Console)**, salvo la carga del archivo, que se hace con curl desde PowerShell. Para ejecutar una petición en Console, coloca el cursor sobre ella y presiona `Ctrl + Enter` o haz clic en el triángulo ▶.
 
-Ejecuta el bloque **3.1**:
+**Escenario:** el equipo de operaciones de una tienda en línea necesita un índice para los logs de sus microservicios (`catalog-service`, `cart-service`, `checkout-service`, `payment-service`, `auth-service` e `inventory-service`) y consultas para responder preguntas operativas.
 
-```
-GET _index_template/logs?filter_path=index_templates.name,index_templates.index_template.index_patterns,index_templates.index_template.priority,index_templates.index_template.composed_of
-```
+---
 
-**Resultado esperado** (extracto):
+### Tarea 1. Gestionar índices
 
-```json
+#### Paso 1. Crea el índice con settings explícitos
+
+```http
+PUT app-logs-lab
 {
-  "index_templates": [ {
-    "name": "logs",
-    "index_template": {
-      "index_patterns": [ "logs-*-*" ],
-      "priority": 100,
-      "composed_of": [ "logs@mappings", "logs@settings", "logs@custom", "ecs@mappings" ]
-    }
-  } ]
-}
-```
-
-**Interpretación.** Todo nombre `logs-*-*` usa esta plantilla de prioridad 100. Cuando dos index templates coinciden con un nombre, **se aplica solo uno: el de mayor `priority`**. Las plantillas no se mezclan. Por eso la de RutaNorte tendrá prioridad **200**.
-
-## Paso 3.2 · Crear los component templates
-
-**Qué estás haciendo.** Un *component template* es un bloque reutilizable de settings, mappings o aliases. Por sí solo no se aplica a ningún índice: se usa al componerlo en un index template. Separar settings y mappings permite cambiar uno sin tocar el otro y reutilizarlos en otros index templates (por ejemplo, para los logs de auditoría del Lab 7).
-
-**3.2 · Settings.** Ejecuta el bloque **3.2**:
-
-```
-PUT _component_template/rutanorte@settings
-{
-  "template": {
-    "settings": {
-      "index.number_of_shards": 1,
-      "index.number_of_replicas": 1,
-      "index.refresh_interval": "5s",
-      "index.codec": "best_compression",
-      "index.mapping.total_fields.limit": 500,
-      "index.mapping.ignore_malformed": false
-    }
-  },
-  "version": 1,
-  "_meta": { "descripcion": "...", "propietario": "equipo-plataforma", "creado_en": "lab-03" }
-}
-```
-
-| Setting | Valor | Explicación |
-|---|---|---|
-| `index.number_of_shards` | `1` | Un primario por índice de respaldo. Un shard aguanta decenas de GB; el rollover crea índices nuevos cuando hace falta |
-| `index.number_of_replicas` | `1` | Una copia en la otra zona |
-| `index.refresh_interval` | `5s` | Cada cuánto se vuelven buscables los documentos nuevos. El valor por defecto es 1 s; 5 s reduce el trabajo de indexación a cambio de unos segundos de retraso, aceptable para logs |
-| `index.codec` | `best_compression` | Comprime más los datos almacenados. Ahorra disco con un costo menor de CPU |
-| `index.mapping.total_fields.limit` | `500` | Máximo de campos por índice. Es la barrera contra la *mapping explosion*. El valor por defecto es 1000 |
-| `index.mapping.ignore_malformed` | `false` | Si un valor no coincide con su tipo, **se rechaza el documento**. Lo fijas explícitamente porque las plantillas de logs pueden activarlo, y en RutaNorte se prefiere detectar los errores a ocultarlos |
-| `version` | `1` | Número de versión del template, para tu control de cambios. Elasticsearch no lo interpreta |
-| `_meta` | objeto | Documentación libre: propietario, propósito y origen |
-
-> **Convención de nombres.** El sufijo `@settings` / `@mappings` imita el estilo de las plantillas integradas (`logs@settings`) y deja claro qué contiene cada componente.
-
-**3.2b · Mappings.** Ejecuta el bloque **3.2b** (completo en el archivo). Sus partes principales:
-
-```
-PUT _component_template/rutanorte@mappings
-{
-  "template": {
-    "mappings": {
-      "dynamic": true,
-      "date_detection": false,
-      "dynamic_templates": [
-        { "cadenas_como_keyword": {
-            "match_mapping_type": "string",
-            "mapping": { "type": "keyword", "ignore_above": 1024 } } }
-      ],
-      "properties": {
-        "@timestamp": { "type": "date" },
-        "message":    { "type": "match_only_text" },
-        "http": { "properties": { "response": { "properties": { "status_code": { "type": "short" } } } } },
-        "client": { "properties": { "ip": { "type": "ip" } } },
-        "labels": { "type": "flattened" },
-        "rutanorte": { "properties": {
-          "monto_mxn": { "type": "scaled_float", "scaling_factor": 100 } } }
-        ...
-      }
-    }
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "refresh_interval": "5s"
   }
 }
 ```
 
-| Elemento | Explicación |
-|---|---|
-| `dynamic: true` | Los campos no declarados **se aceptan** y se mapean automáticamente. Alternativas: `false` (se guardan en `_source` pero no se indexan) y `strict` (se rechaza el documento) |
-| `date_detection: false` | Evita que una cadena con apariencia de fecha, como `"2026-03-27"`, se convierta en campo `date` por accidente |
-| `dynamic_templates` › `cadenas_como_keyword` | Regla para los campos nuevos: toda cadena desconocida se mapea como `keyword`. Sin esta regla se crearían **dos** campos por cadena (`text` + `.keyword`) |
-| `ignore_above: 1024` | Las cadenas de más de 1024 caracteres se guardan, pero no se indexan |
-| `@timestamp: date` | Campo de tiempo obligatorio del data stream |
-| `message: match_only_text` | Texto de búsqueda completa optimizado para logs: ocupa menos espacio que `text` porque no guarda frecuencias ni posiciones |
-| `log.level`, `service.name`, `trace.id`… `keyword` | Valores exactos para filtrar y agregar |
-| `http.response.status_code: short` | Número entero pequeño (−32 768 a 32 767). Permite rangos como `>= 500` |
-| `event.duration: long` | Duración en **nanosegundos**, según ECS |
-| `client.ip: ip` | Admite búsquedas por rango o CIDR, como `189.203.0.0/16` |
-| `labels: flattened` | Todo el objeto se indexa como **un solo campo**, aunque traiga claves nuevas. Protege contra la *mapping explosion* |
-| `rutanorte.*` | Campos de negocio propios, fuera del espacio ECS |
-| `monto_mxn: scaled_float` (factor 100) | Guarda el monto como entero de centavos: preciso para dinero y compacto |
+**Qué hace y por qué:**
 
-**3.2c · Revisión.** Ejecuta el bloque **3.2c**. Debes ver ambos componentes con `version: 1` y su `_meta`.
+- `number_of_shards: 1`: un volumen pequeño no necesita más shards. Cada shard consume memoria y descriptores de archivo, así que demasiados shards pequeños (*oversharding*) es uno de los problemas más comunes.
+- `number_of_replicas: 0`: el clúster tiene un solo nodo (ver Práctica 2) y así el índice queda `green`.
+- `refresh_interval: 5s`: los documentos se vuelven visibles para la búsqueda cada 5 segundos. El valor por defecto es 1 s; aumentarlo reduce el trabajo de indexación en cargas intensivas de logs.
 
-## Paso 3.3 · Crear el index template y simular
+#### Paso 2. Consulta y modifica los settings
 
-**Qué estás haciendo.** El *index template* es la regla que se activa al crear un índice o data stream cuyo nombre coincide con el patrón. Combina los componentes **en orden** (si dos definen lo mismo, gana el último) y declara que el resultado es un data stream.
+```http
+GET app-logs-lab/_settings
 
-Ejecuta el bloque **3.3**:
-
-```
-PUT _index_template/logs-rutanorte
+PUT app-logs-lab/_settings
 {
-  "index_patterns": [ "logs-rutanorte.*-*" ],
-  "data_stream": {},
-  "priority": 200,
-  "composed_of": [ "rutanorte@settings", "rutanorte@mappings" ],
-  "version": 1,
-  "_meta": { "descripcion": "Data streams de logs de los servicios de RutaNorte", ... }
+  "index": { "refresh_interval": "1s" }
+}
+
+GET app-logs-lab/_settings?filter_path=*.settings.index.refresh_interval,*.settings.index.number_of_*
+```
+
+**Qué hace y por qué:** algunos settings son **dinámicos** (`refresh_interval`, `number_of_replicas`) y se cambian en caliente; otros son **estáticos** (`number_of_shards`) y solo se definen al crear el índice. `filter_path` reduce la respuesta a los campos que te interesan, algo útil cuando la salida JSON es larga.
+
+#### Paso 3. Crea aliases, incluido un alias filtrado
+
+```http
+POST _aliases
+{
+  "actions": [
+    { "add": { "index": "app-logs-lab", "alias": "app-logs" } },
+    { "add": { "index": "app-logs-lab", "alias": "app-logs-errores",
+               "filter": { "term": { "log.level.keyword": "ERROR" } } } }
+  ]
+}
+
+GET _cat/aliases/app-logs*?v
+```
+
+**Qué hace y por qué:** un **alias** es un nombre lógico que apunta a uno o varios índices. Las aplicaciones y los dashboards consultan el alias, y el administrador puede cambiar el índice real sin afectarlos (lo harás en la Práctica 4 con un reindex). El alias **filtrado** `app-logs-errores` aplica siempre una condición, de modo que un equipo puede consultar solo los errores sin escribir el filtro. Todas las acciones de `_aliases` se aplican de forma **atómica**.
+
+#### Paso 4. Cierra y vuelve a abrir el índice
+
+```http
+POST app-logs-lab/_close
+GET _cat/indices/app-logs-lab?v&h=index,status,health
+GET app-logs-lab/_search
+
+POST app-logs-lab/_open
+GET _cat/indices/app-logs-lab?v&h=index,status,health
+```
+
+**Qué hace y por qué:** un índice **cerrado** conserva sus datos en disco, pero no consume memoria ni admite lecturas o escrituras: la búsqueda regresa el error `index_closed_exception`. Cerrar índices era una forma de "archivar" sin borrar, y también es necesario para cambiar ciertos settings estáticos, como los analizadores. En 8.x, para logs históricos se prefieren ILM y las fases cold y frozen (Práctica 10).
+
+#### Paso 5. Comprueba la protección contra borrados masivos
+
+```http
+PUT borrar-prueba-1
+PUT borrar-prueba-2
+
+DELETE borrar-prueba-*
+
+GET _cluster/settings?include_defaults=true&filter_path=*.action.destructive_requires_name
+
+DELETE borrar-prueba-1,borrar-prueba-2
+```
+
+**Qué hace y por qué:** en Elasticsearch 8.x, `action.destructive_requires_name` vale `true` por defecto, por lo que un `DELETE` con comodines **falla** con un error. Es una salvaguarda contra borrados accidentales de muchos índices; para eliminar, debes nombrar cada índice explícitamente.
+
+---
+
+### Tarea 2. Operaciones CRUD sobre documentos
+
+#### Paso 6. Indexa (crea) documentos con y sin ID
+
+```http
+PUT app-logs-lab/_doc/manual-1
+{
+  "@timestamp": "2026-10-20T08:00:00-06:00",
+  "service": { "name": "checkout-service" },
+  "host": { "name": "srv-app01" },
+  "log": { "level": "INFO" },
+  "message": "Documento de prueba creado manualmente",
+  "tags": ["manual"]
+}
+
+POST app-logs-lab/_doc
+{
+  "@timestamp": "2026-10-20T08:01:00-06:00",
+  "service": { "name": "cart-service" },
+  "log": { "level": "WARN" },
+  "message": "Documento con ID generado por Elasticsearch",
+  "tags": ["manual"]
 }
 ```
 
-| Parámetro | Explicación |
-|---|---|
-| `index_patterns` | Nombres a los que aplica. `logs-rutanorte.*-*` cubre `logs-rutanorte.reservas-prod`, `logs-rutanorte.pagos-qa`, etc. |
-| `data_stream: {}` | Indica que los nombres que coincidan se crean como **data streams**, no como índices normales |
-| `priority: 200` | Gana sobre la plantilla integrada `logs` (100). Dos templates que se traslapan **no pueden** tener la misma prioridad |
-| `composed_of` | Component templates a combinar, en orden |
+**Qué hace y por qué:** `PUT .../_doc/<id>` crea el documento con un ID propio, o lo **reemplaza** si ya existe. `POST .../_doc` genera un ID automático; es la forma más eficiente para logs, porque Elasticsearch no necesita verificar si el ID ya existe. Observa en la respuesta `_id`, `_version`, `_seq_no`, `_primary_term` y `result` (`created`).
 
-**3.3b · Simular antes de escribir.** Ejecuta el bloque **3.3b**:
+#### Paso 7. Usa `_create` para evitar sobrescrituras
 
-```
-POST _index_template/_simulate_index/logs-rutanorte.reservas-prod
+```http
+PUT app-logs-lab/_create/manual-1
+{
+  "message": "Esto falla porque el ID ya existe"
+}
 ```
 
-La simulación muestra **la configuración exacta** que tendría un índice con ese nombre, **sin crearlo**. Revisa:
+**Qué hace y por qué:** `_create` solo indexa si el ID **no** existe; si existe, responde `409 version_conflict_engine_exception`. Garantiza que un evento no se sobrescriba por error, por ejemplo, al reprocesar logs.
 
-| Sección de la respuesta | Qué comprobar |
-|---|---|
-| `template.settings.index` | `number_of_shards: 1`, `refresh_interval: 5s`, `codec: best_compression`. También puede aparecer `mode: logsdb`, que Elasticsearch 9.x aplica automáticamente a los data streams `logs-*-*` |
-| `template.mappings.properties` | Los campos de `rutanorte@mappings` con sus tipos |
-| `overlapping` | `[{ "name": "logs", "index_patterns": ["logs-*-*"] }]`: confirma que la plantilla integrada también coincidía, pero **perdió** por prioridad |
+#### Paso 8. Lee el documento
 
-> **Buena práctica.** Simula siempre después de cambiar un template. Un error de prioridad o de orden de componentes se descubre aquí, no en producción.
+```http
+GET app-logs-lab/_doc/manual-1
 
-## Paso 3.4 · Cargar los eventos de prueba
+GET app-logs-lab/_source/manual-1
 
-**Qué estás haciendo.** Escribes 48 eventos reales de RutaNorte (16 por servicio) con la API `_bulk`. Cada evento va a un data stream distinto según su servicio. Como los data streams **no existen todavía**, Elasticsearch los crea al recibir el primer evento, usando tu template.
-
-1. Abre `cap03/lab03-bulk-eventos.txt`.
-2. Copia **todo** su contenido y pégalo en una pestaña limpia de Console.
-3. Coloca el cursor en la línea `POST _bulk` y ejecuta.
-
-Estructura del archivo:
-
+HEAD app-logs-lab/_doc/no-existe
 ```
+
+**Qué hace y por qué:** `GET _doc` regresa el documento con sus metadatos; `_source` regresa solo el JSON original, y `HEAD` solo verifica si existe (200 o 404). La lectura por ID es **en tiempo real**: no depende del `refresh_interval`.
+
+#### Paso 9. Actualiza parcialmente y con script
+
+```http
+POST app-logs-lab/_update/manual-1
+{
+  "doc": {
+    "log": { "level": "WARN" },
+    "response_time_ms": 1500
+  }
+}
+
+POST app-logs-lab/_update/manual-1
+{
+  "script": {
+    "source": "ctx._source.tags.add(params.etiqueta); ctx._source.response_time_ms += params.extra",
+    "params": { "etiqueta": "revisado", "extra": 100 }
+  }
+}
+
+GET app-logs-lab/_doc/manual-1
+```
+
+**Qué hace y por qué:** `_update` con `doc` fusiona los campos indicados con el documento existente. Con `script` (lenguaje Painless) se aplica lógica, como agregar una etiqueta o sumar un valor. Internamente, Elasticsearch **reindexa** el documento completo, porque los segmentos de Lucene son inmutables. Por eso los logs, que casi nunca se modifican, se tratan como datos *append-only*.
+
+#### Paso 10. Aplica control de concurrencia optimista
+
+```http
+GET app-logs-lab/_doc/manual-1?filter_path=_seq_no,_primary_term
+
+# Sustituye 3 y 1 por los valores de _seq_no y _primary_term que obtuviste
+PUT app-logs-lab/_doc/manual-1?if_seq_no=3&if_primary_term=1
+{
+  "@timestamp": "2026-10-20T08:00:00-06:00",
+  "message": "Reemplazo controlado",
+  "tags": ["manual"]
+}
+```
+
+Ejecuta el `PUT` dos veces. La segunda vez responde `409` porque `_seq_no` ya cambió.
+
+**Qué hace y por qué:** `if_seq_no` e `if_primary_term` aseguran que solo se modifique la versión que leíste. Si otro proceso cambió el documento entretanto, la operación falla en lugar de perder cambios.
+
+#### Paso 11. Usa la Bulk API con varias operaciones
+
+```http
 POST _bulk
-{"create": {"_index": "logs-rutanorte.reservas-prod"}}
-{"@timestamp": "2026-03-27T18:00:27.899Z", "service.name": "reservas-api", "log.level": "info", ...}
-{"create": {"_index": "logs-rutanorte.asientos-prod"}}
-{"@timestamp": "...", "service.name": "asientos-api", ...}
-...
+{ "index": { "_index": "app-logs-lab", "_id": "manual-2" } }
+{ "@timestamp": "2026-10-20T08:02:00-06:00", "log": { "level": "INFO" }, "message": "Alta por bulk", "tags": ["manual"] }
+{ "create": { "_index": "app-logs-lab", "_id": "manual-3" } }
+{ "@timestamp": "2026-10-20T08:03:00-06:00", "log": { "level": "ERROR" }, "message": "Creado por bulk", "tags": ["manual"] }
+{ "update": { "_index": "app-logs-lab", "_id": "manual-2" } }
+{ "doc": { "log": { "level": "WARN" } } }
+{ "delete": { "_index": "app-logs-lab", "_id": "manual-3" } }
 ```
 
-| Parte | Explicación |
-|---|---|
-| `POST _bulk` (sin índice en la ruta) | Cada acción indica su propio destino en `_index`, así que una sola solicitud alimenta tres data streams |
-| `create` | Única acción de escritura válida en data streams |
-| Campos con punto (`service.name`) y objetos (`rutanorte: {…}`) | Ambas formas son equivalentes; Elasticsearch las convierte en la misma estructura de objetos |
+**Qué hace y por qué:** `_bulk` ejecuta muchas operaciones en una sola petición HTTP, con el formato NDJSON (una línea de acción y, para `index`, `create` y `update`, una línea de datos). Es la forma en que Filebeat, Logstash y Elastic Agent envían los logs. Revisa en la respuesta `"errors": false` y el `status` de cada elemento: un bulk **no es transaccional**, y cada operación puede fallar o tener éxito por separado.
 
-**Resultado esperado:** `"errors": false` y 48 elementos en `items`, cada uno con `"status": 201`.
+#### Paso 12. Elimina los documentos de prueba
 
-> El archivo `eventos-rutanorte.ndjson` tiene los mismos 48 eventos en formato NDJSON puro (un evento por línea, sin líneas de acción). Lo usarás como datos de origen en labs posteriores y para la carga desde **Integrations › Upload a file**.
+```http
+DELETE app-logs-lab/_doc/manual-1
 
-## Paso 3.5 · Revisar los data streams y su mapping efectivo
-
-**Qué estás haciendo.** Compruebas que los data streams se crearon con **tu** template y que los campos tienen los tipos que diseñaste.
-
-**3.5 · Data streams e índices de respaldo.** Ejecuta el bloque **3.5**:
-
-```
-GET _data_stream/logs-rutanorte.*?filter_path=data_streams.name,data_streams.generation,data_streams.template,data_streams.index_mode,data_streams.status,data_streams.indices.index_name
-
-GET _cat/indices/.ds-logs-rutanorte.*?v&h=index,health,pri,rep,docs.count,store.size&s=index
-```
-
-| Campo | Valor esperado |
-|---|---|
-| `name` | `logs-rutanorte.asientos-prod`, `logs-rutanorte.pagos-prod`, `logs-rutanorte.reservas-prod` |
-| `template` | **`logs-rutanorte`**, no `logs` |
-| `generation` | `1` |
-| `index_mode` | `logsdb` (predeterminado en 9.x para `logs-*-*`) |
-| `docs.count` en `_cat/indices` | 16 por índice de respaldo |
-
-> Observa que `ilm_policy` **no aparece**: tu template todavía no define ciclo de vida. En el Lab 7 le asignarás una política de retención.
-
-**3.5b · Mapping efectivo.** Ejecuta el bloque **3.5b**:
-
-```
-GET logs-rutanorte.pagos-prod/_mapping/field/http.response.status_code,rutanorte.monto_mxn,client.ip,message
-```
-
-`_mapping/field/<campos>` devuelve solo la definición de esos campos en cada índice de respaldo. Confirma `short`, `scaled_float`, `ip` y `match_only_text`.
-
-**3.5c · Dynamic template en acción.** Los eventos de `reservas-api` traen el campo `user_agent.original`, que **no** está declarado en `rutanorte@mappings`. Ejecuta el bloque **3.5c**:
-
-```
-GET logs-rutanorte.reservas-prod/_mapping/field/user_agent.original
-```
-
-Elasticsearch lo creó al recibir el primer evento, aplicando tu regla `cadenas_como_keyword`: el tipo es `keyword` con `ignore_above: 1024`, sin el subcampo `.keyword` que habría creado el mapeo dinámico por defecto.
-
-**3.5d · Primera consulta.** Ejecuta el bloque **3.5d**:
-
-```
-GET logs-rutanorte.pagos-prod/_search
+POST app-logs-lab/_delete_by_query?refresh=true
 {
-  "size": 3,
-  "sort": [ { "@timestamp": "desc" } ],
-  "_source": [ "@timestamp", "log.level", "message", "rutanorte.monto_mxn", "http.response.status_code" ],
-  "query": { "term": { "event.outcome": "failure" } }
+  "query": { "term": { "tags.keyword": "manual" } }
 }
+
+GET app-logs-lab/_count
 ```
 
-| Parámetro | Explicación |
-|---|---|
-| `size` | Número de documentos a devolver |
-| `sort` | Orden: los eventos más recientes primero |
-| `_source` | Campos a incluir en cada resultado |
-| `term` | Coincidencia exacta sobre un campo `keyword`. Encuentra los 3 pagos fallidos (HTTP 502) |
+**Qué hace y por qué:** `DELETE` borra un documento por ID; `_delete_by_query` borra todos los que cumplen una consulta. Aquí elimina los documentos de prueba, incluido el de ID automático, para que el índice quede vacío (`count: 0`) antes de la carga masiva. En logs, el borrado selectivo es poco común; la retención se maneja borrando índices completos con ILM, que es mucho más eficiente.
 
-Las consultas a fondo son tema del Lab 5. Aquí solo compruebas que los datos son consultables por tipo.
+#### Paso 13. Carga el archivo de logs con curl
 
-**3.5e · `flattened` contra la mapping explosion.** Ejecuta las tres solicitudes del bloque **3.5e**:
-1. Indexa un evento con **tres claves nuevas** en `labels` (`canal`, `campania`, `experimento`).
-2. Consulta el mapping de `labels*`: sigue existiendo **un solo campo**, `labels`, de tipo `flattened`.
-3. Busca con `term` sobre `labels.campania`: funciona sin que exista un campo `labels.campania` en el mapping.
+En PowerShell:
 
-> Si `labels` fuera un objeto dinámico, cada clave nueva (una por campaña, por experimento, por cliente…) crearía un campo. Con suficiente variedad se alcanza el límite de 500 campos y los documentos empiezan a rechazarse. Eso es la *mapping explosion*.
-
-## Paso 3.6 · Provocar y explicar un rechazo de mapping
-
-**Qué estás haciendo.** Reproduces un error real de integración: el equipo de Pagos envía el monto con formato de moneda (`"1,250.00"`) en lugar de como número.
-
-Ejecuta el bloque **3.6**. **Resultado esperado: HTTP 400**
-
-```json
-{
-  "error": {
-    "root_cause": [ {
-      "type": "document_parsing_exception",
-      "reason": "[1:217] failed to parse field [rutanorte.monto_mxn] of type [scaled_float] in document with id '...'. Preview of field's value: '1,250.00'"
-    } ],
-    "type": "document_parsing_exception",
-    "reason": "[1:217] failed to parse field [rutanorte.monto_mxn] of type [scaled_float] ...",
-    "caused_by": {
-      "type": "number_format_exception",
-      "reason": "For input string: \"1,250.00\""
-    }
-  },
-  "status": 400
-}
+```powershell
+. C:\labs\scripts\entorno.ps1
+es POST "/app-logs-lab/_bulk?refresh=true&filter_path=errors,took" -File C:\labs\datos\cap03_app_logs.ndjson
 ```
 
-**Interpretación**
+Después, en Dev Tools:
 
-| Pregunta | Respuesta |
-|---|---|
-| ¿Qué campo falló? | `rutanorte.monto_mxn`, de tipo `scaled_float` |
-| ¿Por qué? | La coma de miles no es un número válido. Elasticsearch acepta `1250.00` o `"1250.00"`, pero no `"1,250.00"` |
-| ¿Qué le pasó al documento? | **Se rechazó completo**: no se indexó ningún campo del evento |
-| ¿Por qué no se ignoró el campo? | Porque fijaste `index.mapping.ignore_malformed: false` en `rutanorte@settings` |
-
-Ejecuta el bloque **3.6b**: el mismo evento con `"monto_mxn": 1250.00` se indexa con `"result": "created"`.
-
-**¿Cómo se evita en producción?**
-
-| Opción | Cuándo usarla | Costo |
-|---|---|---|
-| Corregir el origen (el servicio envía un número) | Siempre que sea posible | Coordinar con el equipo dueño del servicio |
-| Normalizar en un **ingest pipeline** (procesadores `gsub` y `convert`) | Cuando no controlas el origen | Mantener el pipeline (**Lab 4**) |
-| **Failure store** del data stream | Para no perder nunca un evento rechazado y revisarlo después | Monitorear y reprocesar los fallos (**Lab 4**) |
-| `ignore_malformed: true` | Cuando el campo es secundario | El evento entra, pero sin ese campo, y nadie se entera |
-
-> **Si en lugar del error 400 recibes `201` con `"failure_store": "used"`**, tu deployment tiene el *failure store* activado para `logs-*-*`: el evento no se perdió, se guardó aparte. Revísalo con `GET logs-rutanorte.pagos-prod::failures/_search`. Lo estudiarás en el Lab 4.
-
-## Paso 3.7 · Evolucionar el diseño con un rollover
-
-**Qué estás haciendo.** Reservas pide registrar el número de pasajeros por reserva. Aprenderás la regla más importante de los templates: **solo se aplican al crear un índice**. Cambiar un template no modifica los índices de respaldo existentes. El cambio llega con la siguiente generación del data stream.
-
-1. Ejecuta el bloque **3.7**, que redefine `rutanorte@mappings` con `"version": 2` y el campo nuevo `rutanorte.pasajeros` de tipo `byte` (entero de −128 a 127).
-2. Ejecuta el bloque **3.7b**. El índice de respaldo actual **no** tiene el campo: la respuesta muestra `"mappings": {}` para él.
-3. Ejecuta el bloque **3.7c**:
-
-```
-POST logs-rutanorte.reservas-prod/_rollover
+```http
+GET app-logs-lab/_count
+GET app-logs-lab/_search?size=2
 ```
 
-| Campo de la respuesta | Significado |
-|---|---|
-| `old_index` | `.ds-logs-rutanorte.reservas-prod-AAAA.MM.DD-000001`: deja de recibir escrituras, pero se sigue consultando |
-| `new_index` | `.ds-logs-rutanorte.reservas-prod-AAAA.MM.DD-000002`: nuevo índice de escritura, creado con el template **vigente** |
-| `rolled_over` | `true` |
+**Qué hace y por qué:** el archivo tiene 80 líneas: 40 acciones `{"index":{}}` y 40 documentos. Como el índice va en la URL, las líneas de acción no repiten `_index`. `--data-binary` (dentro de la función `es`) envía el archivo sin alterar los saltos de línea, que son obligatorios en NDJSON. `refresh=true` hace visibles los documentos de inmediato. La respuesta esperada es `{"took":..,"errors":false}` y el conteo debe ser **40**.
 
-4. Ejecuta el bloque **3.7d**. El data stream tiene `generation: 2` y dos índices de respaldo, y `rutanorte.pasajeros` aparece **solo** en el nuevo.
+#### Paso 14. Revisa el mapping dinámico
 
-> Las búsquedas sobre `logs-rutanorte.reservas-prod` consultan **ambos** índices de respaldo de forma transparente. En el Lab 7, ILM hará el rollover automáticamente por tamaño o antigüedad.
-
-## Paso 3.8 · Conteos finales
-
-Ejecuta el bloque **3.8**:
-
-```
-GET _cat/count/logs-rutanorte.reservas-prod?v
-GET _cat/count/logs-rutanorte.asientos-prod?v
-GET _cat/count/logs-rutanorte.pagos-prod?v
+```http
+GET app-logs-lab/_mapping
 ```
 
-| Data stream | Documentos esperados | Origen |
-|---|---|---|
-| `logs-rutanorte.reservas-prod` | **17** | 16 del bulk + 1 de la prueba de `labels` (3.5e) |
-| `logs-rutanorte.asientos-prod` | **16** | 16 del bulk |
-| `logs-rutanorte.pagos-prod` | **17** | 16 del bulk + 1 corregido (3.6b); el rechazado no cuenta |
+**Qué hace y por qué:** no definiste un mapping, así que Elasticsearch lo **infirió**:
 
-> **No borres estos data streams ni los templates.** Son la base de los labs siguientes.
+- `@timestamp` es `date`, y `response_time_ms` y `http.response.status_code` son `long`.
+- Las cadenas (`message`, `log.level`, `service.name`, etc.) son `text` con un subcampo `keyword` (*multi-field*).
+- `source.ip` quedó como `text`/`keyword`, **no** como `ip`, porque la inferencia no detecta direcciones IP.
+
+Esta es la razón por la que en esta práctica usarás `campo.keyword` para comparaciones exactas. En la Práctica 4 diseñarás un mapping explícito que corrige estos tipos.
 
 ---
 
-## Verificación
+### Tarea 3. Búsquedas simples con Query DSL
 
-- [ ] `rutanorte@settings` y `rutanorte@mappings` existen, documentados con `_meta`. Los mappings están en `version: 2`.
-- [ ] `logs-rutanorte` tiene prioridad 200 y la simulación lista a `logs` en `overlapping`.
-- [ ] Los tres data streams usan el template `logs-rutanorte`.
-- [ ] Los mappings efectivos muestran `short`, `scaled_float`, `ip`, `match_only_text` y `flattened`.
-- [ ] Explicaste el rechazo de `monto_mxn`: campo, causa, efecto y cómo evitarlo.
-- [ ] `logs-rutanorte.reservas-prod` está en la generación 2 y solo el índice nuevo tiene `rutanorte.pasajeros`.
-- [ ] Los conteos son 17, 16 y 17.
+#### Paso 15. Busca texto completo con `match` y `match_phrase`
 
-## Pantalla de resultado final
+```http
+GET app-logs-lab/_search
+{
+  "query": { "match": { "message": "timeout" } }
+}
 
-![Data streams de RutaNorte con su template y generación en Kibana Dev Tools](img/lab03-resultado-final.png)
+GET app-logs-lab/_count
+{
+  "query": { "match": { "message": "base de datos" } }
+}
 
-*Pantalla de referencia del Paso 3.7d / 3.5: los tres data streams `logs-rutanorte.*` creados con el template `logs-rutanorte`, en modo `logsdb`, y `reservas-prod` en la generación 2. Las fechas de los índices de respaldo corresponden al día en que hagas el lab.*
+GET app-logs-lab/_count
+{
+  "query": { "match": { "message": { "query": "base de datos", "operator": "and" } } }
+}
 
-Para verlo también de forma gráfica, abre **Stack Management › Index Management › Data Streams** y filtra por `rutanorte`.
-
-## Solución de problemas
-
-| Síntoma | Causa probable | Solución |
-|---|---|---|
-| `index template [logs-rutanorte] has index patterns [...] matching patterns from existing templates [logs] with patterns (...) that have the same priority [100]` | La prioridad quedó en 100 | Usa `"priority": 200` |
-| El data stream muestra `"template": "logs"` | Escribiste eventos **antes** de crear tu template | Borra el data stream (`DELETE _data_stream/<nombre>`), revisa el template con el bloque 3.3b y repite el Paso 3.4 |
-| `_bulk` responde `"errors": true` | Algún evento no coincide con el mapping | Busca en `items` los elementos con `status` distinto de 201 y lee su `error.reason` |
-| `illegal_argument_exception` … `only write ops with an op_type of create are allowed in data streams` | Usaste `index` o `PUT …/_doc/<id>` | En data streams usa `create` o `POST …/_doc` |
-| El documento de 3.6 se indexó sin error | El template no tiene `ignore_malformed: false` o el failure store está activo | Revisa el bloque 3.2 y la nota sobre failure store del Paso 3.6 |
-
-## Preguntas de reflexión
-
-1. ¿Por qué RutaNorte usa un data stream por servicio en vez de uno para todos? Piensa en permisos (Pagos no debe ver Reservas) y en retención.
-2. Si mañana `pagos-api` empieza a enviar `http.response.status_code` como `"200 OK"`, ¿qué pasará? ¿Qué opción de la tabla del Paso 3.6 elegirías?
-3. ¿Qué diferencia hay entre cambiar `number_of_replicas` en un template y cambiarlo con `PUT <índice>/_settings`?
-
-## Lo que dejas listo para el Lab 4
-
-- Templates **`rutanorte@settings`**, **`rutanorte@mappings` (v2)** y **`logs-rutanorte`**.
-- Data streams **`logs-rutanorte.reservas-prod`**, **`asientos-prod`** y **`pagos-prod`** con 50 eventos en total.
-
-En el Lab 4 llegarán los servicios que **no** envían JSON limpio: `api-gateway` escribe líneas de texto y `portal-web` usa nombres de campo propios. Construirás **ingest pipelines** que los conviertan al contrato de datos que diseñaste hoy.
-
----
-
-## Archivo completo · `cap03/lab03-templates.txt`
-
+GET app-logs-lab/_count
+{
+  "query": { "match_phrase": { "message": "base de datos" } }
+}
 ```
-# =====================================================================
-# Lab 3 · Templates, mappings y data streams para los logs de RutaNorte
-# Archivo: cap03/lab03-templates.txt
-# Entorno: Kibana › Dev Tools › Console (sesión de rn_admin)
-# Los eventos de prueba están en cap03/lab03-bulk-eventos.txt (Paso 3.4)
-# =====================================================================
 
-### 3.1 Antes de crear: ¿qué plantillas ya existen para logs-*-*?
-GET _index_template/logs?filter_path=index_templates.name,index_templates.index_template.index_patterns,index_templates.index_template.priority,index_templates.index_template.composed_of
+**Qué hace y por qué:** `match` **analiza** el texto de búsqueda con el mismo analizador del campo (`standard`: minúsculas y separación por palabras) y busca los términos resultantes:
 
-### 3.2 Component template de settings
-PUT _component_template/rutanorte@settings
+| Consulta | Lógica | Resultado |
+|---|---|---|
+| `match "timeout"` | contiene el término `timeout` | 3 |
+| `match "base de datos"` | `base` **OR** `de` **OR** `datos` | 21 (la palabra común `de` aparece en muchos mensajes) |
+| `match ... operator: and` | contiene los tres términos, en cualquier orden | 5 |
+| `match_phrase` | los tres términos juntos y en ese orden | 5 |
+
+Para frases en logs, usa `match_phrase` u `operator: and`; un `match` simple con palabras comunes devuelve ruido.
+
+#### Paso 16. Compara `term` sobre `text` y sobre `keyword`
+
+```http
+GET app-logs-lab/_count
+{ "query": { "term": { "log.level": "ERROR" } } }
+
+GET app-logs-lab/_count
+{ "query": { "term": { "log.level.keyword": "ERROR" } } }
+```
+
+**Qué hace y por qué:** `term` **no analiza** el valor buscado. El campo `log.level` (tipo `text`) se indexó en minúsculas (`error`), así que buscar `ERROR` da **0**. El subcampo `log.level.keyword` guarda el valor exacto y da **8**. Regla práctica: usa `term`, `terms` y `range` sobre campos `keyword`, numéricos, de fecha o IP, y usa `match` sobre campos `text`.
+
+#### Paso 17. Busca varios valores exactos con `terms`
+
+```http
+GET app-logs-lab/_count
 {
-  "template": {
-    "settings": {
-      "index.number_of_shards": 1,
-      "index.number_of_replicas": 1,
-      "index.refresh_interval": "5s",
-      "index.codec": "best_compression",
-      "index.mapping.total_fields.limit": 500,
-      "index.mapping.ignore_malformed": false
-    }
-  },
-  "version": 1,
-  "_meta": {
-    "descripcion": "Settings comunes de los data streams de logs de RutaNorte",
-    "propietario": "equipo-plataforma",
-    "creado_en": "lab-03"
-  }
-}
-
-### 3.2b Component template de mappings
-PUT _component_template/rutanorte@mappings
-{
-  "template": {
-    "mappings": {
-      "dynamic": true,
-      "date_detection": false,
-      "dynamic_templates": [
-        {
-          "cadenas_como_keyword": {
-            "match_mapping_type": "string",
-            "mapping": { "type": "keyword", "ignore_above": 1024 }
-          }
-        }
-      ],
-      "properties": {
-        "@timestamp": { "type": "date" },
-        "message":    { "type": "match_only_text" },
-        "log":     { "properties": { "level": { "type": "keyword" } } },
-        "service": { "properties": {
-          "name":        { "type": "keyword" },
-          "environment": { "type": "keyword" },
-          "version":     { "type": "keyword" }
-        } },
-        "host":    { "properties": { "name": { "type": "keyword" } } },
-        "event":   { "properties": {
-          "outcome":  { "type": "keyword" },
-          "duration": { "type": "long" }
-        } },
-        "http":    { "properties": {
-          "request":  { "properties": { "method": { "type": "keyword" } } },
-          "response": { "properties": { "status_code": { "type": "short" } } }
-        } },
-        "url":     { "properties": { "path": { "type": "keyword" } } },
-        "client":  { "properties": { "ip": { "type": "ip" } } },
-        "trace":   { "properties": { "id": { "type": "keyword" } } },
-        "error":   { "properties": {
-          "type":    { "type": "keyword" },
-          "message": { "type": "match_only_text" }
-        } },
-        "labels":  { "type": "flattened" },
-        "rutanorte": { "properties": {
-          "reserva_id":  { "type": "keyword" },
-          "corrida":     { "type": "keyword" },
-          "origen":      { "type": "keyword" },
-          "destino":     { "type": "keyword" },
-          "metodo_pago": { "type": "keyword" },
-          "monto_mxn":   { "type": "scaled_float", "scaling_factor": 100 }
-        } }
-      }
-    }
-  },
-  "version": 1,
-  "_meta": {
-    "descripcion": "Mappings ECS y de negocio para los logs de RutaNorte",
-    "propietario": "equipo-plataforma",
-    "creado_en": "lab-03"
-  }
-}
-
-### 3.2c Revisar los component templates creados
-GET _component_template/rutanorte@*?filter_path=component_templates.name,component_templates.component_template.version,component_templates.component_template._meta
-
-### 3.3 Index template que combina ambos componentes
-PUT _index_template/logs-rutanorte
-{
-  "index_patterns": [ "logs-rutanorte.*-*" ],
-  "data_stream": {},
-  "priority": 200,
-  "composed_of": [ "rutanorte@settings", "rutanorte@mappings" ],
-  "version": 1,
-  "_meta": {
-    "descripcion": "Data streams de logs de los servicios de RutaNorte",
-    "propietario": "equipo-plataforma",
-    "creado_en": "lab-03"
-  }
-}
-
-### 3.3b Simular el índice que se crearía para reservas-api
-POST _index_template/_simulate_index/logs-rutanorte.reservas-prod
-
-### 3.4 Cargar los eventos: ejecuta el archivo cap03/lab03-bulk-eventos.txt
-# (48 eventos de reservas-api, asientos-api y pagos-api)
-
-### 3.5 Revisar los data streams y sus índices de respaldo
-GET _data_stream/logs-rutanorte.*?filter_path=data_streams.name,data_streams.generation,data_streams.template,data_streams.index_mode,data_streams.status,data_streams.indices.index_name
-
-GET _cat/indices/.ds-logs-rutanorte.*?v&h=index,health,pri,rep,docs.count,store.size&s=index
-
-### 3.5b Mapping efectivo de campos clave
-GET logs-rutanorte.pagos-prod/_mapping/field/http.response.status_code,rutanorte.monto_mxn,client.ip,message
-
-### 3.5c Un campo no declarado en el template (dynamic template en acción)
-GET logs-rutanorte.reservas-prod/_mapping/field/user_agent.original
-
-### 3.5d Consultar los eventos indexados
-GET logs-rutanorte.pagos-prod/_search
-{
-  "size": 3,
-  "sort": [ { "@timestamp": "desc" } ],
-  "_source": [ "@timestamp", "log.level", "message", "rutanorte.monto_mxn", "http.response.status_code" ],
   "query": {
-    "term": { "event.outcome": "failure" }
+    "terms": { "service.name.keyword": ["checkout-service", "payment-service"] }
   }
 }
+```
 
-### 3.5e labels es flattened: claves nuevas sin crear campos nuevos
-POST logs-rutanorte.reservas-prod/_doc
+**Qué hace y por qué:** `terms` equivale a un `IN` de SQL: devuelve los documentos cuyo valor coincide con **cualquiera** de la lista. El resultado es **16** (9 de checkout y 7 de payment).
+
+#### Paso 18. Filtra por rangos numéricos y de fechas
+
+```http
+GET app-logs-lab/_count
 {
-  "@timestamp": "2026-03-27T18:20:00.000Z",
-  "service.name": "reservas-api",
-  "log.level": "info",
-  "message": "Reserva RN-100399 creada desde campaña de temporada",
-  "labels": { "canal": "app-ios", "campania": "verano-2026", "experimento": "checkout-b" }
+  "query": { "range": { "response_time_ms": { "gte": 1000 } } }
 }
 
-GET logs-rutanorte.reservas-prod/_mapping/field/labels*
-
-GET logs-rutanorte.reservas-prod/_search
+GET app-logs-lab/_search
 {
-  "size": 1,
-  "_source": [ "message", "labels" ],
-  "query": { "term": { "labels.campania": "verano-2026" } }
-}
-
-### 3.6 Provocar un rechazo de mapping: el monto llega como texto con coma
-POST logs-rutanorte.pagos-prod/_doc
-{
-  "@timestamp": "2026-03-27T18:21:00.000Z",
-  "service.name": "pagos-api",
-  "log.level": "info",
-  "message": "Pago aprobado para la reserva RN-100400",
-  "http.response.status_code": 200,
-  "rutanorte": { "reserva_id": "RN-100400", "monto_mxn": "1,250.00", "metodo_pago": "tarjeta" }
-}
-
-### 3.6b El mismo evento corregido en el origen: el monto como número
-POST logs-rutanorte.pagos-prod/_doc
-{
-  "@timestamp": "2026-03-27T18:21:00.000Z",
-  "service.name": "pagos-api",
-  "log.level": "info",
-  "message": "Pago aprobado para la reserva RN-100400",
-  "http.response.status_code": 200,
-  "rutanorte": { "reserva_id": "RN-100400", "monto_mxn": 1250.00, "metodo_pago": "tarjeta" }
-}
-
-### 3.7 Evolucionar el diseño: versión 2 del template de mappings
-PUT _component_template/rutanorte@mappings
-{
-  "template": {
-    "mappings": {
-      "dynamic": true,
-      "date_detection": false,
-      "dynamic_templates": [
-        {
-          "cadenas_como_keyword": {
-            "match_mapping_type": "string",
-            "mapping": { "type": "keyword", "ignore_above": 1024 }
-          }
-        }
-      ],
-      "properties": {
-        "@timestamp": { "type": "date" },
-        "message":    { "type": "match_only_text" },
-        "log":     { "properties": { "level": { "type": "keyword" } } },
-        "service": { "properties": {
-          "name":        { "type": "keyword" },
-          "environment": { "type": "keyword" },
-          "version":     { "type": "keyword" }
-        } },
-        "host":    { "properties": { "name": { "type": "keyword" } } },
-        "event":   { "properties": {
-          "outcome":  { "type": "keyword" },
-          "duration": { "type": "long" }
-        } },
-        "http":    { "properties": {
-          "request":  { "properties": { "method": { "type": "keyword" } } },
-          "response": { "properties": { "status_code": { "type": "short" } } }
-        } },
-        "url":     { "properties": { "path": { "type": "keyword" } } },
-        "client":  { "properties": { "ip": { "type": "ip" } } },
-        "trace":   { "properties": { "id": { "type": "keyword" } } },
-        "error":   { "properties": {
-          "type":    { "type": "keyword" },
-          "message": { "type": "match_only_text" }
-        } },
-        "labels":  { "type": "flattened" },
-        "rutanorte": { "properties": {
-          "reserva_id":  { "type": "keyword" },
-          "corrida":     { "type": "keyword" },
-          "origen":      { "type": "keyword" },
-          "destino":     { "type": "keyword" },
-          "metodo_pago": { "type": "keyword" },
-          "monto_mxn":   { "type": "scaled_float", "scaling_factor": 100 },
-          "pasajeros":   { "type": "byte" }
-        } }
+  "query": {
+    "range": {
+      "@timestamp": {
+        "gte": "2026-10-20T12:00:00-06:00",
+        "lt":  "2026-10-20T13:00:00-06:00"
       }
     }
   },
-  "version": 2,
-  "_meta": {
-    "descripcion": "Mappings ECS y de negocio para los logs de RutaNorte",
-    "propietario": "equipo-plataforma",
-    "creado_en": "lab-03",
-    "cambio_v2": "Se agrega rutanorte.pasajeros (byte)"
+  "_source": ["@timestamp", "service.name", "message"]
+}
+```
+
+**Qué hace y por qué:** `range` admite `gt`, `gte`, `lt` y `lte`. Las fechas se guardan en UTC; al incluir la zona `-06:00` en el valor, la consulta se interpreta en hora de la Ciudad de México. Otra opción es usar el parámetro `"time_zone": "America/Mexico_City"`. Resultados: **9** eventos tardaron 1,000 ms o más, y **8** eventos ocurrieron entre las 12:00 y las 13:00. En logs, el rango de tiempo es el filtro más usado: Kibana lo agrega en cada consulta.
+
+#### Paso 19. Verifica la existencia de campos y usa comodines
+
+```http
+GET app-logs-lab/_count
+{ "query": { "exists": { "field": "user.name" } } }
+
+GET app-logs-lab/_search
+{
+  "query": { "wildcard": { "user.name.keyword": { "value": "*ez" } } },
+  "_source": ["user.name", "message"]
+}
+```
+
+**Qué hace y por qué:** `exists` devuelve los documentos que tienen un valor en el campo: **29** de 40 eventos tienen usuario, porque las consultas anónimas al catálogo no lo tienen. `wildcard` acepta `*` y `?` sobre campos `keyword`; devuelve **13** eventos de usuarios cuyo nombre termina en "ez". Los comodines al **inicio** del patrón (`*ez`) obligan a recorrer todo el diccionario de términos y son costosos en índices grandes; úsalos con moderación o prefiere el tipo `wildcard`, que se ve en la Práctica 4.
+
+---
+
+### Tarea 4. Consultas booleanas: `must`, `filter`, `should` y `must_not`
+
+La consulta `bool` combina otras consultas mediante cuatro cláusulas. Elegir la cláusula correcta afecta el **resultado**, la **relevancia** (`_score`) y el **rendimiento**.
+
+| Cláusula | ¿El documento debe cumplirla? | ¿Calcula `_score`? | Contexto | ¿Se puede cachear? | Uso recomendado en logs |
+|---|---|---|---|---|---|
+| `must` | Sí (AND) | **Sí**, suma relevancia | query | No | Búsqueda de texto completo donde importa qué tan bien coincide el texto, como un `match` sobre `message`. |
+| `filter` | Sí (AND) | **No** (score 0) | filter | **Sí** | Condiciones exactas: rango de tiempo, `service.name`, `log.level`, `host.name`, códigos HTTP o entorno. Es la cláusula **más usada** en análisis de logs. |
+| `should` | Opcional; con `minimum_should_match` se vuelve obligatoria (OR) | **Sí**, aumenta el score de lo que coincide | query | No | Expresar un OR (por ejemplo, "es 5xx **o** tardó más de 2 s") o dar prioridad a ciertos resultados sin excluir los demás. |
+| `must_not` | Debe **no** cumplirse (NOT) | **No** | filter | **Sí** | Excluir ruido: health checks, entorno de pruebas o servicios que no interesan. |
+
+> **Importante:** si una `bool` **no** tiene `must` ni `filter`, al menos una cláusula `should` debe cumplirse (`minimum_should_match` vale 1 de forma implícita). Si **sí** tiene `must` o `filter`, las `should` son opcionales y solo modifican el orden por relevancia, a menos que indiques `minimum_should_match`.
+
+#### Paso 20. Combina `must` y `filter`
+
+```http
+GET app-logs-lab/_search
+{
+  "query": {
+    "bool": {
+      "must": [
+        { "match": { "message": "pedido" } }
+      ],
+      "filter": [
+        { "term":  { "environment.keyword": "produccion" } },
+        { "range": { "response_time_ms": { "gte": 1000 } } }
+      ]
+    }
+  },
+  "_source": ["@timestamp", "service.name", "response_time_ms", "message"]
+}
+```
+
+**Qué hace y por qué:** `must` busca la palabra `pedido` en el mensaje y calcula relevancia; `filter` exige el entorno de producción y una latencia de 1 s o más, sin afectar el score. El resultado son **2** documentos: "Latencia alta al guardar el pedido…" y "Reintento de guardado de pedido…". Los mensajes "…base de datos de pedidos" **no** aparecen: `pedidos` es un término distinto de `pedido`, porque el analizador `standard` no reduce palabras a su raíz. En la Práctica 4 verás cómo un analizador en español lo resuelve.
+
+#### Paso 21. Excluye con `must_not`
+
+```http
+GET app-logs-lab/_search
+{
+  "query": {
+    "bool": {
+      "filter": [
+        { "term": { "log.level.keyword": "ERROR" } }
+      ],
+      "must_not": [
+        { "term": { "service.name.keyword": "catalog-service" } }
+      ]
+    }
+  },
+  "_source": ["service.name", "message"]
+}
+```
+
+**Qué hace y por qué:** obtiene los errores de todos los servicios **excepto** catálogo: **7** documentos. `must_not` se ejecuta en contexto de filtro, así que no calcula relevancia y su resultado puede cachearse.
+
+#### Paso 22. Expresa un OR con `should` y `minimum_should_match`
+
+```http
+GET app-logs-lab/_search
+{
+  "query": {
+    "bool": {
+      "filter": [
+        { "term": { "service.name.keyword": "checkout-service" } }
+      ],
+      "should": [
+        { "match": { "message": "timeout" } },
+        { "match": { "message": "latencia" } }
+      ],
+      "minimum_should_match": 1
+    }
+  },
+  "_source": ["@timestamp", "message", "response_time_ms"]
+}
+```
+
+Repite la consulta **sin** `"minimum_should_match": 1` y compara el número de resultados.
+
+**Qué hace y por qué:** con `minimum_should_match: 1`, el documento debe cumplir al menos una `should`: **3** resultados (dos timeouts y una latencia alta). Sin ese parámetro, como existe un `filter`, las `should` se vuelven opcionales y regresan **los 9** eventos de checkout. Los que coinciden con `timeout` o `latencia` aparecen primero por tener mayor score. Es el error más frecuente al construir consultas `bool`.
+
+#### Paso 23. Usa `should` para priorizar sin excluir
+
+```http
+GET app-logs-lab/_search
+{
+  "query": {
+    "bool": {
+      "must": [
+        { "match": { "message": "pedido" } }
+      ],
+      "should": [
+        { "term": { "log.level.keyword": { "value": "ERROR", "boost": 5 } } }
+      ]
+    }
+  },
+  "_source": ["log.level", "message"]
+}
+```
+
+**Qué hace y por qué:** regresa los **7** documentos con la palabra `pedido`, pero el de nivel `ERROR` aparece **primero** porque la `should` suma score (multiplicado por `boost`). Es útil en búsquedas interactivas: "muéstrame todo, pero los errores arriba".
+
+#### Paso 24. Construye una consulta operativa completa
+
+Pregunta: *"¿Qué eventos de producción entre las 09:00 y las 12:00 fueron errores del servidor (5xx) o tardaron 2 segundos o más?"*
+
+```http
+GET app-logs-lab/_search
+{
+  "query": {
+    "bool": {
+      "filter": [
+        { "term":  { "environment.keyword": "produccion" } },
+        { "range": { "@timestamp": { "gte": "2026-10-20T09:00:00", "lt": "2026-10-20T12:00:00", "time_zone": "America/Mexico_City" } } }
+      ],
+      "should": [
+        { "range": { "http.response.status_code": { "gte": 500 } } },
+        { "range": { "response_time_ms": { "gte": 2000 } } }
+      ],
+      "minimum_should_match": 1,
+      "must_not": [
+        { "term": { "service.name.keyword": "inventory-service" } }
+      ]
+    }
+  },
+  "sort": [ { "@timestamp": "asc" } ],
+  "_source": ["@timestamp", "service.name", "http.response.status_code", "response_time_ms", "message"]
+}
+```
+
+**Qué hace y por qué:** combina las cuatro cláusulas como se recomienda: las condiciones exactas van en `filter`, el OR en `should` con `minimum_should_match`, y la exclusión en `must_not`. El resultado son **6** eventos. Al ordenar por `@timestamp`, el score no se usa, así que no hace falta `must`: en análisis de logs, la mayoría de consultas son puramente de filtro.
+
+#### Paso 25. Compara el contexto query y el contexto filter
+
+```http
+GET app-logs-lab/_search
+{
+  "query": { "bool": { "must":   [ { "term": { "log.level.keyword": "ERROR" } } ] } },
+  "size": 3, "_source": false
+}
+
+GET app-logs-lab/_search
+{
+  "query": { "bool": { "filter": [ { "term": { "log.level.keyword": "ERROR" } } ] } },
+  "size": 3, "_source": false
+}
+```
+
+**Qué hace y por qué:** ambas regresan los mismos 8 documentos. Con `must`, cada resultado tiene un `_score` mayor que 0; con `filter`, el `_score` es **0.0**. El contexto filter evita el cálculo de relevancia y permite que Elasticsearch **cachee** el conjunto de documentos que cumplen la condición, lo que acelera consultas repetidas, como las de los dashboards que se actualizan cada minuto.
+
+---
+
+### Tarea 5. Ordenar, paginar y filtrar el `_source`
+
+#### Paso 26. Ordena y pagina con `from` y `size`
+
+```http
+GET app-logs-lab/_search
+{
+  "from": 0,
+  "size": 5,
+  "sort": [
+    { "response_time_ms": "desc" },
+    { "@timestamp": "asc" }
+  ],
+  "_source": ["service.name", "response_time_ms", "message"]
+}
+```
+
+Cambia `"from": 0` por `"from": 5` para ver la segunda página.
+
+**Qué hace y por qué:** muestra los 5 eventos más lentos (5000, 4200, 3010, 3005 y 2450 ms). El segundo criterio de orden desempata. `from`/`size` es sencillo, pero está limitado por `index.max_result_window` (10,000 por defecto), porque cada página profunda obliga a cada shard a ordenar `from + size` documentos.
+
+#### Paso 27. Pagina con `search_after` y un Point in Time (PIT)
+
+```http
+POST app-logs-lab/_pit?keep_alive=2m
+```
+
+Copia el `id` de la respuesta y úsalo en lugar de `<PIT_ID>`:
+
+```http
+GET _search
+{
+  "size": 10,
+  "pit": { "id": "<PIT_ID>", "keep_alive": "2m" },
+  "sort": [ { "@timestamp": "asc" } ],
+  "_source": ["@timestamp", "message"]
+}
+```
+
+En la respuesta, copia el arreglo `sort` del **último** resultado (por ejemplo, `[1760976067000, 9]`) y pide la siguiente página:
+
+```http
+GET _search
+{
+  "size": 10,
+  "pit": { "id": "<PIT_ID>", "keep_alive": "2m" },
+  "sort": [ { "@timestamp": "asc" } ],
+  "search_after": [1760976067000, 9],
+  "_source": ["@timestamp", "message"]
+}
+```
+
+Al terminar, libera el PIT:
+
+```http
+DELETE _pit
+{ "id": "<PIT_ID>" }
+```
+
+**Qué hace y por qué:** un **PIT** congela una vista consistente del índice, de modo que los documentos que llegan durante la paginación no desplazan las páginas. `search_after` continúa desde los valores de orden del último resultado, sin el costo de `from`, y no tiene límite de profundidad. Es el método recomendado para exportar o recorrer muchos logs. Con PIT, Elasticsearch agrega un desempate implícito (`_shard_doc`), por eso el arreglo `sort` tiene dos valores. La petición se hace a `_search` sin nombre de índice, porque el PIT ya lo incluye.
+
+#### Paso 28. Filtra los campos devueltos
+
+```http
+GET app-logs-lab/_search
+{
+  "size": 3,
+  "_source": {
+    "includes": ["@timestamp", "service.*", "log.level"],
+    "excludes": ["service.version"]
   }
 }
 
-### 3.7b El índice de respaldo actual NO cambia: el template solo aplica al crear índices
-GET logs-rutanorte.reservas-prod/_mapping/field/rutanorte.pasajeros
-
-### 3.7c Rollover: crear la generación 2 del data stream
-POST logs-rutanorte.reservas-prod/_rollover
-
-### 3.7d La nueva generación ya incluye el campo
-GET _data_stream/logs-rutanorte.reservas-prod?filter_path=data_streams.generation,data_streams.indices.index_name
-
-GET logs-rutanorte.reservas-prod/_mapping/field/rutanorte.pasajeros
-
-### 3.8 Resumen final: conteo por data stream
-GET _cat/count/logs-rutanorte.reservas-prod?v
-
-GET _cat/count/logs-rutanorte.asientos-prod?v
-
-GET _cat/count/logs-rutanorte.pagos-prod?v
+GET app-logs-lab/_search
+{
+  "size": 3,
+  "_source": false,
+  "fields": ["@timestamp", "service.name", "response_time_ms"]
+}
 ```
 
-## Archivo de datos · `cap03/lab03-bulk-eventos.txt` (primeras líneas)
+**Qué hace y por qué:** `_source` con `includes` y `excludes` (se permiten comodines) reduce el tamaño de la respuesta y el tráfico de red. `fields` devuelve los valores tal como están **mapeados**, por ejemplo, fechas normalizadas, y también funciona con runtime fields (Práctica 4). Kibana Discover usa `fields`.
 
-El archivo completo tiene 96 líneas de datos (48 acciones + 48 eventos) y se entrega en la carpeta `cap03/`.
+---
 
+### Resultado esperado
+
+- El índice `app-logs-lab` existe, está en estado `green`, tiene los aliases `app-logs` y `app-logs-errores` y contiene **40** documentos.
+
+```http
+GET _cat/indices/app-logs-lab?v&h=index,health,status,docs.count
+GET app-logs-errores/_count
 ```
-# =====================================================================
-# Lab 3 · Carga de eventos de prueba con la API _bulk
-# Archivo: cap03/lab03-bulk-eventos.txt
-# Entorno: Kibana › Dev Tools › Console
-# Origen de los datos: cap03/eventos-rutanorte.ndjson (48 eventos)
-# Ejecuta TODO el bloque como una sola solicitud (cursor en la línea POST _bulk).
-# =====================================================================
 
-### 3.4 Indexar 48 eventos en tres data streams
-POST _bulk
-{"create": {"_index": "logs-rutanorte.reservas-prod"}}
-{"@timestamp": "2026-03-27T18:00:27.899Z", "service.name": "reservas-api", "service.environment": "prod", "service.version": "3.4.1", "host.name": "reservas-7f9c-2", "trace.id": "fe641ee5de3ab2469d706d0099fde583", "client.ip": "189.203.14.12", "rutanorte": {"reserva_id": "RN-100300", "corrida": "TIJ-HMO 07:15", "origen": "TIJ", "destino": "HMO"}, "http.request.method": "POST", "url.path": "/v1/reservas", "log.level": "info", "http.response.status_code": 201, "event.outcome": "success", "event.duration": 56000000, "message": "Reserva RN-100300 creada para la corrida TIJ-HMO 07:15", "labels": {"canal": "app-android"}, "user_agent.original": "RutaNorteApp/4.2.0 (Android 15)"}
-{"create": {"_index": "logs-rutanorte.asientos-prod"}}
-{"@timestamp": "2026-03-27T18:01:05.700Z", "service.name": "asientos-api", "service.environment": "prod", "service.version": "2.9.0", "host.name": "asientos-5d2b-1", "trace.id": "07fbe7aae24bdb59be1321176df6d4fc", "client.ip": "201.141.88.11", "rutanorte": {"reserva_id": "RN-100301", "corrida": "CUU-TRC 10:20", "origen": "CUU", "destino": "TRC"}, "http.request.method": "PUT", "url.path": "/v1/corridas/CUUTRC/asientos/25", "log.level": "info", "http.response.status_code": 200, "event.outcome": "success", "event.duration": 8000000, "message": "Asiento 25 bloqueado para la reserva RN-100301"}
-{"create": {"_index": "logs-rutanorte.pagos-prod"}}
-{"@timestamp": "2026-03-27T18:01:13.418Z", "service.name": "pagos-api", "service.environment": "prod", "service.version": "5.1.2", "host.name": "pagos-8a1e-1", "trace.id": "6c39682d3b041bbfdba2f0fd756edf4e", "client.ip": "189.203.14.24", "rutanorte": {"reserva_id": "RN-100302", "corrida": "SLT-MTY 19:10", "origen": "SLT", "destino": "MTY", "monto_mxn": 978, "metodo_pago": "tarjeta"}, "http.request.method": "POST", "url.path": "/v1/pagos", "log.level": "info", "http.response.status_code": 200, "event.outcome": "success", "event.duration": 1356000000, "message": "Pago aprobado de 978.00 MXN para la reserva RN-100302"}
-...
+```text
+index        health status docs.count
+app-logs-lab green  open           40
 ```
+
+`app-logs-errores/_count` regresa **8**.
+
+- Resumen de resultados de las consultas:
+
+| Paso | Consulta | Resultado |
+|---|---|---|
+| 15 | `match` "timeout" / "base de datos" (OR) / (AND) / `match_phrase` | 3 / 21 / 5 / 5 |
+| 16 | `term` en `log.level` / `log.level.keyword` | 0 / 8 |
+| 17 | `terms` checkout o payment | 16 |
+| 18 | `range` ≥ 1000 ms / de 12:00 a 13:00 | 9 / 8 |
+| 19 | `exists user.name` / `wildcard *ez` | 29 / 13 |
+| 20 | `bool` must + filter | 2 |
+| 21 | `bool` filter + must_not | 7 |
+| 22 | `should` con / sin `minimum_should_match` | 3 / 9 |
+| 23 | `should` con boost | 7 (el ERROR primero) |
+| 24 | consulta operativa completa | 6 |
+
+- Puedes explicar con tus palabras cuándo usar `must`, `filter`, `should` y `must_not`, y por qué en el análisis de logs predominan `filter` y `must_not`.
+
+### Referencias
+
+- Elastic. *Index APIs [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/indices.html
+- Elastic. *Document APIs y Bulk API [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/docs-bulk.html
+- Elastic. *Boolean query [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/query-dsl-bool-query.html
+- Elastic. *Query and filter context [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/query-filter-context.html
+- Elastic. *Paginate search results [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/paginate-search-results.html

@@ -1,373 +1,264 @@
 # Administración de Elasticsearch para gestión y análisis de logs
 
-## Práctica 9. Crear usuarios y roles de mínimo privilegio para analistas, operadores y procesos de ingesta
+## Práctica 10. Configurar una política ILM de retención y una política SLM, y probar una restauración
 
 ### Objetivo
 
 Al finalizar la práctica, serás capaz de:
 
-- Verificar la seguridad por defecto de Elasticsearch 8.x: TLS, keystore, usuarios integrados y realms.
-- Diseñar roles con privilegios de clúster, de índice y de Kibana siguiendo el principio de mínimo privilegio.
-- Crear usuarios nativos y probar sus permisos.
-- Sustituir la contraseña de `elastic` en Filebeat por una API key con privilegios limitados.
-- Usar service accounts, seguridad a nivel de documento y de campo, auditoría y role mappings.
+- Diseñar una política de Index Lifecycle Management (ILM) con fases hot, warm, cold y delete, rollover, forcemerge y retención.
+- Asociar la política a un data stream mediante un index template y observar el avance de las fases y la migración entre data tiers.
+- Registrar un repositorio de snapshots en un sistema de archivos compartido (`path.repo`).
+- Automatizar respaldos con Snapshot Lifecycle Management (SLM) y su retención.
+- Restaurar un índice y un data stream, y comprobar la integridad de los datos.
 
 ### Objetivo visual
 
-![Modelo de seguridad: usuarios, roles y privilegios](img/cap09.png)
+![Ciclo de vida de un backing index y respaldo con SLM](img/cap10.png)
 
 ### Duración aproximada
 
-- 45 minutos.
+- 50 minutos.
 
 ### Prerrequisitos
 
-- Prácticas 2 a 8 completadas.
-- Licencia de prueba activa: la seguridad a nivel de documento y de campo y la auditoría no están incluidas en Basic.
-- Una ventana de PowerShell con el entorno cargado (`. C:\labs\scripts\entorno.ps1`).
+- Prácticas 5 a 9 completadas: data streams `logs-weblab.*` y `logs-syslog.lab-default`, e índices `servicios-logs-lab` y `tienda-logs-2026.10.20`.
+- Script `C:\labs\scripts\cargar_ilmlab.ps1`.
+- Permiso para reiniciar el servicio de Elasticsearch.
 
 ---
 
 ### Instrucciones
 
-**Escenario:** hasta ahora todo se hizo con el superusuario `elastic`, que puede borrar cualquier índice, cambiar la configuración del clúster y leer todos los datos. Antes de abrir la plataforma al resto de la organización, debes crear accesos de mínimo privilegio para tres perfiles:
+**Escenario:** la política de la empresa exige conservar los logs 30 días en almacenamiento rápido y después borrarlos, y tener un respaldo diario con 7 días de antigüedad, mínimo, para recuperarse de un borrado accidental. Primero probarás el ciclo completo con tiempos de **minutos**, para verlo funcionar durante la clase, y después aplicarás los tiempos reales.
 
-| Perfil | Necesita | No debe poder |
-|---|---|---|
-| **Analista** (NOC, soporte, auditoría) | Buscar logs y ver dashboards | Modificar índices, pipelines, dashboards o la configuración |
-| **Operador** (administración diaria) | Administrar data streams, templates, pipelines, ILM y reglas; ver la salud del clúster | Administrar usuarios ni la seguridad |
-| **Ingesta** (Filebeat, Logstash) | Escribir en sus data streams | Leer, borrar o escribir en otros índices |
+> **Importante:** los tiempos en minutos (`3m`, `10m`) y el `poll_interval` de 10 segundos son **solo para el laboratorio**. En producción, las fases se miden en días y el `poll_interval` se deja en su valor por defecto (10 minutos).
 
 ---
 
-### Tarea 1. Revisar la seguridad por defecto
+### Tarea 1. Revisar el ciclo de vida actual
 
-#### Paso 1. Identifica con qué usuario y realm te autenticas
-
-En **Dev Tools**:
+#### Paso 1. Revisa la política integrada `logs`
 
 ```http
-GET _security/_authenticate
+GET _ilm/policy/logs
 
-GET _xpack/usage?filter_path=security.realms.native,security.realms.file,security.ssl
+GET logs-weblab.access-default/_ilm/explain?filter_path=indices.*.policy,indices.*.phase,indices.*.action,indices.*.age
 ```
 
-**Qué hace y por qué:** `_authenticate` muestra el usuario (`elastic`), sus roles (`superuser`) y el **realm** que lo validó (`reserved`, el realm de los usuarios integrados). Un **realm** es una fuente de autenticación. En 8.x vienen activos `native` (usuarios guardados en un índice del clúster) y `file` (usuarios en archivos de cada nodo). Se pueden agregar `ldap`, `active_directory`, `saml`, `oidc`, `pki` y `kerberos`. `_xpack/usage` confirma que TLS está activo en las capas HTTP y de transporte.
+**Qué hace y por qué:** los data streams `logs-*-*` usan por defecto la política integrada `logs`, asignada por el component template `logs@settings`. Esa política hace **rollover** a los 30 días o a los 50 GB por shard primario, pero **no borra nada**: sin una política propia, los logs crecen indefinidamente hasta llenar el disco. `_ilm/explain` muestra en qué fase, acción y paso está cada backing index.
 
-#### Paso 2. Revisa los certificados y el keystore
+#### Paso 2. Acelera la evaluación de ILM para el laboratorio
 
 ```http
-GET _ssl/certificates?filter_path=*.path,*.subject_dn,*.expiry
+PUT _cluster/settings
+{
+  "persistent": { "indices.lifecycle.poll_interval": "10s" }
+}
 ```
 
-En PowerShell (como administrador):
-
-```powershell
-cd C:\elastic\elasticsearch
-.\bin\elasticsearch-keystore.bat list
-```
-
-**Qué hace y por qué:** `_ssl/certificates` lista los certificados en uso y su **fecha de expiración**. Un certificado vencido detiene la comunicación entre nodos y con los clientes, así que conviene vigilarlo. El **keystore** de Elasticsearch guarda cifrados los secretos que no deben estar en `elasticsearch.yml`, como las contraseñas de los archivos `.p12` (`xpack.security.http.ssl.keystore.secure_password`) y, en general, cualquier credencial de un repositorio de snapshots o de un realm LDAP.
-
-#### Paso 3. Revisa los usuarios integrados
-
-```http
-GET _security/user?filter_path=*.username,*.roles,*.enabled
-```
-
-**Qué hace y por qué:** además de `elastic` existen usuarios integrados para componentes: `kibana_system`, `logstash_system`, `beats_system`, `apm_system` y `remote_monitoring_user`. En 8.x, Kibana ya no usa `kibana_system`, sino un **service account token** (Paso 15). Los usuarios integrados no pueden borrarse, pero sí desactivarse o cambiarles la contraseña.
+**Qué hace y por qué:** ILM revisa periódicamente si cada índice cumple las condiciones para avanzar; por defecto, cada 10 minutos. Con 10 segundos verás los cambios en clase. Lo restablecerás al final de la práctica.
 
 ---
 
-### Tarea 2. Crear los roles
+### Tarea 2. Crear y aplicar una política ILM
 
-Un **rol** agrupa tres tipos de privilegios:
-
-| Tipo | Ejemplos | Aplica a |
-|---|---|---|
-| De **clúster** | `monitor`, `manage_ilm`, `manage_index_templates`, `manage_pipeline`, `manage_security` | Operaciones sobre todo el clúster |
-| De **índice** | `read`, `view_index_metadata`, `create_doc`, `auto_configure`, `monitor`, `manage`, `delete_index` | Índices, aliases y data streams que coinciden con `names` |
-| De **Kibana** | Discover, Dashboard, Visualize Library, Maps, Rules… en nivel **Read** o **All**, por space | Funciones y spaces de Kibana |
-
-#### Paso 4. Crea el rol de analista
+#### Paso 3. Crea la política
 
 ```http
-PUT _security/role/rol_analista_logs
+PUT _ilm/policy/lab-logs-retencion
 {
-  "description": "Consulta de logs y dashboards (solo lectura)",
-  "cluster": [],
-  "indices": [
-    {
-      "names": ["logs-*", "tienda-logs-*", "servicios-logs-lab"],
-      "privileges": ["read", "view_index_metadata"]
-    }
-  ]
-}
-```
-
-**Qué hace y por qué:** `read` permite buscar y agregar; `view_index_metadata` permite a Kibana leer los mappings para listar los campos en los data views. El analista no tiene privilegios de clúster. Un privilegio sobre un data stream (`logs-*`) se aplica también a sus backing indices.
-
-#### Paso 5. Crea el rol de operador
-
-```http
-PUT _security/role/rol_operador_logs
-{
-  "description": "Administracion diaria de la plataforma de logs (sin seguridad)",
-  "cluster": ["monitor", "manage_ilm", "manage_slm", "manage_index_templates", "manage_pipeline"],
-  "indices": [
-    {
-      "names": ["logs-*", "tienda-logs-*", "servicios-logs-lab", "alertas-lab-logs"],
-      "privileges": ["read", "view_index_metadata", "monitor", "manage"]
-    }
-  ]
-}
-```
-
-**Qué hace y por qué:** el operador puede ver la salud del clúster (`monitor`) y administrar políticas ILM y SLM, templates y pipelines. Sobre los índices de logs puede leer y administrar (`manage` incluye rollover, cambio de settings y aliases). No recibe `manage_security` ni `all`: no puede crearse más privilegios a sí mismo.
-
-#### Paso 6. Crea el rol de ingesta
-
-```http
-PUT _security/role/rol_ingesta_logs
-{
-  "description": "Escritura de Filebeat/Logstash en sus data streams",
-  "cluster": ["monitor", "read_ilm", "read_pipeline"],
-  "indices": [
-    {
-      "names": ["logs-weblab.*", "logs-syslog.*"],
-      "privileges": ["create_doc", "auto_configure"]
-    }
-  ]
-}
-```
-
-**Qué hace y por qué:** `create_doc` solo permite **agregar** documentos nuevos (no actualizar ni borrar), que es exactamente lo que necesita un data stream. `auto_configure` permite crear el data stream automáticamente la primera vez. Los privilegios de clúster `monitor`, `read_ilm` y `read_pipeline` los usan Filebeat y Logstash para verificar la conexión y la configuración. Un proceso de ingesta comprometido no podría leer ni borrar logs.
-
-#### Paso 7. Agrega los privilegios de Kibana desde la interfaz
-
-1. Ve a **Stack Management > Roles** y abre `rol_analista_logs`.
-2. En **Kibana**, haz clic en **Add Kibana privilege**, elige los spaces **Default** y **Operaciones**, y selecciona **Customize**.
-3. En **Analytics**, asigna **Read** a **Discover**, **Dashboard**, **Visualize Library** y **Maps**. Deja **None** en el resto.
-4. Haz clic en **Add Kibana privilege** y en **Update role**.
-5. Abre `rol_operador_logs` y agrega un privilegio para los mismos spaces: **All** en **Discover**, **Dashboard**, **Visualize Library** y **Maps**; en **Management**, **All** en **Stack Rules** y **Read** en **Stack Monitoring**. Haz clic en **Update role**.
-
-**Qué hace y por qué:** los privilegios de Kibana controlan qué **aplicaciones** se ven y si se pueden crear o modificar objetos, por space. Son independientes de los privilegios de índice: un usuario con Discover en **All** pero sin `read` sobre `logs-*` vería Discover vacío. Se configuran en la interfaz porque los nombres internos de estos privilegios cambian entre versiones de Kibana.
-
----
-
-### Tarea 3. Crear usuarios y probar el mínimo privilegio
-
-#### Paso 8. Crea los usuarios nativos
-
-```http
-POST _security/user/ana_analista
-{
-  "password": "Analista.Lab2026",
-  "roles": ["rol_analista_logs"],
-  "full_name": "Ana Analista",
-  "email": "ana.analista@ejemplo.mx"
-}
-
-POST _security/user/oscar_operador
-{
-  "password": "Operador.Lab2026",
-  "roles": ["rol_operador_logs"],
-  "full_name": "Oscar Operador"
-}
-
-POST _security/user/svc_ingesta
-{
-  "password": "Ingesta.Lab2026",
-  "roles": ["rol_ingesta_logs"],
-  "full_name": "Cuenta de servicio de ingesta",
-  "metadata": { "tipo": "proceso" }
-}
-```
-
-**Qué hace y por qué:** los usuarios del realm `native` se guardan en un índice del sistema y se replican en todo el clúster. Cada persona debe tener su propio usuario: compartir `elastic` impide saber quién hizo qué. En producción, las personas se autentican con LDAP, Active Directory o SAML (Tarea 6) y los procesos, con API keys.
-
-#### Paso 9. Prueba los permisos de la analista con curl
-
-En PowerShell:
-
-```powershell
-es GET "/_security/_authenticate?pretty" -User ana_analista -Password "Analista.Lab2026"
-es GET "/logs-weblab.access-default/_count" -User ana_analista -Password "Analista.Lab2026"
-es DELETE "/servicios-logs-lab" -User ana_analista -Password "Analista.Lab2026"
-es GET "/_cluster/settings" -User ana_analista -Password "Analista.Lab2026"
-```
-
-**Qué hace y por qué:** la función `es` del script de entorno acepta otro usuario y contraseña. Resultados:
-
-1. Usuario `ana_analista`, realm `default_native`, rol `rol_analista_logs`.
-2. Conteo de **3,421**: puede leer logs.
-3. Error **403** `security_exception`: *action [indices:admin/delete] is unauthorized for user [ana_analista]*. No puede borrar.
-4. Error **403**: no tiene privilegios de clúster.
-
-El 403 (*Forbidden*) significa que el usuario **sí** se autenticó, pero no tiene permiso; el 401 significa que no se autenticó.
-
-#### Paso 10. Prueba la cuenta de ingesta
-
-```powershell
-@"
-{"create":{}}
-{"message":"$((Get-Date).ToString("yyyy-MM-dd'T'HH:mm:ss.fffzzz")) INFO [checkout-service] [srv-app01] [trace=-] [user=-] Prueba de escritura con svc_ingesta"}
-"@ | Set-Content -Encoding ascii C:\labs\prueba_ingesta.ndjson
-
-es POST "/logs-weblab.app-default/_bulk?filter_path=errors,items.*.status" -File C:\labs\prueba_ingesta.ndjson -User svc_ingesta -Password "Ingesta.Lab2026"
-es POST "/servicios-logs-lab/_bulk?filter_path=errors,items.*.status,items.*.error.type" -File C:\labs\prueba_ingesta.ndjson -User svc_ingesta -Password "Ingesta.Lab2026"
-es GET "/logs-weblab.app-default/_search?size=1" -User svc_ingesta -Password "Ingesta.Lab2026"
-```
-
-**Qué hace y por qué:**
-
-1. Escribir en `logs-weblab.app-default` funciona (`status: 201`): el documento pasa por el pipeline `weblab-app` como cualquier otro.
-2. Escribir en `servicios-logs-lab` falla con `status: 403` (`security_exception`).
-3. Buscar falla con 403: la cuenta de ingesta **no puede leer** los logs que escribe.
-
-#### Paso 11. Prueba los accesos en Kibana
-
-1. Abre una ventana **privada** del navegador en `http://localhost:5601` e inicia sesión como `ana_analista`.
-2. Verifica que el menú solo muestre Discover, Dashboard, Visualize Library y Maps; abre el dashboard `Operación tienda - Logs web` y confirma que **no** aparece el botón **Edit**.
-3. Cierra sesión e ingresa como `oscar_operador`: puede editar dashboards, ver **Stack Management > Rules** e **Index Management**, pero no la sección **Security > Users**.
-
-**Qué hace y por qué:** comprueba en la interfaz el mismo modelo que probaste con curl. Kibana aplica los privilegios de Kibana y Elasticsearch aplica los de índice y clúster en cada consulta, aunque el usuario intente saltarse la interfaz.
-
----
-
-### Tarea 4. API keys y service accounts
-
-#### Paso 12. Crea una API key para Filebeat
-
-En **Dev Tools**:
-
-```http
-POST _security/api_key
-{
-  "name": "filebeat-weblab",
-  "role_descriptors": {
-    "filebeat_escritura": {
-      "cluster": ["monitor", "read_ilm", "read_pipeline"],
-      "indices": [
-        { "names": ["logs-weblab.*"], "privileges": ["create_doc", "auto_configure"] }
-      ]
-    }
-  },
-  "metadata": { "servicio": "filebeat", "equipo": "operaciones" }
-}
-```
-
-Copia los valores `id` y `api_key` de la respuesta.
-
-**Qué hace y por qué:** los privilegios efectivos de una API key son la **intersección** de los privilegios de quien la crea (`elastic`) y los `role_descriptors` indicados, así que esta llave solo puede escribir en `logs-weblab.*`. Las API keys son la forma recomendada de autenticar procesos: no exponen la contraseña de ninguna persona, se pueden rotar y revocar individualmente, y aceptan expiración.
-
-#### Paso 13. Configura Filebeat con la API key
-
-1. Detén Filebeat con `Ctrl + C` en su ventana.
-2. Edita `C:\elastic\filebeat\filebeat.yml`: comenta `username` y `password` y agrega `api_key` con el formato `id:api_key`:
-
-```yaml
-output.elasticsearch:
-  hosts: ["https://localhost:9200"]
-  #username: "elastic"
-  #password: "${ES_PWD}"
-  api_key: "<id>:<api_key>"
-  ssl.certificate_authorities: ['C:\elastic\elasticsearch\config\certs\http_ca.crt']
-```
-
-3. Prueba y vuelve a ejecutar:
-
-```powershell
-cd C:\elastic\filebeat
-.\filebeat.exe test output -c filebeat.yml
-.\filebeat.exe -e -c filebeat.yml
-```
-
-**Qué hace y por qué:** Filebeat deja de usar al superusuario. Si alguien obtuviera el archivo de configuración, solo podría agregar documentos a los data streams `logs-weblab.*`. Filebeat no reenvía los logs ya leídos, porque su *registry* recuerda la posición de cada archivo. Para mayor seguridad, la API key también puede guardarse en el keystore de Filebeat.
-
-#### Paso 14. Consulta e invalida API keys
-
-```http
-GET _security/api_key?name=filebeat-weblab&filter_path=api_keys.id,api_keys.name,api_keys.creation,api_keys.invalidated
-
-POST _security/api_key
-{ "name": "llave-temporal", "expiration": "1h" }
-
-DELETE _security/api_key
-{ "name": "llave-temporal" }
-```
-
-**Qué hace y por qué:** el inventario de API keys permite auditar qué procesos tienen acceso. Invalidar una llave corta el acceso de inmediato, por ejemplo, si un servidor se ve comprometido. La llave `reportes-programados-dashboard` de la Práctica 8b también aparece en el inventario.
-
-#### Paso 15. Revisa los service accounts
-
-```http
-GET _security/service
-
-GET _security/service/elastic/kibana/credential
-
-POST _security/service/elastic/fleet-server/credential/token/token-lab
-GET _security/service/elastic/fleet-server/credential
-DELETE _security/service/elastic/fleet-server/credential/token/token-lab
-```
-
-**Qué hace y por qué:** los **service accounts** son cuentas predefinidas para componentes de Elastic (`elastic/kibana`, `elastic/fleet-server`, `elastic/enterprise-search-server`) con privilegios fijos que no se pueden modificar. Se autentican con **tokens**. El token de Kibana lo creó la inscripción de la Práctica 2. El token de `fleet-server` creado aquí es el que usaría un Fleet Server; se elimina al terminar porque no se usa.
-
----
-
-### Tarea 5. Seguridad a nivel de documento y de campo, y auditoría
-
-#### Paso 16. Crea un rol con seguridad a nivel de documento (DLS) y de campo (FLS)
-
-```http
-PUT _security/role/rol_analista_pagos
-{
-  "description": "Solo eventos de checkout y pagos, sin datos personales",
-  "indices": [
-    {
-      "names": ["logs-weblab.app-*"],
-      "privileges": ["read", "view_index_metadata"],
-      "query": { "terms": { "service.name": ["checkout-service", "payment-service"] } },
-      "field_security": {
-        "grant": ["*"],
-        "except": ["user.name", "source.*", "event.original"]
+  "policy": {
+    "_meta": { "descripcion": "Politica de laboratorio con tiempos en minutos" },
+    "phases": {
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "rollover": { "max_docs": 200, "max_age": "3m", "max_primary_shard_size": "50gb" },
+          "set_priority": { "priority": 100 }
+        }
+      },
+      "warm": {
+        "min_age": "2m",
+        "actions": {
+          "forcemerge": { "max_num_segments": 1 },
+          "readonly": {},
+          "set_priority": { "priority": 50 }
+        }
+      },
+      "cold": {
+        "min_age": "5m",
+        "actions": {
+          "set_priority": { "priority": 0 }
+        }
+      },
+      "delete": {
+        "min_age": "10m",
+        "actions": { "delete": {} }
       }
     }
-  ]
+  }
 }
-
-POST _security/user/pablo_pagos
-{
-  "password": "Pagos.Lab2026",
-  "roles": ["rol_analista_pagos"],
-  "full_name": "Pablo Pagos"
-}
-```
-
-En PowerShell:
-
-```powershell
-es GET "/logs-weblab.app-default/_count" -User pablo_pagos -Password "Pagos.Lab2026"
-es GET "/logs-weblab.app-default/_search?size=1&filter_path=hits.hits._source&q=log.level:ERROR" -User pablo_pagos -Password "Pagos.Lab2026"
 ```
 
 **Qué hace y por qué:**
 
-- **DLS** (`query`): el usuario solo ve los documentos que cumplen la consulta. El conteo es **672** (520 de checkout + 152 de payment), más los eventos simulados en la Práctica 8b y el de prueba del Paso 10, en lugar de los más de 2,458 del data stream.
-- **FLS** (`field_security`): los campos `user.name`, `source.*` y `event.original` no aparecen en los resultados, ni siquiera en `_source`. Se excluye `event.original` porque contiene la línea completa, incluido el usuario.
+| Fase | Cuándo entra | Acciones | Propósito |
+|---|---|---|---|
+| **hot** | Al crearse el índice | `rollover` al llegar a 200 documentos, 3 minutos o 50 GB por shard primario | Recibir escrituras; el rollover crea un backing index nuevo y mantiene los índices de tamaño manejable. |
+| **warm** | 2 min después del rollover | `forcemerge` a 1 segmento, `readonly` | El índice ya no recibe escrituras; fusionar segmentos reduce el uso de disco y memoria y acelera las búsquedas. |
+| **cold** | 5 min después del rollover | baja prioridad de recuperación | Datos consultados con poca frecuencia, en hardware más económico. |
+| **delete** | 10 min después del rollover | `delete` | Cumplir la **retención**: borrar índices completos es inmediato y barato, a diferencia de borrar documentos. |
 
-Así un equipo puede analizar sus logs sin acceder a datos personales de clientes ni a eventos de otras áreas, en el mismo data stream.
+El `min_age` de cada fase se cuenta desde el **rollover** del índice, no desde su creación. `set_priority` define el orden de recuperación tras un reinicio: primero los índices hot. Las fases **warm** y **cold** incluyen de forma implícita la acción `migrate`, que mueve el índice al data tier correspondiente (Tarea 3). La fase **frozen** no se usa: requiere *searchable snapshots*, una función de licencia Enterprise.
 
-#### Paso 17. Activa la auditoría
+#### Paso 4. Crea el index template que asocia la política al data stream
 
-1. Edita `C:\elastic\elasticsearch\config\elasticsearch.yml` (como administrador) y agrega:
-
-```yaml
-xpack.security.audit.enabled: true
-xpack.security.audit.logfile.events.include: ["authentication_failed", "access_denied", "security_config_change"]
+```http
+PUT _index_template/logs-ilmlab
+{
+  "index_patterns": ["logs-ilmlab-*"],
+  "data_stream": {},
+  "priority": 200,
+  "composed_of": ["logs@mappings", "logs@settings", "ecs@mappings"],
+  "template": {
+    "settings": {
+      "index.lifecycle.name": "lab-logs-retencion",
+      "index.number_of_replicas": 0
+    }
+  }
+}
 ```
 
-2. Reinicia el servicio y espera a que responda:
+**Qué hace y por qué:** `index.lifecycle.name` en el template hace que **cada** backing index nuevo quede gobernado por la política. Sobrescribe la política `logs` que trae `logs@settings`. Asociar la política en el template, y no índice por índice, garantiza que el rollover herede la configuración.
+
+#### Paso 5. Carga datos de forma continua
+
+En una ventana de PowerShell aparte:
+
+```powershell
+. C:\labs\scripts\entorno.ps1
+C:\labs\scripts\cargar_ilmlab.ps1 -Rondas 20 -DocsPorRonda 40 -PausaSeg 30
+```
+
+**Qué hace y por qué:** el script envía 40 documentos cada 30 segundos durante unos 10 minutos (800 en total) al data stream `logs-ilmlab-default`, que se crea automáticamente con el template del paso anterior. Con estos valores, el rollover ocurre cada 2.5 minutos por el límite de 200 documentos. Deja el script en ejecución y continúa.
+
+#### Paso 6. Observa el rollover y el avance de las fases
+
+Ejecuta estas peticiones varias veces, con un par de minutos entre una y otra:
+
+```http
+GET _data_stream/logs-ilmlab-default?filter_path=data_streams.indices.index_name,data_streams.generation,data_streams.ilm_policy
+
+GET logs-ilmlab-default/_ilm/explain?filter_path=indices.*.phase,indices.*.action,indices.*.step,indices.*.age
+
+GET _cat/indices/.ds-logs-ilmlab-*?v&h=index,health,docs.count,pri.store.size&s=index&expand_wildcards=all
+```
+
+**Qué hace y por qué:** verás cómo aumenta `generation` y aparecen backing indices nuevos (`-000002`, `-000003`…). Solo el último recibe escrituras (*write index*). En `_ilm/explain`, los anteriores avanzan de `hot` a `warm` (acción `forcemerge`), luego a `cold` y finalmente desaparecen en la fase `delete`. Si un índice se queda en un paso con `step: ERROR`, la respuesta incluye `step_info` con la causa, y se reintenta con `POST <indice>/_ilm/retry`.
+
+#### Paso 7. Verifica el efecto de las acciones
+
+Cuando algún índice esté en fase `warm` o posterior, ejecuta:
+
+```http
+GET _cat/segments/.ds-logs-ilmlab-*?v&h=index,segment,docs.count,size&expand_wildcards=all
+
+GET .ds-logs-ilmlab-*/_settings?expand_wildcards=all&filter_path=**.routing.allocation.include._tier_preference,**.priority,**.blocks.write
+```
+
+**Qué hace y por qué:**
+
+- Los índices en warm o cold tienen **un solo segmento** (efecto de `forcemerge`), mientras que el write index puede tener varios.
+- `index.blocks.write: true` confirma que son de solo lectura.
+- `_tier_preference` cambia de `data_hot` a `data_warm,data_hot` y después a `data_cold,data_warm,data_hot`: es la acción `migrate` indicando a qué nivel debe moverse el índice.
+- `priority` baja de 100 a 50 y a 0.
+
+---
+
+### Tarea 3. Data tiers on premise
+
+#### Paso 8. Revisa los roles de tier del nodo
+
+```http
+GET _cat/nodes?v&h=name,node.role
+
+GET _cluster/allocation/explain
+{
+  "index": ".ds-logs-ilmlab-default-<fecha>-000001",
+  "shard": 0,
+  "primary": true
+}
+```
+
+Sustituye el nombre por un backing index que exista (usa el resultado del Paso 6). Si todos ya se borraron, usa el más antiguo disponible.
+
+**Qué hace y por qué:** el nodo tiene los roles `h` (hot), `w` (warm), `c` (cold) y `f` (frozen) a la vez, por lo que la migración entre tiers ocurre "en el mismo lugar": el índice cumple la preferencia sin moverse. En un clúster on premise real, los tiers se asignan a nodos con hardware distinto en `elasticsearch.yml`:
+
+```yaml
+# Nodos hot: SSD/NVMe, más CPU. Reciben escrituras y consultas recientes.
+node.roles: [ data_hot, data_content, ingest ]
+
+# Nodos warm: discos más grandes y económicos.
+node.roles: [ data_warm ]
+
+# Nodos cold: almacenamiento de gran capacidad; menos réplicas.
+node.roles: [ data_cold ]
+
+# Nodos maestros dedicados (3 para quórum), sin datos.
+node.roles: [ master ]
+```
+
+Con esa configuración, la acción `migrate` de ILM mueve los shards de un tipo de nodo a otro sin intervención manual, y `allocation explain` muestra el decider `data_tier`.
+
+---
+
+### Tarea 4. Aplicar la retención real a los logs de la tienda
+
+#### Paso 9. Crea la política de producción y aplícala
+
+```http
+PUT _ilm/policy/logs-tienda-30d
+{
+  "policy": {
+    "phases": {
+      "hot":    { "actions": { "rollover": { "max_age": "1d", "max_primary_shard_size": "50gb" } } },
+      "warm":   { "min_age": "7d",  "actions": { "forcemerge": { "max_num_segments": 1 }, "set_priority": { "priority": 50 } } },
+      "delete": { "min_age": "30d", "actions": { "delete": {} } }
+    }
+  }
+}
+
+PUT logs-weblab.access-default,logs-weblab.app-default,logs-syslog.lab-default/_settings
+{
+  "index.lifecycle.name": "logs-tienda-30d"
+}
+
+GET logs-weblab.*,logs-syslog.*/_ilm/explain?filter_path=indices.*.policy,indices.*.phase
+```
+
+**Qué hace y por qué:** cambiar `index.lifecycle.name` en los data streams actualiza sus backing indices **actuales**. Para que los **futuros** backing indices también la usen, agrega la misma línea en los templates `logs-weblab.access` y `logs-weblab.app` (en `template.settings`), o crea el component template `logs@custom`, que el template integrado `logs` incluye automáticamente. Con esta política, cada día se crea un índice nuevo, a los 7 días se compacta y a los 30 días se borra. El rollover diario hace que la retención sea precisa: se borra un día completo a la vez.
+
+---
+
+### Tarea 5. Repositorio de snapshots
+
+#### Paso 10. Declara la ruta del repositorio en `path.repo`
+
+En PowerShell como administrador:
+
+```powershell
+New-Item -ItemType Directory -Force -Path C:\elastic\respaldos
+notepad C:\elastic\elasticsearch\config\elasticsearch.yml
+```
+
+Agrega al final y guarda:
+
+```yaml
+path.repo: ["C:\\elastic\\respaldos"]
+```
+
+Reinicia el servicio:
 
 ```powershell
 Restart-Service elasticsearch-service-x64
@@ -375,102 +266,191 @@ Start-Sleep -Seconds 40
 es GET "/_cluster/health?pretty"
 ```
 
-3. Genera eventos auditables:
+**Qué hace y por qué:** por seguridad, Elasticsearch solo permite repositorios de tipo `fs` dentro de las rutas listadas en `path.repo`, que es un setting **estático** y requiere reiniciar. En un clúster de varios nodos, la ruta debe ser un **almacenamiento compartido** montado en el mismo lugar en **todos** los nodos maestros y de datos: un recurso NFS en Linux o una ruta UNC en Windows (`\\servidor\respaldos`, que en el YAML se escribe `path.repo: ["\\\\servidor\\respaldos"]`), accesible para la cuenta con la que corre el servicio. Un disco local solo sirve para un nodo único como este.
 
-```powershell
-es GET "/_cluster/health" -User ana_analista -Password "contrasena-incorrecta"
-es DELETE "/servicios-logs-lab" -User ana_analista -Password "Analista.Lab2026"
+#### Paso 11. Registra y verifica el repositorio
+
+```http
+PUT _snapshot/repo_local
+{
+  "type": "fs",
+  "settings": {
+    "location": "repo_local",
+    "compress": true
+  }
+}
+
+POST _snapshot/repo_local/_verify
 ```
 
-4. Revisa la bitácora:
+**Qué hace y por qué:** `location` relativa se resuelve dentro de `path.repo` (`C:\elastic\respaldos\repo_local`). `compress: true` comprime los metadatos. `_verify` comprueba que cada nodo puede escribir en el repositorio; en un clúster real detecta un nodo que no montó el recurso compartido. La respuesta lista el nodo `nodo-01`.
 
-```powershell
-Get-Content C:\elastic\logs\lab-logs_audit.json -Tail 5
+> **Alternativa S3 compatible on premise (MinIO, Ceph, etc.):** se agregan las credenciales al keystore (`elasticsearch-keystore add s3.client.minio.access_key` y `s3.client.minio.secret_key`), se configura el cliente en `elasticsearch.yml` (`s3.client.minio.endpoint: "minio.ejemplo.local:9000"`, `s3.client.minio.protocol: https`, `s3.client.minio.path_style_access: true`) y se registra el repositorio con `"type": "s3"` y `"settings": { "bucket": "respaldos-elastic", "client": "minio", "base_path": "lab-logs" }`. El plugin `repository-s3` viene incluido en 8.x.
+
+#### Paso 12. Toma un snapshot manual
+
+```http
+PUT _snapshot/repo_local/snap-manual-1?wait_for_completion=true
+{
+  "indices": "servicios-logs-lab,tienda-logs-*,logs-weblab.*,logs-syslog.*",
+  "include_global_state": false,
+  "metadata": { "motivo": "Practica 10 - respaldo antes de pruebas de restauracion" }
+}
+
+GET _cat/snapshots/repo_local?v&h=id,status,indices,successful_shards,failed_shards,duration
 ```
 
-**Qué hace y por qué:** la auditoría registra en `<cluster.name>_audit.json`, en formato JSON, quién intentó qué, desde qué IP y con qué resultado. Verás un evento `authentication_failed` (contraseña incorrecta) y un `access_denied` (intento de borrado). Se limita a eventos relevantes porque auditar cada acceso permitido (`access_granted`) genera un volumen enorme. Ese archivo puede ingerirse con Filebeat para analizarlo como cualquier otro log.
-
-> **Importante:** cambiar `elasticsearch.yml` requiere reiniciar el nodo. En un clúster de varios nodos se hace con un *rolling restart* (Práctica 11).
+**Qué hace y por qué:** el snapshot copia los segmentos de los índices y data streams indicados. Es **incremental**: un segundo snapshot solo copia los segmentos nuevos, por eso los respaldos frecuentes son baratos. Por la misma razón, los índices ya compactados con `forcemerge` se respaldan una sola vez. `include_global_state: false` excluye la configuración del clúster (templates, políticas, usuarios); inclúyela en un respaldo aparte si la necesitas. El estado debe ser `SUCCESS`.
 
 ---
 
-### Tarea 6. Otros realms y role mappings
+### Tarea 6. Automatizar con SLM
 
-#### Paso 18. Crea un usuario del realm `file` para emergencias
-
-En PowerShell como administrador:
-
-```powershell
-cd C:\elastic\elasticsearch
-.\bin\elasticsearch-users.bat useradd emergencia -p "Emergencia.Lab2026" -r superuser
-.\bin\elasticsearch-users.bat list
-es GET "/_security/_authenticate?filter_path=username,authentication_realm" -User emergencia -Password "Emergencia.Lab2026"
-.\bin\elasticsearch-users.bat userdel emergencia
-```
-
-**Qué hace y por qué:** los usuarios del realm `file` se guardan en `config\users` y `config\users_roles` de **cada nodo** y no dependen de que el índice de seguridad esté disponible. Por eso se usan como **cuenta de emergencia** (*break glass*) cuando el realm nativo o el LDAP no funcionan. La desventaja es que hay que mantenerlos en todos los nodos. La autenticación muestra el realm `default_file`.
-
-#### Paso 19. Revisa la configuración de LDAP/AD y SAML y crea un role mapping
-
-Lee esta configuración de ejemplo para Active Directory (**no la apliques**: el laboratorio no tiene un controlador de dominio):
-
-```yaml
-xpack.security.authc.realms.active_directory.ad1:
-  order: 1
-  domain_name: ejemplo.mx
-  url: ldaps://dc01.ejemplo.mx:636
-  ssl.certificate_authorities: ["C:\\elastic\\elasticsearch\\config\\certs\\ca-corporativa.crt"]
-  # La contrasena del usuario de enlace va en el keystore:
-  # elasticsearch-keystore add xpack.security.authc.realms.active_directory.ad1.secure_bind_password
-```
-
-Crea el role mapping que asignaría el rol de analista a un grupo de AD:
+#### Paso 13. Crea la política SLM
 
 ```http
-PUT _security/role_mapping/ad_analistas_logs
+PUT _slm/policy/slm-logs-diario
 {
-  "enabled": true,
-  "roles": ["rol_analista_logs"],
-  "rules": {
-    "all": [
-      { "field": { "realm.name": "ad1" } },
-      { "field": { "groups": "CN=Analistas-Logs,OU=Grupos,DC=ejemplo,DC=mx" } }
-    ]
+  "schedule": "0 30 1 * * ?",
+  "name": "<logs-diario-{now/d}>",
+  "repository": "repo_local",
+  "config": {
+    "indices": ["logs-*", "tienda-logs-*", "servicios-logs-lab"],
+    "include_global_state": false,
+    "ignore_unavailable": true
   },
-  "metadata": { "ticket": "CHG-5001" }
+  "retention": {
+    "expire_after": "7d",
+    "min_count": 2,
+    "max_count": 10
+  }
 }
-
-GET _security/role_mapping/ad_analistas_logs
 ```
 
-**Qué hace y por qué:** con realms externos los usuarios no se crean en Elasticsearch: el **role mapping** asigna roles según los atributos del usuario autenticado (realm, grupos, nombre, DN). Así el alta y la baja de personal se administran en el directorio corporativo. SAML (y OIDC) se configura de forma parecida y habilita el inicio de sesión único en Kibana con el proveedor de identidad de la organización. El mapping queda creado, pero no tiene efecto mientras no exista el realm `ad1`.
+**Qué hace y por qué:**
+
+- `schedule` usa sintaxis cron de Elasticsearch (con segundos): todos los días a la 01:30 UTC.
+- `name` usa *date math* y produce nombres como `logs-diario-2026.10.21-<id>`.
+- `retention` borra los snapshots con más de 7 días, pero siempre conserva al menos 2 (para no quedarse sin respaldos si fallan varios días seguidos) y nunca más de 10.
+
+Así se cumplen el respaldo diario y la retención mínima de 7 días del escenario.
+
+#### Paso 14. Ejecuta la política de inmediato y revisa su estado
+
+```http
+POST _slm/policy/slm-logs-diario/_execute
+
+GET _slm/policy/slm-logs-diario?human&filter_path=*.last_success,*.last_failure,*.next_execution,*.stats
+
+GET _cat/snapshots/repo_local?v&h=id,status,indices,duration
+
+GET _slm/stats
+```
+
+**Qué hace y por qué:** `_execute` dispara la política sin esperar al horario, una buena práctica después de crearla o modificarla. `last_success`, `next_execution` y las estadísticas permiten vigilar que los respaldos se ejecutan. En producción conviene crear una alerta si `last_failure` es más reciente que `last_success`. También puedes administrar las políticas en **Stack Management > Snapshot and Restore**.
+
+---
+
+### Tarea 7. Probar la restauración
+
+Un respaldo que nunca se ha restaurado no es un respaldo comprobado.
+
+#### Paso 15. Restaura un índice con otro nombre
+
+```http
+POST _snapshot/repo_local/snap-manual-1/_restore?wait_for_completion=true
+{
+  "indices": "servicios-logs-lab",
+  "rename_pattern": "(.+)",
+  "rename_replacement": "restaurado-$1",
+  "include_aliases": false
+}
+
+GET restaurado-servicios-logs-lab/_count
+GET servicios-logs-lab/_count
+```
+
+**Qué hace y por qué:** restaurar con otro nombre permite recuperar datos **junto** al índice actual, por ejemplo, para comparar o rescatar documentos borrados por error, sin sobrescribir nada. Ambos conteos deben ser **3,489**.
+
+#### Paso 16. Simula una pérdida y restaura el índice original
+
+```http
+DELETE servicios-logs-lab
+
+GET servicios-logs-lab/_count
+
+POST _snapshot/repo_local/snap-manual-1/_restore?wait_for_completion=true
+{
+  "indices": "servicios-logs-lab"
+}
+
+GET servicios-logs-lab/_count
+
+GET servicios-logs-lab/_search
+{
+  "size": 0,
+  "aggs": { "por_servicio": { "terms": { "field": "service.name" } } }
+}
+```
+
+**Qué hace y por qué:** después del `DELETE`, la consulta responde `index_not_found_exception`. Tras restaurar, el índice vuelve con **3,489** documentos y la agregación por servicio coincide con la Práctica 6 (catalog 1,318, cart 563, …). Un índice no puede restaurarse sobre otro abierto con el mismo nombre: primero se borra o se cierra.
+
+#### Paso 17. Restaura un data stream completo
+
+```http
+DELETE _data_stream/logs-syslog.lab-default
+
+POST _snapshot/repo_local/snap-manual-1/_restore?wait_for_completion=true
+{
+  "indices": "logs-syslog.lab-default",
+  "include_global_state": false
+}
+
+GET _data_stream/logs-syslog.lab-default?filter_path=data_streams.name,data_streams.indices.index_name,data_streams.status
+GET logs-syslog.lab-default/_count
+```
+
+**Qué hace y por qué:** al restaurar un data stream se recuperan sus backing indices y su definición. El conteo vuelve a ser **663**. Para que el data stream siga recibiendo datos después de restaurarlo, su index template debe existir en el clúster; aquí se usa el template integrado `logs`.
+
+#### Paso 18. Restablece los valores de laboratorio y limpia
+
+```http
+PUT _cluster/settings
+{
+  "persistent": { "indices.lifecycle.poll_interval": null }
+}
+
+DELETE restaurado-servicios-logs-lab
+DELETE _data_stream/logs-ilmlab-default
+```
+
+**Qué hace y por qué:** `null` regresa el setting a su valor por defecto. Se borran el índice restaurado de prueba y el data stream de laboratorio. Conserva el repositorio, la política SLM y la política `logs-tienda-30d`.
 
 ---
 
 ### Resultado esperado
 
-```http
-GET _security/role/rol_*?filter_path=*.description
-GET _security/user/ana_analista,oscar_operador,svc_ingesta,pablo_pagos?filter_path=*.username,*.roles
+- Durante la carga, `logs-ilmlab-default` llegó a tener varias generaciones, sus backing indices recorrieron las fases **hot → warm → cold → delete** y los primeros se borraron automáticamente.
+- En warm, los índices quedaron con 1 segmento, `blocks.write: true` y `_tier_preference: data_warm,data_hot`.
+- Los data streams de la tienda usan la política `logs-tienda-30d`.
+- Repositorio `repo_local` verificado y snapshots `SUCCESS`:
+
+```text
+id                                status  indices
+snap-manual-1                     SUCCESS 9
+logs-diario-2026.10.21-xxxxxxxxxx SUCCESS 9
 ```
 
-| Usuario o credencial | Rol | Prueba | Resultado |
-|---|---|---|---|
-| `ana_analista` | `rol_analista_logs` | Leer `logs-*` / borrar un índice / ver settings del clúster | 3,421 / 403 / 403 |
-| `oscar_operador` | `rol_operador_logs` | Editar dashboards, ver reglas e Index Management | Permitido; sin acceso a Security |
-| `svc_ingesta` | `rol_ingesta_logs` | Escribir en `logs-weblab.app-default` / en otro índice / leer | 201 / 403 / 403 |
-| API key `filebeat-weblab` | descriptor `filebeat_escritura` | Filebeat envía logs | `test output` OK |
-| `pablo_pagos` | `rol_analista_pagos` (DLS/FLS) | Conteo y campos visibles | 672 eventos originales (más los de prueba), sin `user.name` ni `source.*` |
+(El número de índices puede variar según los backing indices existentes).
 
-- La bitácora `lab-logs_audit.json` contiene eventos `authentication_failed` y `access_denied`.
-- Existe el role mapping `ad_analistas_logs`.
+- Las restauraciones devolvieron **3,489** documentos para `servicios-logs-lab` (con otro nombre y con el original) y **663** para `logs-syslog.lab-default`.
 
 ### Referencias
 
-- Elastic. *Secure the Elastic Stack [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/secure-cluster.html
-- Elastic. *Security privileges [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/security-privileges.html
-- Elastic. *Kibana privileges [8.19].* https://www.elastic.co/guide/en/kibana/8.19/kibana-privileges.html
-- Elastic. *API keys y Service accounts [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/service-accounts.html
-- Elastic. *Document and field level security [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/field-and-document-access-control.html
-- Elastic. *Auditing security settings [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/auditing-settings.html
-- Elastic. *Role mapping [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/mapping-roles.html
+- Elastic. *ILM: Manage the index lifecycle [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/index-lifecycle-management.html
+- Elastic. *Index lifecycle actions [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/ilm-actions.html
+- Elastic. *Data tiers [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/data-tiers.html
+- Elastic. *Snapshot and restore [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/snapshot-restore.html
+- Elastic. *Shared file system repository [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/snapshots-filesystem-repository.html
+- Elastic. *S3 repository [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/repository-s3.html
+- Elastic. *Automate snapshots with SLM [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/automate-snapshots-slm.html

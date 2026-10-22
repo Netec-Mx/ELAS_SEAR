@@ -1,1119 +1,476 @@
-# 4 Laboratorio final: Diagnosticar y documentar un incidente en una plataforma de logs
+# Administración de Elasticsearch para gestión y análisis de logs
 
-## Metadatos
+## Práctica 9. Crear usuarios y roles de mínimo privilegio para analistas, operadores y procesos de ingesta
 
-| Campo | Valor |
-|---|---|
-| Duración | 60 minutos |
-| Complejidad | Difícil |
-| Nivel de Bloom | Crear |
+### Objetivo
 
-## Descripción general
+Al finalizar la práctica, serás capaz de:
 
-En este laboratorio final investigarás un incidente controlado sobre el clúster `es930-lab-cluster` y los datos restaurados en `logs-ops-lab`. Partirás de síntomas observables en Kibana Discover y recopilarás evidencia antes de realizar cambios, diferenciando entre fallos de ingestión, permisos, asignación de shards y capacidad.
+- Verificar la seguridad por defecto de Elasticsearch 8.x: TLS, keystore, usuarios integrados y realms.
+- Diseñar roles con privilegios de clúster, de índice y de Kibana siguiendo el principio de mínimo privilegio.
+- Crear usuarios nativos y probar sus permisos.
+- Sustituir la contraseña de `elastic` en Filebeat por una API key con privilegios limitados.
+- Usar service accounts, seguridad a nivel de documento y de campo, auditoría y role mappings.
 
-La práctica concluye con una mitigación reversible, validación funcional y la redacción de un informe técnico de incidente que incorpore las líneas base, controles de seguridad, políticas ILM y garantías de recuperación de prácticas anteriores.
+### Objetivo visual
 
-## Objetivos de aprendizaje
+![Modelo de seguridad: usuarios, roles y privilegios](img/cap09.png)
 
-Al finalizar el laboratorio, podrás:
+### Duración aproximada
 
-- [ ] Delimitar un incidente de logs mediante Kibana Discover, KQL, Query DSL y ES|QL.
-- [ ] Recopilar evidencia no destructiva con las APIs de salud, shards, asignación, nodos, estadísticas, ILM y Bulk.
-- [ ] Distinguir síntomas, impacto, causas inmediatas, hipótesis y causa raíz probable.
-- [ ] Aplicar una mitigación segura y reversible para una réplica no viable o un problema controlado de permisos de ingestión.
-- [ ] Elaborar un informe técnico de incidente con cronología, evidencias, decisiones, escalamiento y acciones preventivas.
+- 45 minutos.
 
-## Prerrequisitos
+### Prerrequisitos
 
-### Conocimientos requeridos
-
-- Metodología de diagnóstico de Elasticsearch: delimitación, impacto, evidencia, hipótesis, mitigación y validación.
-- Uso básico de Kibana Discover, KQL, Elasticsearch Query DSL y ES|QL.
-- Interpretación de `_cluster/health`, `_cat/shards`, `_cluster/allocation/explain`, `_nodes/stats` e ILM.
-- Conceptos de roles, privilegios mínimos, API keys, ingestión Bulk, réplicas y clústeres de un nodo.
-- Contenido de las prácticas 6, 7, 8 y 9.
-
-### Acceso y estado requerido
-
-Antes de comenzar, confirma lo siguiente:
-
-- La Práctica 9 está completada.
-- `es930-lab` y `kibana930-lab` están disponibles.
-- El índice `logs-ops-lab` fue restaurado y contiene datos.
-- Las consultas guardadas de la Práctica 8 están disponibles en Kibana.
-- El runbook de actualización existe en:
-
-```text
-/opt/elastic-labs/reports/upgrade-runbook-717-to-930.md
-```
-
-- El archivo de credenciales existe y tiene permisos `0600`:
-
-```text
-/opt/elastic-labs/.env
-```
-
-> **Importante:** No ejecutes `docker compose down -v`. Esa operación eliminaría los volúmenes persistentes necesarios para la continuidad del curso.
-
-## Entorno del laboratorio
-
-### Componentes usados
-
-| Componente | Valor esperado |
-|---|---|
-| Elasticsearch objetivo | `es930-lab` / Elasticsearch 9.3.0 |
-| Kibana objetivo | `kibana930-lab` / Kibana 9.3.0 |
-| Clúster | `es930-lab-cluster` |
-| Nodo | `es930-node-1` |
-| Tipo de descubrimiento | `single-node` |
-| Índice de logs | `logs-ops-lab` |
-| Elasticsearch | `http://localhost:9201` |
-| Kibana | `http://localhost:5602` |
-| Directorio raíz | `/opt/elastic-labs` |
-| Directorio de evidencias | `/opt/elastic-labs/work/incident-10-00-01` |
-| Directorio de informes | `/opt/elastic-labs/reports` |
-
-### Preparación de la sesión
-
-1. Abre una terminal y prepara un directorio privado para las evidencias.
-
-   ```bash
-   cd /opt/elastic-labs
-   sudo mkdir -p /opt/elastic-labs/work/incident-10-00-01
-   sudo mkdir -p /opt/elastic-labs/reports
-   sudo chown -R "$USER":"$USER" /opt/elastic-labs/work/incident-10-00-01 /opt/elastic-labs/reports
-   chmod 700 /opt/elastic-labs/work/incident-10-00-01
-   umask 077
-   ```
-
-2. Carga las credenciales sin mostrarlas en pantalla.
-
-   ```bash
-   set -a
-   source /opt/elastic-labs/.env
-   set +a
-
-   export ES_URL="http://localhost:9201"
-   export KIBANA_URL="http://localhost:5602"
-   export EVIDENCE_DIR="/opt/elastic-labs/work/incident-10-00-01"
-   export REPORT="/opt/elastic-labs/reports/incident-10-00-01.md"
-   ```
-
-   Si la Práctica 9 dejó TLS habilitado en el endpoint HTTP, utiliza esta alternativa:
-
-   ```bash
-   export ES_URL="https://localhost:9201"
-   ```
-
-   En tal caso, añade `-k` a los comandos `curl` únicamente si el certificado es autofirmado dentro del laboratorio.
-
-3. Comprueba conectividad, autenticación y versión.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/?pretty" | tee "${EVIDENCE_DIR}/00-cluster-identidad.json"
-   ```
-
-**Resultado esperado**
-
-La respuesta incluye información similar a:
-
-```json
-{
-  "name" : "es930-node-1",
-  "cluster_name" : "es930-lab-cluster",
-  "version" : {
-    "number" : "9.3.0"
-  }
-}
-```
-
-**Verificación**
-
-Confirma que:
-
-```bash
-jq -r '.cluster_name, .name, .version.number' \
-  "${EVIDENCE_DIR}/00-cluster-identidad.json"
-```
-
-muestra `es930-lab-cluster`, `es930-node-1` y `9.3.0`.
-
-## Procedimiento paso a paso
-
-### Paso 1. Registrar la apertura del incidente y preservar la evidencia inicial
-
-**Objetivo:** Crear una referencia temporal del incidente y comprobar que los artefactos previos requeridos están disponibles antes de modificar el clúster.
-
-**Instrucciones**
-
-1. Registra fecha, zona horaria y contexto local.
-
-   ```bash
-   {
-     echo "incident_id=INC-10-00-01"
-     echo "investigador=$USER"
-     echo "inicio_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-     echo "host=$(hostname)"
-     echo "es_url=$ES_URL"
-     echo "kibana_url=$KIBANA_URL"
-   } | tee "${EVIDENCE_DIR}/01-contexto-incidente.txt"
-   ```
-
-2. Confirma que el runbook de actualización y recuperación está presente.
-
-   ```bash
-   ls -l /opt/elastic-labs/reports/upgrade-runbook-717-to-930.md \
-     | tee "${EVIDENCE_DIR}/01-runbook-disponible.txt"
-   ```
-
-3. Revisa el estado de los contenedores sin reiniciarlos ni recrearlos.
-
-   ```bash
-   docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' \
-     | tee "${EVIDENCE_DIR}/01-contenedores.txt"
-   ```
-
-4. Registra los índices existentes y verifica que `logs-ops-lab` está disponible.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/_cat/indices?v&s=index" \
-     | tee "${EVIDENCE_DIR}/01-cat-indices-inicial.txt"
-   ```
-
-**Resultado esperado**
-
-- Los contenedores `es930-lab` y `kibana930-lab` aparecen en ejecución.
-- Existe el archivo `upgrade-runbook-717-to-930.md`.
-- El índice `logs-ops-lab` aparece en la salida de `_cat/indices`.
-
-**Verificación**
-
-```bash
-grep -E 'es930-lab|kibana930-lab' "${EVIDENCE_DIR}/01-contenedores.txt"
-grep 'logs-ops-lab' "${EVIDENCE_DIR}/01-cat-indices-inicial.txt"
-```
-
-No realices todavía cambios en réplicas, ILM, pipelines, nodos, índices ni contenedores.
+- Prácticas 2 a 8 completadas.
+- Licencia de prueba activa: la seguridad a nivel de documento y de campo y la auditoría no están incluidas en Basic.
+- Una ventana de PowerShell con el entorno cargado (`. C:\labs\scripts\entorno.ps1`).
 
 ---
 
-### Paso 2. Delimitar el impacto funcional desde Kibana Discover
+### Instrucciones
 
-**Objetivo:** Identificar qué logs faltan o presentan errores, desde cuándo ocurre el problema y qué servicio está afectado.
+**Escenario:** hasta ahora todo se hizo con el superusuario `elastic`, que puede borrar cualquier índice, cambiar la configuración del clúster y leer todos los datos. Antes de abrir la plataforma al resto de la organización, debes crear accesos de mínimo privilegio para tres perfiles:
 
-**Instrucciones**
-
-1. Abre Kibana en el navegador:
-
-   ```text
-   http://localhost:5602
-   ```
-
-2. Inicia sesión con el usuario `elastic` y la contraseña definida en `/opt/elastic-labs/.env`.
-
-3. Accede a **Discover** y selecciona el data view asociado a `logs-ops-lab`.
-
-4. Carga la consulta guardada de la Práctica 8 destinada a investigar errores o actividad de `payments-api`.
-
-5. Establece un rango temporal que incluya los eventos del incidente. Si desconoces la hora exacta, comienza con **Last 24 hours** y ajusta el rango tras localizar el primer error.
-
-6. Ejecuta la siguiente consulta KQL, adaptando el nombre de campo solo si la consulta guardada de la Práctica 8 documenta una estructura diferente:
-
-   ```kql
-   service.name : "payments-api" and log.level : "error"
-   ```
-
-7. Registra manualmente en un archivo:
-   - rango temporal consultado;
-   - cantidad aproximada de resultados;
-   - primer y último evento relevante;
-   - mensajes de error repetidos;
-   - identificadores de correlación, si existen;
-   - evidencia visual exportada o captura de pantalla.
-
-   ```bash
-   cat > "${EVIDENCE_DIR}/02-discover-observaciones.md" <<'EOF'
-   # Observaciones de Discover
-
-   - Consulta guardada utilizada:
-   - KQL ejecutada: `service.name : "payments-api" and log.level : "error"`
-   - Rango temporal:
-   - Número aproximado de eventos:
-   - Primer evento relevante:
-   - Último evento relevante:
-   - Mensajes repetidos:
-   - Servicios afectados:
-   - Impacto observado por el usuario:
-   - Archivo de captura/exportación:
-   EOF
-   ```
-
-8. Como corroboración por API, ejecuta una consulta Query DSL para contar errores por minuto. Ajusta el campo `log.level` si tu esquema usa otro campo equivalente.
-
-   ```bash
-   cat > "${EVIDENCE_DIR}/02-payments-errors-query.json" <<'EOF'
-   {
-     "size": 0,
-     "query": {
-       "bool": {
-         "filter": [
-           { "term": { "service.name.keyword": "payments-api" } },
-           { "term": { "log.level.keyword": "error" } }
-         ]
-       }
-     },
-     "aggs": {
-       "errores_por_minuto": {
-         "date_histogram": {
-           "field": "@timestamp",
-           "fixed_interval": "1m"
-         }
-       }
-     }
-   }
-   EOF
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -H 'Content-Type: application/json' \
-     -X POST "${ES_URL}/logs-ops-lab/_search?pretty" \
-     --data-binary @"${EVIDENCE_DIR}/02-payments-errors-query.json" \
-     | tee "${EVIDENCE_DIR}/02-payments-errors-dsl.json"
-   ```
-
-9. Ejecuta una consulta ES|QL equivalente para obtener una tendencia resumida.
-
-   ```bash
-   cat > "${EVIDENCE_DIR}/02-payments-errors-esql.json" <<'EOF'
-   {
-     "query": "FROM logs-ops-lab | WHERE service.name == \"payments-api\" AND log.level == \"error\" | STATS errores = COUNT(*) BY bucket = DATE_TRUNC(1 minute, @timestamp) | SORT bucket ASC"
-   }
-   EOF
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -H 'Content-Type: application/json' \
-     -X POST "${ES_URL}/_query?format=json" \
-     --data-binary @"${EVIDENCE_DIR}/02-payments-errors-esql.json" \
-     | tee "${EVIDENCE_DIR}/02-payments-errors-esql.json.out"
-   ```
-
-**Resultado esperado**
-
-- Discover muestra eventos de error asociados a `payments-api`.
-- La agregación Query DSL revela uno o más intervalos con incremento de errores.
-- ES|QL devuelve una serie temporal agrupada por minuto.
-- Puede observarse que los errores de aplicación no prueban por sí solos una caída de Elasticsearch: son un síntoma que debe correlacionarse con ingestión y estado del clúster.
-
-**Verificación**
-
-Comprueba la cantidad total de errores devuelta por Query DSL:
-
-```bash
-jq '.hits.total' "${EVIDENCE_DIR}/02-payments-errors-dsl.json"
-```
-
-Revisa la salida ES|QL:
-
-```bash
-jq '.' "${EVIDENCE_DIR}/02-payments-errors-esql.json.out"
-```
-
-Conserva la captura de Discover en el directorio de evidencia con un nombre como:
-
-```text
-02-discover-payments-api-errors.png
-```
-
----
-
-### Paso 3. Recopilar evidencia técnica del clúster sin modificarlo
-
-**Objetivo:** Determinar si el incidente incluye degradación de disponibilidad, shards no asignados, presión de recursos, crecimiento anómalo o incumplimiento de ILM.
-
-**Instrucciones**
-
-1. Captura la salud del clúster.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/_cluster/health?pretty" \
-     | tee "${EVIDENCE_DIR}/03-cluster-health-antes.json"
-   ```
-
-2. Registra los nodos, sus roles y métricas básicas.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/_cat/nodes?v&h=name,roles,master,heap.percent,ram.percent,cpu,load_1m,disk.used_percent" \
-     | tee "${EVIDENCE_DIR}/03-cat-nodes-antes.txt"
-   ```
-
-3. Captura el tamaño, salud y cantidad de documentos de los índices.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/_cat/indices?v&s=store.size:desc" \
-     | tee "${EVIDENCE_DIR}/03-cat-indices-antes.txt"
-   ```
-
-4. Examina los shards, ordenándolos por estado e índice.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/_cat/shards?v&s=state,index" \
-     | tee "${EVIDENCE_DIR}/03-cat-shards-antes.txt"
-   ```
-
-5. Si hay shards no asignados, solicita una explicación de asignación. No supongas la causa.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -X GET "${ES_URL}/_cluster/allocation/explain?pretty" \
-     | tee "${EVIDENCE_DIR}/03-allocation-explain-antes.json"
-   ```
-
-6. Obtén métricas de JVM, sistema de archivos, proceso e indexación del nodo.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/_nodes/stats/jvm,fs,process,indices?pretty" \
-     | tee "${EVIDENCE_DIR}/03-nodes-stats-antes.json"
-   ```
-
-7. Obtén estadísticas específicas del índice de logs.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/logs-ops-lab/_stats?pretty" \
-     | tee "${EVIDENCE_DIR}/03-logs-ops-stats-antes.json"
-   ```
-
-8. Revisa el estado ILM y los pipelines configurados para el índice.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/logs-ops-lab/_ilm/explain?pretty" \
-     | tee "${EVIDENCE_DIR}/03-ilm-explain-antes.json"
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/logs-ops-lab/_settings?filter_path=*.settings.index.number_of_replicas,*.settings.index.default_pipeline,*.settings.index.final_pipeline&pretty" \
-     | tee "${EVIDENCE_DIR}/03-index-settings-antes.json"
-   ```
-
-**Resultado esperado**
-
-En el escenario previsto puede aparecer una combinación de estas condiciones:
-
-- Estado `yellow`.
-- Un shard réplica `UNASSIGNED`.
-- Un mensaje de `_cluster/allocation/explain` que indique que una réplica no puede asignarse al mismo nodo que su shard primario.
-- Un único nodo de datos en el clúster.
-- Un índice `logs-ops-lab` con `number_of_replicas: "1"`.
-- Métricas de heap, CPU y disco que deben compararse con las líneas base de la Práctica 6.
-- ILM activo o configurado según la Práctica 7.
-
-**Verificación**
-
-Ejecuta los siguientes controles rápidos:
-
-```bash
-jq '{status, number_of_nodes, active_primary_shards, active_shards, unassigned_shards}' \
-  "${EVIDENCE_DIR}/03-cluster-health-antes.json"
-
-grep 'UNASSIGNED' "${EVIDENCE_DIR}/03-cat-shards-antes.txt" || true
-
-jq '.' "${EVIDENCE_DIR}/03-allocation-explain-antes.json"
-```
-
-Documenta una primera separación entre hechos y conclusiones:
-
-| Tipo | Ejemplo que debes adaptar a tu evidencia |
-|---|---|
-| Síntoma | Discover presenta errores de `payments-api` o ausencia de logs recientes. |
-| Impacto | Operadores no pueden confiar plenamente en los paneles o en la trazabilidad de pagos. |
-| Hecho técnico | El clúster tiene un shard réplica no asignado. |
-| Hipótesis | La réplica no se asigna porque el clúster solo tiene un nodo. |
-| Evidencia confirmatoria | `_cluster/allocation/explain` informa una decisión `same_shard` o equivalente. |
-
----
-
-### Paso 4. Investigar errores de ingestión y permisos mediante respuestas Bulk
-
-**Objetivo:** Confirmar si la ingestión falla por permisos insuficientes o una configuración de ingestión y separar ese fallo de la condición de réplicas.
-
-**Instrucciones**
-
-1. Busca primero artefactos de la simulación o respuestas Bulk que el instructor haya proporcionado.
-
-   ```bash
-   find /opt/elastic-labs/work -maxdepth 3 -type f \
-     \( -iname '*bulk*' -o -iname '*ingest*' -o -iname '*incident*' \) \
-     -printf '%TY-%Tm-%Td %TH:%TM %p\n' 2>/dev/null \
-     | sort \
-     | tee "${EVIDENCE_DIR}/04-artefactos-disponibles.txt"
-   ```
-
-2. Examina los ajustes de pipeline capturados en el paso anterior. Si `default_pipeline` o `final_pipeline` contiene un nombre, inspecciónalo sin modificarlo.
-
-   ```bash
-   PIPELINE_NAME=$(jq -r '
-     to_entries[]
-     | .value.settings.index.default_pipeline // .value.settings.index.final_pipeline // empty
-   ' "${EVIDENCE_DIR}/03-index-settings-antes.json" | head -n 1)
-
-   echo "pipeline_detectado=${PIPELINE_NAME:-ninguno}" \
-     | tee "${EVIDENCE_DIR}/04-pipeline-detectado.txt"
-
-   if [ -n "${PIPELINE_NAME}" ]; then
-     curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-       "${ES_URL}/_ingest/pipeline/${PIPELINE_NAME}?pretty" \
-       | tee "${EVIDENCE_DIR}/04-pipeline-inspeccion.json"
-   fi
-   ```
-
-3. Si el instructor ya proporcionó una respuesta Bulk fallida, cópiala al directorio de evidencias y analízala con `jq`. Si no existe, ejecuta la siguiente reproducción controlada autorizada. Esta prueba crea una API key sin privilegio de escritura y no debe indexar ningún documento.
-
-   ```bash
-   RUN_ID="lab-$(date -u +%Y%m%dT%H%M%SZ)"
-
-   cat > "${EVIDENCE_DIR}/04-api-key-denied-request.json" <<EOF
-   {
-     "name": "incident-denied-${RUN_ID}",
-     "role_descriptors": {
-       "lectura_sin_ingestion": {
-         "cluster": [],
-         "indices": [
-           {
-             "names": ["logs-ops-lab"],
-             "privileges": ["read"]
-           }
-         ]
-       }
-     }
-   }
-   EOF
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -H 'Content-Type: application/json' \
-     -X POST "${ES_URL}/_security/api_key" \
-     --data-binary @"${EVIDENCE_DIR}/04-api-key-denied-request.json" \
-     | tee "${EVIDENCE_DIR}/04-api-key-denied-response.json"
-
-   export DENIED_KEY_ID
-   export DENIED_KEY
-   DENIED_KEY_ID=$(jq -r '.id' "${EVIDENCE_DIR}/04-api-key-denied-response.json")
-   DENIED_KEY=$(jq -r '.encoded' "${EVIDENCE_DIR}/04-api-key-denied-response.json")
-
-   cat > "${EVIDENCE_DIR}/04-bulk-denied.ndjson" <<EOF
-   {"create":{"_id":"${RUN_ID}-denied"}}
-   {"@timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","service":{"name":"payments-api"},"log":{"level":"error"},"message":"Prueba controlada de API key sin privilegio create_doc","event":{"kind":"event","dataset":"lab.incident"}}
-   EOF
-
-   curl -sS \
-     -H "Authorization: ApiKey ${DENIED_KEY}" \
-     -H 'Content-Type: application/x-ndjson' \
-     -X POST "${ES_URL}/logs-ops-lab/_bulk?refresh=true" \
-     --data-binary @"${EVIDENCE_DIR}/04-bulk-denied.ndjson" \
-     | tee "${EVIDENCE_DIR}/04-bulk-denied-response.json"
-   ```
-
-4. Analiza la respuesta Bulk.
-
-   ```bash
-   jq '{
-     errors,
-     items: [
-       .items[]
-       | {
-           operation: (keys[0]),
-           status: (.[] .status),
-           error_type: (.[] .error.type // null),
-           reason: (.[] .error.reason // null)
-         }
-     ]
-   }' "${EVIDENCE_DIR}/04-bulk-denied-response.json"
-   ```
-
-5. Clasifica el resultado:
-   - Si aparece `security_exception`, `authorization_exception` o estado `403`, la causa inmediata es insuficiencia de privilegios.
-   - Si aparece un error de procesador, `illegal_argument_exception` o referencia a pipeline, la causa inmediata es una configuración de ingestión.
-   - Si la operación es exitosa, registra que la reproducción no confirma el fallo de permisos y usa la evidencia suministrada por el instructor para continuar el diagnóstico.
-
-**Resultado esperado**
-
-La reproducción controlada con una API key de solo lectura devuelve una respuesta Bulk con:
-
-```json
-{
-  "errors": true
-}
-```
-
-y al menos un ítem con estado `403` y error de seguridad. La operación no crea un documento porque la API key no dispone de privilegios de escritura.
-
-**Verificación**
-
-```bash
-jq -r '.errors' "${EVIDENCE_DIR}/04-bulk-denied-response.json"
-
-jq '.items[] | .[] | {status, error}' \
-  "${EVIDENCE_DIR}/04-bulk-denied-response.json"
-```
-
-La evidencia debe permitir formular una afirmación precisa:
-
-> La respuesta Bulk confirma que una API key sin privilegio de indexación no puede crear documentos en `logs-ops-lab`. Esto explica un fallo de ingestión cuando el cliente utiliza dicha key, pero no explica por sí solo un shard réplica no asignado.
-
----
-
-### Paso 5. Formular hipótesis, seleccionar la mitigación y ejecutar un cambio reversible
-
-**Objetivo:** Aplicar la acción de menor riesgo que reduzca el impacto confirmado, sin ocultar la causa ni eliminar evidencia.
-
-**Instrucciones**
-
-1. Completa la siguiente matriz en un archivo de trabajo antes de modificar configuración.
-
-   ```bash
-   cat > "${EVIDENCE_DIR}/05-matriz-diagnostico.md" <<'EOF'
-   # Matriz de diagnóstico
-
-   | Elemento | Hallazgo | Evidencia | Confianza |
-   |---|---|---|---|
-   | Síntoma en Discover |  | 02-discover-observaciones.md |  |
-   | Impacto operativo |  | 02-discover-observaciones.md |  |
-   | Salud del clúster |  | 03-cluster-health-antes.json |  |
-   | Shard no asignado |  | 03-cat-shards-antes.txt |  |
-   | Motivo de asignación |  | 03-allocation-explain-antes.json |  |
-   | Estado de recursos |  | 03-nodes-stats-antes.json |  |
-   | ILM |  | 03-ilm-explain-antes.json |  |
-   | Ingestión Bulk |  | 04-bulk-denied-response.json |  |
-   | Causa inmediata probable |  |  |  |
-   | Causa raíz probable |  |  |  |
-   EOF
-   ```
-
-2. Confirma que el clúster tiene exactamente un nodo y que el shard no asignado es una réplica no viable. No reduzcas réplicas si la explicación identifica otra causa, como falta de disco, filtros de asignación o un primario sin asignar.
-
-   ```bash
-   jq '{number_of_nodes, status, unassigned_shards}' \
-     "${EVIDENCE_DIR}/03-cluster-health-antes.json"
-
-   jq '{
-     index,
-     shard,
-     primary,
-     current_state,
-     unassigned_info,
-     can_allocate,
-     allocate_explanation,
-     node_allocation_decisions
-   }' "${EVIDENCE_DIR}/03-allocation-explain-antes.json"
-   ```
-
-3. Si la evidencia confirma una réplica no asignable en el clúster de un solo nodo, aplica la mitigación reversible estableciendo cero réplicas en el índice de laboratorio.
-
-   ```bash
-   cat > "${EVIDENCE_DIR}/05-replicas-cero-request.json" <<'EOF'
-   {
-     "index": {
-       "number_of_replicas": 0
-     }
-   }
-   EOF
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -H 'Content-Type: application/json' \
-     -X PUT "${ES_URL}/logs-ops-lab/_settings?pretty" \
-     --data-binary @"${EVIDENCE_DIR}/05-replicas-cero-request.json" \
-     | tee "${EVIDENCE_DIR}/05-replicas-cero-response.json"
-   ```
-
-4. Para el fallo de permisos, no reutilices la API key denegada. Crea una API key temporal con privilegio mínimo `create_doc`, válida únicamente para la prueba de recuperación de ingestión.
-
-   ```bash
-   cat > "${EVIDENCE_DIR}/05-api-key-write-request.json" <<EOF
-   {
-     "name": "incident-create-doc-${RUN_ID}",
-     "role_descriptors": {
-       "ingestion_minima": {
-         "cluster": [],
-         "indices": [
-           {
-             "names": ["logs-ops-lab"],
-             "privileges": ["create_doc"]
-           }
-         ]
-       }
-     }
-   }
-   EOF
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -H 'Content-Type: application/json' \
-     -X POST "${ES_URL}/_security/api_key" \
-     --data-binary @"${EVIDENCE_DIR}/05-api-key-write-request.json" \
-     | tee "${EVIDENCE_DIR}/05-api-key-write-response.json"
-
-   export ALLOWED_KEY_ID
-   export ALLOWED_KEY
-   ALLOWED_KEY_ID=$(jq -r '.id' "${EVIDENCE_DIR}/05-api-key-write-response.json")
-   ALLOWED_KEY=$(jq -r '.encoded' "${EVIDENCE_DIR}/05-api-key-write-response.json")
-
-   export OK_DOC_ID="${RUN_ID}-allowed"
-
-   cat > "${EVIDENCE_DIR}/05-bulk-allowed.ndjson" <<EOF
-   {"create":{"_id":"${OK_DOC_ID}"}}
-   {"@timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","service":{"name":"payments-api"},"log":{"level":"info"},"message":"Prueba controlada de recuperación con privilegio create_doc","event":{"kind":"event","dataset":"lab.incident"},"labels":{"incident_id":"INC-10-00-01"}}
-   EOF
-
-   curl -sS \
-     -H "Authorization: ApiKey ${ALLOWED_KEY}" \
-     -H 'Content-Type: application/x-ndjson' \
-     -X POST "${ES_URL}/logs-ops-lab/_bulk?refresh=true" \
-     --data-binary @"${EVIDENCE_DIR}/05-bulk-allowed.ndjson" \
-     | tee "${EVIDENCE_DIR}/05-bulk-allowed-response.json"
-   ```
-
-5. Registra la decisión técnica tomada. La reducción a cero réplicas en un clúster de un nodo elimina el estado `yellow`, pero también elimina redundancia. Es una mitigación aceptable únicamente para el entorno de laboratorio o como riesgo temporal formalmente aceptado.
-
-   ```bash
-   cat > "${EVIDENCE_DIR}/05-decision-mitigacion.md" <<'EOF'
-   # Decisión de mitigación
-
-   - Cambio aplicado:
-   - Evidencia que lo justifica:
-   - Riesgo introducido o aceptado:
-   - Reversibilidad:
-   - Criterio para revertir:
-   - Responsable de aprobación:
-   - Hora UTC de aplicación:
-   EOF
-   ```
-
-**Resultado esperado**
-
-- La actualización de settings es reconocida con `"acknowledged": true`.
-- El Bulk ejecutado con la API key de privilegio mínimo devuelve `"errors": false`.
-- La mitigación de réplicas solo se aplica si el diagnóstico confirmó que el problema era una réplica no viable en un clúster de nodo único.
-
-**Verificación**
-
-```bash
-jq '.' "${EVIDENCE_DIR}/05-replicas-cero-response.json"
-
-jq '{
-  errors,
-  items: [.items[] | .[] | {status, result, error}]
-}' "${EVIDENCE_DIR}/05-bulk-allowed-response.json"
-```
-
----
-
-### Paso 6. Validar recuperación técnica y funcional
-
-**Objetivo:** Demostrar con métricas, APIs y búsqueda funcional que la mitigación produjo el resultado esperado y que no generó un efecto secundario relevante.
-
-**Instrucciones**
-
-1. Espera hasta 60 segundos a que la salud del clúster alcance el estado esperado.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/_cluster/health?wait_for_status=green&timeout=60s&pretty" \
-     | tee "${EVIDENCE_DIR}/06-cluster-health-despues.json"
-   ```
-
-2. Captura nuevamente el estado de shards, índices, nodos y estadísticas del índice.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/_cat/shards?v&s=state,index" \
-     | tee "${EVIDENCE_DIR}/06-cat-shards-despues.txt"
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/_cat/indices?v&s=store.size:desc" \
-     | tee "${EVIDENCE_DIR}/06-cat-indices-despues.txt"
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/_nodes/stats/jvm,fs,process,indices?pretty" \
-     | tee "${EVIDENCE_DIR}/06-nodes-stats-despues.json"
-
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/logs-ops-lab/_stats?pretty" \
-     | tee "${EVIDENCE_DIR}/06-logs-ops-stats-despues.json"
-   ```
-
-3. Comprueba que el documento de prueba autorizado fue indexado.
-
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     "${ES_URL}/logs-ops-lab/_doc/${OK_DOC_ID}?pretty" \
-     | tee "${EVIDENCE_DIR}/06-documento-prueba.json"
-   ```
-
-4. En Kibana Discover, busca el identificador de la prueba controlada:
-
-   ```kql
-   labels.incident_id : "INC-10-00-01"
-   ```
-
-5. Repite la consulta guardada de la Práctica 8 y la consulta KQL de `payments-api`. Comprueba si:
-   - los nuevos documentos son visibles;
-   - no hay retraso inesperado de ingestión;
-   - la búsqueda responde;
-   - los errores históricos siguen disponibles para investigación;
-   - el panel o visualización relacionado recuperó comportamiento normal.
-
-6. Compara las métricas de antes y después con la línea base de la Práctica 6. Registra como mínimo:
-   - `heap.percent`;
-   - `cpu`;
-   - `disk.used_percent`;
-   - `store.size`;
-   - total de documentos;
-   - `unassigned_shards`;
-   - estado de salud;
-   - resultado Bulk.
-
-**Resultado esperado**
-
-- El clúster pasa a `green` si la única causa del estado `yellow` era una réplica no asignable.
-- No quedan líneas `UNASSIGNED` para `logs-ops-lab`.
-- El Bulk autorizado devuelve `errors: false`.
-- El documento de prueba existe y es visible en Discover.
-- Los recursos del nodo no muestran una desviación importante frente a la línea base de la Práctica 6.
-
-**Verificación**
-
-```bash
-jq '{status, number_of_nodes, active_shards, unassigned_shards}' \
-  "${EVIDENCE_DIR}/06-cluster-health-despues.json"
-
-grep 'UNASSIGNED' "${EVIDENCE_DIR}/06-cat-shards-despues.txt" || true
-
-jq '._source | {timestamp: ."@timestamp", service, log, labels, message}' \
-  "${EVIDENCE_DIR}/06-documento-prueba.json"
-```
-
-Si el clúster no llega a `green`, no ocultes el resultado: conserva la evidencia, revisa `_cluster/allocation/explain` otra vez y considera el caso para escalamiento.
-
----
-
-### Paso 7. Redactar el informe técnico de incidente
-
-**Objetivo:** Crear un informe técnico trazable que permita a otro equipo comprender el incidente, validar las decisiones y prevenir su recurrencia.
-
-**Instrucciones**
-
-1. Crea el informe usando la siguiente plantilla.
-
-   ```bash
-   cat > "${REPORT}" <<'EOF'
-   # Informe técnico de incidente INC-10-00-01
-
-   ## 1. Identificación
-
-   | Campo | Valor |
-   |---|---|
-   | Identificador | INC-10-00-01 |
-   | Fecha y hora de detección (UTC) | |
-   | Fecha y hora de mitigación (UTC) | |
-   | Investigador | |
-   | Entorno | Laboratorio Elasticsearch 9.3.0 |
-   | Clúster | es930-lab-cluster |
-   | Nodo | es930-node-1 |
-   | Índice afectado | logs-ops-lab |
-   | Severidad propuesta | |
-
-   ## 2. Resumen ejecutivo
-
-   Describa en 3 a 5 líneas qué ocurrió, qué usuarios o procesos fueron afectados,
-   cuál fue el impacto y cuál fue el estado final.
-
-   ## 3. Impacto
-
-   - Impacto en ingestión:
-   - Impacto en búsqueda y Discover:
-   - Impacto en disponibilidad:
-   - Impacto en integridad de datos:
-   - Impacto en seguridad:
-   - Riesgo de continuidad o recuperación:
-
-   ## 4. Línea temporal
-
-   | Hora UTC | Evento | Evidencia |
-   |---|---|---|
-   | | Detección inicial | |
-   | | Consulta de Discover | |
-   | | Captura de salud del clúster | |
-   | | Confirmación de Bulk o permisos | |
-   | | Mitigación aplicada | |
-   | | Validación final | |
-
-   ## 5. Evidencia técnica
-
-   ### Evidencia funcional
-
-   - Consulta guardada de Kibana utilizada:
-   - KQL:
-   - Rango temporal:
-   - Resultado observado:
-   - Archivo de captura:
-
-   ### Evidencia de Elasticsearch
-
-   - Salud antes:
-   - Salud después:
-   - Shards no asignados:
-   - Resultado de allocation explain:
-   - Métricas de heap, CPU y disco:
-   - Estadísticas del índice:
-   - Estado ILM:
-   - Respuesta Bulk denegada:
-   - Respuesta Bulk autorizada:
-
-   ## 6. Diagnóstico
-
-   | Categoría | Descripción |
-   |---|---|
-   | Síntoma | |
-   | Causa inmediata | |
-   | Causa raíz probable | |
-   | Evidencia que confirma la hipótesis | |
-   | Evidencia que descarta hipótesis alternativas | |
-   | Riesgo residual | |
-
-   ## 7. Mitigación aplicada
-
-   - Cambio:
-   - Justificación:
-   - Comando o API utilizada:
-   - Reversibilidad:
-   - Riesgo aceptado:
-   - Resultado:
-
-   ## 8. Validación de recuperación
-
-   - Estado del clúster:
-   - Shards:
-   - Resultado de Bulk:
-   - Verificación en Discover:
-   - Comparación con línea base de Práctica 6:
-   - Relación con ILM y seguridad de Práctica 7:
-   - Garantía de recuperación consultada en el runbook de Práctica 9:
-
-   ## 9. Escalamiento
-
-   - ¿Requiere escalamiento?: Sí / No
-   - Equipo destinatario:
-   - Criterio de escalamiento:
-   - Información que debe adjuntarse:
-   - Decisión final:
-
-   ## 10. Acciones preventivas
-
-   | Acción | Prioridad | Responsable | Fecha objetivo | Criterio de cierre |
-   |---|---|---|---|---|
-   | Revisar privilegios mínimos de API keys de ingestión | Alta | | | |
-   | Definir política explícita de réplicas para clústeres de un nodo | Alta | | | |
-   | Alertar sobre errores Bulk y shards no asignados | Media | | | |
-   | Validar ILM y capacidad frente a crecimiento de logs | Media | | | |
-   | Ensayar restauración según runbook | Media | | | |
-
-   ## 11. Lecciones aprendidas
-
-   - Qué evidencia fue más útil:
-   - Qué decisión podría automatizarse:
-   - Qué documentación debe mejorarse:
-   - Qué se validará en el siguiente ejercicio:
-   EOF
-   ```
-
-2. Completa el informe usando exclusivamente evidencias verificables almacenadas en:
-
-   ```text
-   /opt/elastic-labs/work/incident-10-00-01
-   ```
-
-3. Añade al informe referencias explícitas a:
-   - líneas base de rendimiento de la Práctica 6;
-   - roles, API keys, TLS e ILM de la Práctica 7;
-   - consultas y observaciones de Discover de la Práctica 8;
-   - runbook de actualización y recuperación de la Práctica 9.
-
-4. Determina si el incidente requiere escalamiento. Debe escalarse, por ejemplo, si se observa alguno de estos criterios:
-   - shards primarios no asignados o estado `red`;
-   - uso de disco cercano a los umbrales de Elasticsearch;
-   - heap o CPU sostenidamente por encima de la línea base;
-   - pérdida no explicada de eventos;
-   - permisos de producción asignados incorrectamente;
-   - fallo de ILM que compromete retención o cumplimiento;
-   - necesidad de modificar infraestructura, añadir nodos o restaurar desde snapshot.
-
-**Resultado esperado**
-
-Existe un informe completo en:
-
-```text
-/opt/elastic-labs/reports/incident-10-00-01.md
-```
-
-El documento distingue claramente entre observaciones, evidencias, hipótesis, causa inmediata, causa raíz probable, mitigación, riesgo residual y acciones preventivas.
-
-**Verificación**
-
-```bash
-test -s "${REPORT}" && echo "Informe creado correctamente"
-grep -E '^## (3|4|5|6|7|8|9|10)\.' "${REPORT}"
-```
-
-## Validación y pruebas
-
-Completa esta lista de validación final antes de entregar el laboratorio.
-
-| Validación | Comando o evidencia | Resultado esperado |
+| Perfil | Necesita | No debe poder |
 |---|---|---|
-| Identidad del clúster | `00-cluster-identidad.json` | Clúster `es930-lab-cluster`, nodo `es930-node-1`, versión 9.3.0 |
-| Datos restaurados | `_cat/indices` | Existe `logs-ops-lab` |
-| Impacto funcional | Discover y KQL | Se identifican eventos o ausencia de logs relacionados con el incidente |
-| Tendencia de errores | Query DSL y ES|QL | Se puede cuantificar la tendencia de `payments-api` |
-| Salud inicial | `03-cluster-health-antes.json` | Se documenta estado y shards no asignados |
-| Asignación | `03-allocation-explain-antes.json` | Se identifica la causa real de no asignación |
-| Recursos | `_nodes/stats` | Heap, CPU y disco comparados contra Práctica 6 |
-| ILM | `03-ilm-explain-antes.json` | Estado ILM documentado |
-| Permisos | Respuesta Bulk denegada | Error `403` o error de seguridad confirmado, si aplica |
-| Recuperación de ingestión | Respuesta Bulk autorizada | `errors: false` |
-| Mitigación de réplicas | Salud posterior y CAT shards | Estado `green` y ausencia de réplica no asignada, si la condición era de nodo único |
-| Documento de prueba | GET por ID y Discover | Documento visible y consultable |
-| Informe final | `incident-10-00-01.md` | Incluye impacto, cronología, evidencia, diagnóstico, mitigación, escalamiento y prevención |
+| **Analista** (NOC, soporte, auditoría) | Buscar logs y ver dashboards | Modificar índices, pipelines, dashboards o la configuración |
+| **Operador** (administración diaria) | Administrar data streams, templates, pipelines, ILM y reglas; ver la salud del clúster | Administrar usuarios ni la seguridad |
+| **Ingesta** (Filebeat, Logstash) | Escribir en sus data streams | Leer, borrar o escribir en otros índices |
 
-Ejecuta este resumen técnico final:
+---
 
-```bash
-echo "=== Salud posterior ==="
-jq '{status, number_of_nodes, active_primary_shards, active_shards, unassigned_shards}' \
-  "${EVIDENCE_DIR}/06-cluster-health-despues.json"
+### Tarea 1. Revisar la seguridad por defecto
 
-echo
-echo "=== Resultado Bulk autorizado ==="
-jq '{errors, items: [.items[] | .[] | {status, result, error}]}' \
-  "${EVIDENCE_DIR}/05-bulk-allowed-response.json"
+#### Paso 1. Identifica con qué usuario y realm te autenticas
 
-echo
-echo "=== Réplicas configuradas ==="
-curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-  "${ES_URL}/logs-ops-lab/_settings?filter_path=*.settings.index.number_of_replicas&pretty"
+En **Dev Tools**:
+
+```http
+GET _security/_authenticate
+
+GET _xpack/usage?filter_path=security.realms.native,security.realms.file,security.ssl
 ```
 
-## Solución de problemas
+**Qué hace y por qué:** `_authenticate` muestra el usuario (`elastic`), sus roles (`superuser`) y el **realm** que lo validó (`reserved`, el realm de los usuarios integrados). Un **realm** es una fuente de autenticación. En 8.x vienen activos `native` (usuarios guardados en un índice del clúster) y `file` (usuarios en archivos de cada nodo). Se pueden agregar `ldap`, `active_directory`, `saml`, `oidc`, `pki` y `kerberos`. `_xpack/usage` confirma que TLS está activo en las capas HTTP y de transporte.
 
-### 1. El clúster permanece en `yellow` después de establecer `number_of_replicas: 0`
+#### Paso 2. Revisa los certificados y el keystore
 
-**Síntomas**
-
-- `_cluster/health` continúa mostrando `yellow`.
-- `_cat/shards` todavía presenta shards `UNASSIGNED`.
-- La explicación de asignación no corresponde a una réplica del índice `logs-ops-lab`.
-
-**Causa**
-
-La condición no está relacionada únicamente con la réplica del índice intervenido. Puede existir otro índice con réplicas configuradas, un shard primario sin asignar, un filtro de asignación, una restricción de tier o una condición de disco.
-
-**Corrección**
-
-No apliques cambios masivos de réplicas. Identifica el índice y shard exactos:
-
-```bash
-curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-  "${ES_URL}/_cat/shards?v&s=state,index"
-
-curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-  "${ES_URL}/_cluster/allocation/explain?pretty"
+```http
+GET _ssl/certificates?filter_path=*.path,*.subject_dn,*.expiry
 ```
 
-Actualiza el informe con el nuevo hallazgo y escala el caso si la causa requiere capacidad, cambio de topología, corrección de filtros o intervención fuera del alcance del laboratorio.
+En PowerShell (como administrador):
 
-### 2. La prueba Bulk autorizada devuelve `403`, `401` o `errors: true`
-
-**Síntomas**
-
-- La respuesta Bulk con la API key de prueba no devuelve `errors: false`.
-- Aparece `security_exception`, `unable to authenticate`, `authorization_exception` o un error de pipeline.
-
-**Causa**
-
-La API key puede estar mal copiada, expirada, creada con un rol incorrecto, enviada sin la cabecera `Authorization: ApiKey`, o el índice puede tener un pipeline obligatorio que falla antes de indexar el documento.
-
-**Corrección**
-
-Primero inspecciona la respuesta exacta sin exponer la API key:
-
-```bash
-jq '.items[] | .[] | {status, error}' \
-  "${EVIDENCE_DIR}/05-bulk-allowed-response.json"
+```powershell
+cd C:\elastic\elasticsearch
+.\bin\elasticsearch-keystore.bat list
 ```
 
-Si el error es de permisos, crea nuevamente una API key con `create_doc` sobre `logs-ops-lab` y repite solo la prueba controlada. Si el error menciona un pipeline, revisa el pipeline detectado en `04-pipeline-inspeccion.json`, documenta el hallazgo y no lo modifiques sin una corrección aprobada y reversible.
+**Qué hace y por qué:** `_ssl/certificates` lista los certificados en uso y su **fecha de expiración**. Un certificado vencido detiene la comunicación entre nodos y con los clientes, así que conviene vigilarlo. El **keystore** de Elasticsearch guarda cifrados los secretos que no deben estar en `elasticsearch.yml`, como las contraseñas de los archivos `.p12` (`xpack.security.http.ssl.keystore.secure_password`) y, en general, cualquier credencial de un repositorio de snapshots o de un realm LDAP.
 
-## Limpieza
+#### Paso 3. Revisa los usuarios integrados
 
-La limpieza debe eliminar únicamente artefactos temporales de la prueba controlada. Debes conservar las evidencias y el informe final.
+```http
+GET _security/user?filter_path=*.username,*.roles,*.enabled
+```
 
-1. Elimina el documento creado por la prueba de ingestión autorizada.
+**Qué hace y por qué:** además de `elastic` existen usuarios integrados para componentes: `kibana_system`, `logstash_system`, `beats_system`, `apm_system` y `remote_monitoring_user`. En 8.x, Kibana ya no usa `kibana_system`, sino un **service account token** (Paso 15). Los usuarios integrados no pueden borrarse, pero sí desactivarse o cambiarles la contraseña.
 
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -X DELETE "${ES_URL}/logs-ops-lab/_doc/${OK_DOC_ID}?refresh=true&pretty" \
-     | tee "${EVIDENCE_DIR}/cleanup-delete-documento-prueba.json"
-   ```
+---
 
-2. Revoca las API keys temporales creadas durante el laboratorio.
+### Tarea 2. Crear los roles
 
-   ```bash
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -X DELETE "${ES_URL}/_security/api_key?id=${DENIED_KEY_ID}&pretty" \
-     | tee "${EVIDENCE_DIR}/cleanup-delete-denied-key.json"
+Un **rol** agrupa tres tipos de privilegios:
 
-   curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
-     -X DELETE "${ES_URL}/_security/api_key?id=${ALLOWED_KEY_ID}&pretty" \
-     | tee "${EVIDENCE_DIR}/cleanup-delete-allowed-key.json"
-   ```
+| Tipo | Ejemplos | Aplica a |
+|---|---|---|
+| De **clúster** | `monitor`, `manage_ilm`, `manage_index_templates`, `manage_pipeline`, `manage_security` | Operaciones sobre todo el clúster |
+| De **índice** | `read`, `view_index_metadata`, `create_doc`, `auto_configure`, `monitor`, `manage`, `delete_index` | Índices, aliases y data streams que coinciden con `names` |
+| De **Kibana** | Discover, Dashboard, Visualize Library, Maps, Rules… en nivel **Read** o **All**, por space | Funciones y spaces de Kibana |
 
-3. Elimina variables sensibles de la sesión actual.
+#### Paso 4. Crea el rol de analista
 
-   ```bash
-   unset DENIED_KEY DENIED_KEY_ID ALLOWED_KEY ALLOWED_KEY_ID ELASTIC_PASSWORD
-   ```
+```http
+PUT _security/role/rol_analista_logs
+{
+  "description": "Consulta de logs y dashboards (solo lectura)",
+  "cluster": [],
+  "indices": [
+    {
+      "names": ["logs-*", "tienda-logs-*", "servicios-logs-lab"],
+      "privileges": ["read", "view_index_metadata"]
+    }
+  ]
+}
+```
 
-4. Mantén el ajuste de cero réplicas si fue la mitigación aprobada para este clúster de laboratorio. No lo reviertas a `1` mientras el clúster siga teniendo un único nodo, porque el estado volvería previsiblemente a `yellow`.
+**Qué hace y por qué:** `read` permite buscar y agregar; `view_index_metadata` permite a Kibana leer los mappings para listar los campos en los data views. El analista no tiene privilegios de clúster. Un privilegio sobre un data stream (`logs-*`) se aplica también a sus backing indices.
 
-5. No ejecutes ninguno de estos comandos:
+#### Paso 5. Crea el rol de operador
 
-   ```bash
-   docker compose down -v
-   docker volume rm es717-data es930-data kibana717-data kibana930-data
-   ```
+```http
+PUT _security/role/rol_operador_logs
+{
+  "description": "Administracion diaria de la plataforma de logs (sin seguridad)",
+  "cluster": ["monitor", "manage_ilm", "manage_slm", "manage_index_templates", "manage_pipeline"],
+  "indices": [
+    {
+      "names": ["logs-*", "tienda-logs-*", "servicios-logs-lab", "alertas-lab-logs"],
+      "privileges": ["read", "view_index_metadata", "monitor", "manage"]
+    }
+  ]
+}
+```
 
-## Resumen
+**Qué hace y por qué:** el operador puede ver la salud del clúster (`monitor`) y administrar políticas ILM y SLM, templates y pipelines. Sobre los índices de logs puede leer y administrar (`manage` incluye rollover, cambio de settings y aliases). No recibe `manage_security` ni `all`: no puede crearse más privilegios a sí mismo.
 
-En este laboratorio aplicaste una metodología de diagnóstico estructurada: partiste de síntomas observables en Discover, mediste el impacto, capturaste evidencia de Elasticsearch antes de modificar el entorno, formulaste hipótesis y validaste una mitigación reversible.
+#### Paso 6. Crea el rol de ingesta
 
-Las conclusiones principales deben reflejar que:
+```http
+PUT _security/role/rol_ingesta_logs
+{
+  "description": "Escritura de Filebeat/Logstash en sus data streams",
+  "cluster": ["monitor", "read_ilm", "read_pipeline"],
+  "indices": [
+    {
+      "names": ["logs-weblab.*", "logs-syslog.*"],
+      "privileges": ["create_doc", "auto_configure"]
+    }
+  ]
+}
+```
 
-- Un error de aplicación o de ingestión no demuestra por sí mismo una caída del clúster.
-- Un estado `yellow` requiere identificar qué shard está sin asignar y solicitar una explicación de asignación.
-- Una réplica en un clúster de un nodo representa un riesgo de disponibilidad, no necesariamente una pérdida de servicio inmediata.
-- Las respuestas de Bulk son evidencia directa para distinguir problemas de permisos, autenticación y pipelines.
-- Una mitigación operativa solo está completa cuando se valida con salud del clúster, shards, métricas, consultas funcionales y documentación.
-- El informe técnico convierte la investigación en conocimiento reutilizable, facilita el escalamiento y define acciones preventivas verificables.
+**Qué hace y por qué:** `create_doc` solo permite **agregar** documentos nuevos (no actualizar ni borrar), que es exactamente lo que necesita un data stream. `auto_configure` permite crear el data stream automáticamente la primera vez. Los privilegios de clúster `monitor`, `read_ilm` y `read_pipeline` los usan Filebeat y Logstash para verificar la conexión y la configuración. Un proceso de ingesta comprometido no podría leer ni borrar logs.
 
-### Recursos opcionales
+#### Paso 7. Agrega los privilegios de Kibana desde la interfaz
 
-- [Diagnóstico de clústeres Elasticsearch en estado rojo o amarillo](https://www.elastic.co/docs/troubleshoot/elasticsearch/red-yellow-cluster-status)
-- [API Cluster Health](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-cluster-health)
-- [API Cluster Allocation Explain](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-cluster-allocation-explain)
-- [API Bulk](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-bulk)
-- [API Explain ILM](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-ilm-explain-lifecycle)
-- [Seguridad con API keys de Elasticsearch](https://www.elastic.co/docs/deploy-manage/api-keys)
+1. Ve a **Stack Management > Roles** y abre `rol_analista_logs`.
+2. En **Kibana**, haz clic en **Add Kibana privilege**, elige los spaces **Default** y **Operaciones**, y selecciona **Customize**.
+3. En **Analytics**, asigna **Read** a **Discover**, **Dashboard**, **Visualize Library** y **Maps**. Deja **None** en el resto.
+4. Haz clic en **Add Kibana privilege** y en **Update role**.
+5. Abre `rol_operador_logs` y agrega un privilegio para los mismos spaces: **All** en **Discover**, **Dashboard**, **Visualize Library** y **Maps**; en **Management**, **All** en **Stack Rules** y **Read** en **Stack Monitoring**. Haz clic en **Update role**.
+
+**Qué hace y por qué:** los privilegios de Kibana controlan qué **aplicaciones** se ven y si se pueden crear o modificar objetos, por space. Son independientes de los privilegios de índice: un usuario con Discover en **All** pero sin `read` sobre `logs-*` vería Discover vacío. Se configuran en la interfaz porque los nombres internos de estos privilegios cambian entre versiones de Kibana.
+
+---
+
+### Tarea 3. Crear usuarios y probar el mínimo privilegio
+
+#### Paso 8. Crea los usuarios nativos
+
+```http
+POST _security/user/ana_analista
+{
+  "password": "Analista.Lab2026",
+  "roles": ["rol_analista_logs"],
+  "full_name": "Ana Analista",
+  "email": "ana.analista@ejemplo.mx"
+}
+
+POST _security/user/oscar_operador
+{
+  "password": "Operador.Lab2026",
+  "roles": ["rol_operador_logs"],
+  "full_name": "Oscar Operador"
+}
+
+POST _security/user/svc_ingesta
+{
+  "password": "Ingesta.Lab2026",
+  "roles": ["rol_ingesta_logs"],
+  "full_name": "Cuenta de servicio de ingesta",
+  "metadata": { "tipo": "proceso" }
+}
+```
+
+**Qué hace y por qué:** los usuarios del realm `native` se guardan en un índice del sistema y se replican en todo el clúster. Cada persona debe tener su propio usuario: compartir `elastic` impide saber quién hizo qué. En producción, las personas se autentican con LDAP, Active Directory o SAML (Tarea 6) y los procesos, con API keys.
+
+#### Paso 9. Prueba los permisos de la analista con curl
+
+En PowerShell:
+
+```powershell
+es GET "/_security/_authenticate?pretty" -User ana_analista -Password "Analista.Lab2026"
+es GET "/logs-weblab.access-default/_count" -User ana_analista -Password "Analista.Lab2026"
+es DELETE "/servicios-logs-lab" -User ana_analista -Password "Analista.Lab2026"
+es GET "/_cluster/settings" -User ana_analista -Password "Analista.Lab2026"
+```
+
+**Qué hace y por qué:** la función `es` del script de entorno acepta otro usuario y contraseña. Resultados:
+
+1. Usuario `ana_analista`, realm `default_native`, rol `rol_analista_logs`.
+2. Conteo de **3,421**: puede leer logs.
+3. Error **403** `security_exception`: *action [indices:admin/delete] is unauthorized for user [ana_analista]*. No puede borrar.
+4. Error **403**: no tiene privilegios de clúster.
+
+El 403 (*Forbidden*) significa que el usuario **sí** se autenticó, pero no tiene permiso; el 401 significa que no se autenticó.
+
+#### Paso 10. Prueba la cuenta de ingesta
+
+```powershell
+@"
+{"create":{}}
+{"message":"$((Get-Date).ToString("yyyy-MM-dd'T'HH:mm:ss.fffzzz")) INFO [checkout-service] [srv-app01] [trace=-] [user=-] Prueba de escritura con svc_ingesta"}
+"@ | Set-Content -Encoding ascii C:\labs\prueba_ingesta.ndjson
+
+es POST "/logs-weblab.app-default/_bulk?filter_path=errors,items.*.status" -File C:\labs\prueba_ingesta.ndjson -User svc_ingesta -Password "Ingesta.Lab2026"
+es POST "/servicios-logs-lab/_bulk?filter_path=errors,items.*.status,items.*.error.type" -File C:\labs\prueba_ingesta.ndjson -User svc_ingesta -Password "Ingesta.Lab2026"
+es GET "/logs-weblab.app-default/_search?size=1" -User svc_ingesta -Password "Ingesta.Lab2026"
+```
+
+**Qué hace y por qué:**
+
+1. Escribir en `logs-weblab.app-default` funciona (`status: 201`): el documento pasa por el pipeline `weblab-app` como cualquier otro.
+2. Escribir en `servicios-logs-lab` falla con `status: 403` (`security_exception`).
+3. Buscar falla con 403: la cuenta de ingesta **no puede leer** los logs que escribe.
+
+#### Paso 11. Prueba los accesos en Kibana
+
+1. Abre una ventana **privada** del navegador en `http://localhost:5601` e inicia sesión como `ana_analista`.
+2. Verifica que el menú solo muestre Discover, Dashboard, Visualize Library y Maps; abre el dashboard `Operación tienda - Logs web` y confirma que **no** aparece el botón **Edit**.
+3. Cierra sesión e ingresa como `oscar_operador`: puede editar dashboards, ver **Stack Management > Rules** e **Index Management**, pero no la sección **Security > Users**.
+
+**Qué hace y por qué:** comprueba en la interfaz el mismo modelo que probaste con curl. Kibana aplica los privilegios de Kibana y Elasticsearch aplica los de índice y clúster en cada consulta, aunque el usuario intente saltarse la interfaz.
+
+---
+
+### Tarea 4. API keys y service accounts
+
+#### Paso 12. Crea una API key para Filebeat
+
+En **Dev Tools**:
+
+```http
+POST _security/api_key
+{
+  "name": "filebeat-weblab",
+  "role_descriptors": {
+    "filebeat_escritura": {
+      "cluster": ["monitor", "read_ilm", "read_pipeline"],
+      "indices": [
+        { "names": ["logs-weblab.*"], "privileges": ["create_doc", "auto_configure"] }
+      ]
+    }
+  },
+  "metadata": { "servicio": "filebeat", "equipo": "operaciones" }
+}
+```
+
+Copia los valores `id` y `api_key` de la respuesta.
+
+**Qué hace y por qué:** los privilegios efectivos de una API key son la **intersección** de los privilegios de quien la crea (`elastic`) y los `role_descriptors` indicados, así que esta llave solo puede escribir en `logs-weblab.*`. Las API keys son la forma recomendada de autenticar procesos: no exponen la contraseña de ninguna persona, se pueden rotar y revocar individualmente, y aceptan expiración.
+
+#### Paso 13. Configura Filebeat con la API key
+
+1. Detén Filebeat con `Ctrl + C` en su ventana.
+2. Edita `C:\elastic\filebeat\filebeat.yml`: comenta `username` y `password` y agrega `api_key` con el formato `id:api_key`:
+
+```yaml
+output.elasticsearch:
+  hosts: ["https://localhost:9200"]
+  #username: "elastic"
+  #password: "${ES_PWD}"
+  api_key: "<id>:<api_key>"
+  ssl.certificate_authorities: ['C:\elastic\elasticsearch\config\certs\http_ca.crt']
+```
+
+3. Prueba y vuelve a ejecutar:
+
+```powershell
+cd C:\elastic\filebeat
+.\filebeat.exe test output -c filebeat.yml
+.\filebeat.exe -e -c filebeat.yml
+```
+
+**Qué hace y por qué:** Filebeat deja de usar al superusuario. Si alguien obtuviera el archivo de configuración, solo podría agregar documentos a los data streams `logs-weblab.*`. Filebeat no reenvía los logs ya leídos, porque su *registry* recuerda la posición de cada archivo. Para mayor seguridad, la API key también puede guardarse en el keystore de Filebeat.
+
+#### Paso 14. Consulta e invalida API keys
+
+```http
+GET _security/api_key?name=filebeat-weblab&filter_path=api_keys.id,api_keys.name,api_keys.creation,api_keys.invalidated
+
+POST _security/api_key
+{ "name": "llave-temporal", "expiration": "1h" }
+
+DELETE _security/api_key
+{ "name": "llave-temporal" }
+```
+
+**Qué hace y por qué:** el inventario de API keys permite auditar qué procesos tienen acceso. Invalidar una llave corta el acceso de inmediato, por ejemplo, si un servidor se ve comprometido. La llave `reportes-programados-dashboard` de la Práctica 8b también aparece en el inventario.
+
+#### Paso 15. Revisa los service accounts
+
+```http
+GET _security/service
+
+GET _security/service/elastic/kibana/credential
+
+POST _security/service/elastic/fleet-server/credential/token/token-lab
+GET _security/service/elastic/fleet-server/credential
+DELETE _security/service/elastic/fleet-server/credential/token/token-lab
+```
+
+**Qué hace y por qué:** los **service accounts** son cuentas predefinidas para componentes de Elastic (`elastic/kibana`, `elastic/fleet-server`, `elastic/enterprise-search-server`) con privilegios fijos que no se pueden modificar. Se autentican con **tokens**. El token de Kibana lo creó la inscripción de la Práctica 2. El token de `fleet-server` creado aquí es el que usaría un Fleet Server; se elimina al terminar porque no se usa.
+
+---
+
+### Tarea 5. Seguridad a nivel de documento y de campo, y auditoría
+
+#### Paso 16. Crea un rol con seguridad a nivel de documento (DLS) y de campo (FLS)
+
+```http
+PUT _security/role/rol_analista_pagos
+{
+  "description": "Solo eventos de checkout y pagos, sin datos personales",
+  "indices": [
+    {
+      "names": ["logs-weblab.app-*"],
+      "privileges": ["read", "view_index_metadata"],
+      "query": { "terms": { "service.name": ["checkout-service", "payment-service"] } },
+      "field_security": {
+        "grant": ["*"],
+        "except": ["user.name", "source.*", "event.original"]
+      }
+    }
+  ]
+}
+
+POST _security/user/pablo_pagos
+{
+  "password": "Pagos.Lab2026",
+  "roles": ["rol_analista_pagos"],
+  "full_name": "Pablo Pagos"
+}
+```
+
+En PowerShell:
+
+```powershell
+es GET "/logs-weblab.app-default/_count" -User pablo_pagos -Password "Pagos.Lab2026"
+es GET "/logs-weblab.app-default/_search?size=1&filter_path=hits.hits._source&q=log.level:ERROR" -User pablo_pagos -Password "Pagos.Lab2026"
+```
+
+**Qué hace y por qué:**
+
+- **DLS** (`query`): el usuario solo ve los documentos que cumplen la consulta. El conteo es **672** (520 de checkout + 152 de payment), más los eventos simulados en la Práctica 8b y el de prueba del Paso 10, en lugar de los más de 2,458 del data stream.
+- **FLS** (`field_security`): los campos `user.name`, `source.*` y `event.original` no aparecen en los resultados, ni siquiera en `_source`. Se excluye `event.original` porque contiene la línea completa, incluido el usuario.
+
+Así un equipo puede analizar sus logs sin acceder a datos personales de clientes ni a eventos de otras áreas, en el mismo data stream.
+
+#### Paso 17. Activa la auditoría
+
+1. Edita `C:\elastic\elasticsearch\config\elasticsearch.yml` (como administrador) y agrega:
+
+```yaml
+xpack.security.audit.enabled: true
+xpack.security.audit.logfile.events.include: ["authentication_failed", "access_denied", "security_config_change"]
+```
+
+2. Reinicia el servicio y espera a que responda:
+
+```powershell
+Restart-Service elasticsearch-service-x64
+Start-Sleep -Seconds 40
+es GET "/_cluster/health?pretty"
+```
+
+3. Genera eventos auditables:
+
+```powershell
+es GET "/_cluster/health" -User ana_analista -Password "contrasena-incorrecta"
+es DELETE "/servicios-logs-lab" -User ana_analista -Password "Analista.Lab2026"
+```
+
+4. Revisa la bitácora:
+
+```powershell
+Get-Content C:\elastic\logs\lab-logs_audit.json -Tail 5
+```
+
+**Qué hace y por qué:** la auditoría registra en `<cluster.name>_audit.json`, en formato JSON, quién intentó qué, desde qué IP y con qué resultado. Verás un evento `authentication_failed` (contraseña incorrecta) y un `access_denied` (intento de borrado). Se limita a eventos relevantes porque auditar cada acceso permitido (`access_granted`) genera un volumen enorme. Ese archivo puede ingerirse con Filebeat para analizarlo como cualquier otro log.
+
+> **Importante:** cambiar `elasticsearch.yml` requiere reiniciar el nodo. En un clúster de varios nodos se hace con un *rolling restart* (Práctica 11).
+
+---
+
+### Tarea 6. Otros realms y role mappings
+
+#### Paso 18. Crea un usuario del realm `file` para emergencias
+
+En PowerShell como administrador:
+
+```powershell
+cd C:\elastic\elasticsearch
+.\bin\elasticsearch-users.bat useradd emergencia -p "Emergencia.Lab2026" -r superuser
+.\bin\elasticsearch-users.bat list
+es GET "/_security/_authenticate?filter_path=username,authentication_realm" -User emergencia -Password "Emergencia.Lab2026"
+.\bin\elasticsearch-users.bat userdel emergencia
+```
+
+**Qué hace y por qué:** los usuarios del realm `file` se guardan en `config\users` y `config\users_roles` de **cada nodo** y no dependen de que el índice de seguridad esté disponible. Por eso se usan como **cuenta de emergencia** (*break glass*) cuando el realm nativo o el LDAP no funcionan. La desventaja es que hay que mantenerlos en todos los nodos. La autenticación muestra el realm `default_file`.
+
+#### Paso 19. Revisa la configuración de LDAP/AD y SAML y crea un role mapping
+
+Lee esta configuración de ejemplo para Active Directory (**no la apliques**: el laboratorio no tiene un controlador de dominio):
+
+```yaml
+xpack.security.authc.realms.active_directory.ad1:
+  order: 1
+  domain_name: ejemplo.mx
+  url: ldaps://dc01.ejemplo.mx:636
+  ssl.certificate_authorities: ["C:\\elastic\\elasticsearch\\config\\certs\\ca-corporativa.crt"]
+  # La contrasena del usuario de enlace va en el keystore:
+  # elasticsearch-keystore add xpack.security.authc.realms.active_directory.ad1.secure_bind_password
+```
+
+Crea el role mapping que asignaría el rol de analista a un grupo de AD:
+
+```http
+PUT _security/role_mapping/ad_analistas_logs
+{
+  "enabled": true,
+  "roles": ["rol_analista_logs"],
+  "rules": {
+    "all": [
+      { "field": { "realm.name": "ad1" } },
+      { "field": { "groups": "CN=Analistas-Logs,OU=Grupos,DC=ejemplo,DC=mx" } }
+    ]
+  },
+  "metadata": { "ticket": "CHG-5001" }
+}
+
+GET _security/role_mapping/ad_analistas_logs
+```
+
+**Qué hace y por qué:** con realms externos los usuarios no se crean en Elasticsearch: el **role mapping** asigna roles según los atributos del usuario autenticado (realm, grupos, nombre, DN). Así el alta y la baja de personal se administran en el directorio corporativo. SAML (y OIDC) se configura de forma parecida y habilita el inicio de sesión único en Kibana con el proveedor de identidad de la organización. El mapping queda creado, pero no tiene efecto mientras no exista el realm `ad1`.
+
+---
+
+### Resultado esperado
+
+```http
+GET _security/role/rol_*?filter_path=*.description
+GET _security/user/ana_analista,oscar_operador,svc_ingesta,pablo_pagos?filter_path=*.username,*.roles
+```
+
+| Usuario o credencial | Rol | Prueba | Resultado |
+|---|---|---|---|
+| `ana_analista` | `rol_analista_logs` | Leer `logs-*` / borrar un índice / ver settings del clúster | 3,421 / 403 / 403 |
+| `oscar_operador` | `rol_operador_logs` | Editar dashboards, ver reglas e Index Management | Permitido; sin acceso a Security |
+| `svc_ingesta` | `rol_ingesta_logs` | Escribir en `logs-weblab.app-default` / en otro índice / leer | 201 / 403 / 403 |
+| API key `filebeat-weblab` | descriptor `filebeat_escritura` | Filebeat envía logs | `test output` OK |
+| `pablo_pagos` | `rol_analista_pagos` (DLS/FLS) | Conteo y campos visibles | 672 eventos originales (más los de prueba), sin `user.name` ni `source.*` |
+
+- La bitácora `lab-logs_audit.json` contiene eventos `authentication_failed` y `access_denied`.
+- Existe el role mapping `ad_analistas_logs`.
+
+### Referencias
+
+- Elastic. *Secure the Elastic Stack [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/secure-cluster.html
+- Elastic. *Security privileges [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/security-privileges.html
+- Elastic. *Kibana privileges [8.19].* https://www.elastic.co/guide/en/kibana/8.19/kibana-privileges.html
+- Elastic. *API keys y Service accounts [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/service-accounts.html
+- Elastic. *Document and field level security [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/field-and-document-access-control.html
+- Elastic. *Auditing security settings [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/auditing-settings.html
+- Elastic. *Role mapping [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/mapping-roles.html

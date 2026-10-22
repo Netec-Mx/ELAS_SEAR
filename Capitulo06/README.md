@@ -1,1198 +1,492 @@
-# Identificar un cuello de botella y validar un ajuste operativo
+# Administración de Elasticsearch para gestión y análisis de logs
 
-## Metadatos
+## Práctica 6. Construir agregaciones de eventos por servicio, severidad, código de respuesta e intervalo de tiempo
 
-| Campo | Valor |
-|---|---|
-| Duración | 80 minutos |
-| Complejidad | Difícil |
-| Nivel de Bloom | Aplicar |
-| Tecnologías | Elasticsearch 7.17.29, Kibana 7.17.29, Bulk API, Cat APIs, Nodes Stats API, Apache JMeter 5.6.3 |
+### Objetivo
 
-## Descripción general
+Al finalizar la práctica, serás capaz de:
 
-En esta práctica desplegará el clúster de origen `es717-lab`, generará una carga reproducible de indexación masiva y recogerá una línea base de métricas operativas. El índice inicial tendrá una configuración deliberadamente ineficiente para un clúster de un solo nodo: demasiados shards primarios, una réplica no asignable y un intervalo de refresco frecuente.
+- Calcular métricas de logs con `avg`, `sum`, `min`, `max`, `stats`, `cardinality` y `percentiles`.
+- Agrupar eventos con agregaciones de buckets: `terms`, `date_histogram`, `range`, `filters` y `significant_terms`.
+- Anidar subagregaciones y aplicar agregaciones de pipeline: `derivative`, `moving_fn`, `bucket_script` y `bucket_selector`.
+- Reconocer los aspectos de rendimiento y precisión: `size`/`shard_size`, resultados aproximados y paginación con `composite`.
 
-A continuación, identificará el factor dominante a partir de evidencias de shards, segmentos, heap, presión de indexación, pools de hilos y latencia de bulk. Finalmente, aplicará un ajuste de bajo riesgo mediante un índice optimizado y comparará los resultados antes y después en un informe técnico reutilizable en la Práctica 7.
+### Objetivo visual
 
-## Objetivos de aprendizaje
+![Anatomía de una agregación anidada](img/cap06.png)
 
-Al finalizar la práctica, podrá:
+### Duración aproximada
 
-- [ ] Inspeccionar salud, nodos, shards, almacenamiento, heap, segmentos y presión de indexación mediante APIs de Elasticsearch.
-- [ ] Crear y ejecutar una prueba reproducible de bulk indexing con Apache JMeter.
-- [ ] Establecer una línea base con tasa de documentos, latencia, rechazos y métricas del índice.
-- [ ] Identificar el impacto operativo de demasiados shards y refresh frecuente en un único nodo.
-- [ ] Aplicar una configuración optimizada y validar cuantitativamente la mejora.
+- 65 minutos.
 
-## Prerrequisitos
+### Prerrequisitos
 
-### Conocimientos
-
-- Uso básico de terminal Linux, `curl`, JSON y archivos YAML.
-- Conceptos de índices, documentos, shards primarios, réplicas, refresh y Bulk API.
-- Interpretación básica de estado `green`, `yellow` y `red` en Elasticsearch.
-- Conocimiento inicial de Apache JMeter en modo no gráfico.
-
-### Acceso y requisitos técnicos
-
-- Acceso de lectura y escritura sobre `/opt/elastic-labs`.
-- Docker Engine y Docker Compose plugin operativos.
-- Apache JMeter 5.6.3 instalado y disponible mediante el comando `jmeter`.
-- `curl` y `jq` instalados.
-- Puertos `9200` y `5601` libres.
-- Parámetro Linux `vm.max_map_count=262144`.
-- Al menos 16 GB de RAM disponible; se recomiendan 24 GB.
-- Al menos 40 GB libres en disco SSD.
-
-## Entorno de laboratorio
-
-### Recursos previstos
-
-| Recurso | Requisito mínimo | Recomendado |
-|---|---:|---:|
-| CPU | 4 vCPU | 6 vCPU |
-| Memoria RAM | 16 GB | 24 GB |
-| Espacio libre SSD | 40 GB | 60 GB |
-| Elasticsearch | 7.17.29 | 7.17.29 |
-| Kibana | 7.17.29 | 7.17.29 |
-| JMeter | 5.6.3 | 5.6.3 |
-
-### Convenciones obligatorias
-
-| Elemento | Valor |
-|---|---|
-| Directorio raíz | `/opt/elastic-labs` |
-| Archivo Compose | `/opt/elastic-labs/compose.yaml` |
-| Directorio de trabajo | `/opt/elastic-labs/work` |
-| Red Docker | `elastic-lab-net` |
-| Elasticsearch origen | `es717-lab` |
-| Kibana origen | `kibana717-lab` |
-| Cluster origen | `es717-lab-cluster` |
-| Nodo origen | `es717-node-1` |
-| Endpoint Elasticsearch | `http://localhost:9200` |
-| Endpoint Kibana | `http://localhost:5601` |
-| Índice de línea base | `logs-app-lab-v1` |
-| Índice optimizado | `logs-app-lab-v2` |
-
-> **Importante:** No ejecute `docker compose down -v`. Ese comando eliminaría los volúmenes persistentes requeridos para prácticas posteriores.
+- Práctica 4 completada (conocimiento de mappings).
+- Archivo `C:\labs\datos\cap06_logs_servicios.ndjson`: 3,489 eventos de los microservicios de la tienda, del **13 al 19 de octubre de 2026**, con latencia en `event.duration_ms`.
 
 ---
 
-## Procedimiento paso a paso
+### Instrucciones
 
-### Paso 1. Preparar la estructura de trabajo y validar el host
+**Escenario:** el gerente de operaciones pide un informe semanal: volumen por servicio, latencias, tasas de error y la explicación de un incidente reportado el fin de semana. Responderás con agregaciones, sin exportar datos a una hoja de cálculo.
 
-**Objetivo:** Crear la estructura obligatoria del laboratorio, validar requisitos del host y proteger las credenciales del entorno.
-
-**Instrucciones:**
-
-1. Cree los directorios de trabajo requeridos.
-
-   ```bash
-   sudo mkdir -p /opt/elastic-labs/work/{evidence,results,jmeter}
-   sudo chown -R "$USER":"$USER" /opt/elastic-labs
-   cd /opt/elastic-labs
-   ```
-
-2. Verifique el valor de `vm.max_map_count`.
-
-   ```bash
-   sysctl vm.max_map_count
-   ```
-
-3. Si el resultado es menor que `262144`, aplique el valor temporal y persistente.
-
-   ```bash
-   sudo sysctl -w vm.max_map_count=262144
-
-   echo 'vm.max_map_count=262144' | \
-     sudo tee /etc/sysctl.d/99-elastic-labs.conf
-
-   sudo sysctl --system
-   ```
-
-4. Cree el archivo de variables de entorno con las credenciales exclusivas del laboratorio.
-
-   ```bash
-   cat > /opt/elastic-labs/.env <<'EOF'
-   ELASTIC_PASSWORD=ElasticLab_2026!
-   EOF
-
-   chmod 0600 /opt/elastic-labs/.env
-   ```
-
-5. Verifique Docker, Docker Compose, JMeter, espacio de disco y memoria disponible.
-
-   ```bash
-   docker --version
-   docker compose version
-   jmeter --version | head -n 2
-   df -h /opt
-   free -h
-   ```
-
-**Resultado esperado:**
-
-- `vm.max_map_count = 262144`.
-- Docker y Docker Compose muestran versiones instaladas.
-- JMeter informa versión `5.6.3` o compatible.
-- El archivo `.env` tiene permisos `-rw-------`.
-
-**Verificación:**
-
-```bash
-ls -l /opt/elastic-labs/.env
-sysctl vm.max_map_count
-```
-
-La salida esperada debe incluir permisos `600` y el valor `262144`.
+Todas las consultas usan `"size": 0`: no se necesitan los documentos, solo los resultados de las agregaciones. Así la respuesta es más pequeña y Elasticsearch puede usar la caché de peticiones.
 
 ---
 
-### Paso 2. Crear y desplegar Elasticsearch 7.17.29 y Kibana 7.17.29
+### Tarea 1. Preparar el índice
 
-**Objetivo:** Desplegar el clúster de origen de un solo nodo con almacenamiento persistente y autenticación básica habilitada.
+#### Paso 1. Crea el índice con un mapping apto para agregaciones
 
-**Instrucciones:**
-
-1. Cree el archivo `/opt/elastic-labs/compose.yaml`.
-
-   ```bash
-   cat > /opt/elastic-labs/compose.yaml <<'EOF'
-   services:
-     es717-lab:
-       image: docker.elastic.co/elasticsearch/elasticsearch:7.17.29
-       container_name: es717-lab
-       environment:
-         - node.name=es717-node-1
-         - cluster.name=es717-lab-cluster
-         - discovery.type=single-node
-         - xpack.security.enabled=true
-         - xpack.security.http.ssl.enabled=false
-         - xpack.security.transport.ssl.enabled=false
-         - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
-         - ES_JAVA_OPTS=-Xms1g -Xmx1g
-       ports:
-         - "9200:9200"
-       volumes:
-         - es717-data:/usr/share/elasticsearch/data
-       networks:
-         - elastic-lab-net
-
-     kibana717-lab:
-       image: docker.elastic.co/kibana/kibana:7.17.29
-       container_name: kibana717-lab
-       environment:
-         - ELASTICSEARCH_HOSTS=http://es717-lab:9200
-         - ELASTICSEARCH_USERNAME=elastic
-         - ELASTICSEARCH_PASSWORD=${ELASTIC_PASSWORD}
-         - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=elastic-lab-kibana-717-encryption-key-2026
-       ports:
-         - "5601:5601"
-       volumes:
-         - kibana717-data:/usr/share/kibana/data
-       depends_on:
-         - es717-lab
-       networks:
-         - elastic-lab-net
-
-     es930-lab:
-       image: docker.elastic.co/elasticsearch/elasticsearch:9.3.0
-       container_name: es930-lab
-       profiles: ["future"]
-       environment:
-         - node.name=es930-node-1
-         - cluster.name=es930-lab-cluster
-         - discovery.type=single-node
-       ports:
-         - "9201:9200"
-       volumes:
-         - es930-data:/usr/share/elasticsearch/data
-       networks:
-         - elastic-lab-net
-
-     kibana930-lab:
-       image: docker.elastic.co/kibana/kibana:9.3.0
-       container_name: kibana930-lab
-       profiles: ["future"]
-       ports:
-         - "5602:5601"
-       volumes:
-         - kibana930-data:/usr/share/kibana/data
-       networks:
-         - elastic-lab-net
-
-   volumes:
-     es717-data:
-       name: es717-data
-     es930-data:
-       name: es930-data
-     kibana717-data:
-       name: kibana717-data
-     kibana930-data:
-       name: kibana930-data
-
-   networks:
-     elastic-lab-net:
-       name: elastic-lab-net
-   EOF
-   ```
-
-2. Inicie únicamente el clúster de origen y Kibana 7.17.29.
-
-   ```bash
-   cd /opt/elastic-labs
-   docker compose up -d es717-lab kibana717-lab
-   ```
-
-3. Espere a que Elasticsearch responda.
-
-   ```bash
-   source /opt/elastic-labs/.env
-
-   until curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     http://localhost:9200/_cluster/health | jq -e '.status' >/dev/null; do
-     echo "Esperando a Elasticsearch..."
-     sleep 5
-   done
-   ```
-
-4. Consulte la información del clúster y la licencia.
-
-   ```bash
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     http://localhost:9200 | jq
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     http://localhost:9200/_license | jq '.license | {type, status, uid}'
-   ```
-
-**Resultado esperado:**
-
-- Los contenedores `es717-lab` y `kibana717-lab` aparecen en estado `Up`.
-- Elasticsearch informa versión `7.17.29`.
-- El nombre del clúster es `es717-lab-cluster`.
-- La licencia aparece como `basic` y `active` o equivalente.
-
-**Verificación:**
-
-```bash
-docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
-
-curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-  http://localhost:9200/_cluster/health?pretty
+```http
+PUT servicios-logs-lab
+{
+  "settings": { "number_of_shards": 1, "number_of_replicas": 0 },
+  "mappings": {
+    "properties": {
+      "@timestamp":                 { "type": "date" },
+      "service.name":               { "type": "keyword" },
+      "host.name":                  { "type": "keyword" },
+      "log.level":                  { "type": "keyword" },
+      "http.request.method":        { "type": "keyword" },
+      "url.path":                   { "type": "keyword" },
+      "http.response.status_code":  { "type": "long" },
+      "event.duration_ms":          { "type": "long" },
+      "http.response.body.bytes":   { "type": "long" },
+      "source.ip":                  { "type": "ip" },
+      "source.geo.country_iso_code":{ "type": "keyword" },
+      "user.name":                  { "type": "keyword" }
+    }
+  }
+}
 ```
 
-El estado inicial debe ser `green`, ya que aún no existen índices de usuario con réplicas.
+**Qué hace y por qué:** las agregaciones leen los **doc_values**, una estructura columnar en disco que los campos `keyword`, numéricos, `date` e `ip` tienen activada por defecto. Los campos `text` **no** tienen doc_values y no se pueden agregar, salvo activando `fielddata`, que consume mucha memoria y no se recomienda. Por eso los campos de agrupación se definen como `keyword`. Puedes escribir los nombres con punto (`service.name`): Elasticsearch los convierte en objetos.
+
+#### Paso 2. Carga los datos
+
+En PowerShell:
+
+```powershell
+. C:\labs\scripts\entorno.ps1
+es POST "/servicios-logs-lab/_bulk?refresh=true&filter_path=errors,took" -File C:\labs\datos\cap06_logs_servicios.ndjson
+```
+
+En Dev Tools:
+
+```http
+GET servicios-logs-lab/_count
+```
+
+**Qué hace y por qué:** carga los 3,489 eventos con la Bulk API. La respuesta debe tener `"errors": false` y el conteo debe ser **3489**.
 
 ---
 
-### Paso 3. Crear datos de logs y el índice subóptimo de línea base
+### Tarea 2. Agregaciones de métricas
 
-**Objetivo:** Generar una carga NDJSON reproducible y crear un índice con una configuración deliberadamente ineficiente para un nodo único.
+#### Paso 3. Calcula las métricas básicas de latencia y tráfico
 
-**Instrucciones:**
-
-1. Cree un archivo NDJSON de 200 eventos de aplicación. Cada acción `index` no especifica `_id`, por lo que Elasticsearch generará identificadores únicos en cada repetición del bulk.
-
-   ```bash
-   cd /opt/elastic-labs/work
-
-   : > bulk-200.ndjson
-
-   for i in $(seq 1 200); do
-     level="INFO"
-     if [ $((i % 10)) -eq 0 ]; then
-       level="ERROR"
-     elif [ $((i % 5)) -eq 0 ]; then
-       level="WARN"
-     fi
-
-     cat >> bulk-200.ndjson <<EOF
-   {"index":{}}
-   {"@timestamp":"2026-08-25T10:00:00.000Z","service":{"name":"checkout-api"},"host":{"name":"app-lab-01"},"log":{"level":"${level}"},"event":{"dataset":"app.logs","category":"application"},"message":"Laboratory event ${i} for performance validation","http":{"response":{"status_code":$((200 + i % 5))}},"labels":{"environment":"lab","test_run":"bulk-performance"}}
-   EOF
-   done
-
-   wc -l bulk-200.ndjson
-   du -h bulk-200.ndjson
-   tail -n 2 bulk-200.ndjson
-   ```
-
-2. El archivo debe tener exactamente 400 líneas: una línea de acción y una línea de documento por evento.
-
-3. Cree el índice de línea base con 24 shards primarios, una réplica y `refresh_interval` de un segundo.
-
-   ```bash
-   source /opt/elastic-labs/.env
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     -X PUT http://localhost:9200/logs-app-lab-v1 \
-     -H 'Content-Type: application/json' \
-     -d '{
-       "settings": {
-         "number_of_shards": 24,
-         "number_of_replicas": 1,
-         "refresh_interval": "1s"
-       },
-       "mappings": {
-         "dynamic": false,
-         "properties": {
-           "@timestamp": { "type": "date" },
-           "service": {
-             "properties": {
-               "name": { "type": "keyword" }
-             }
-           },
-           "host": {
-             "properties": {
-               "name": { "type": "keyword" }
-             }
-           },
-           "log": {
-             "properties": {
-               "level": { "type": "keyword" }
-             }
-           },
-           "event": {
-             "properties": {
-               "dataset": { "type": "keyword" },
-               "category": { "type": "keyword" }
-             }
-           },
-           "message": { "type": "text" },
-           "http": {
-             "properties": {
-               "response": {
-                 "properties": {
-                   "status_code": { "type": "integer" }
-                 }
-               }
-             }
-           },
-           "labels": {
-             "properties": {
-               "environment": { "type": "keyword" },
-               "test_run": { "type": "keyword" }
-             }
-           }
-         }
-       }
-     }' | jq
-   ```
-
-4. Consulte la salud y los shards del índice recién creado.
-
-   ```bash
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/_cluster/health?pretty'
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/_cat/shards/logs-app-lab-v1?v&bytes=mb'
-   ```
-
-**Resultado esperado:**
-
-- El archivo `bulk-200.ndjson` tiene 400 líneas.
-- El índice `logs-app-lab-v1` tiene 24 primarios asignados.
-- El clúster pasa a estado `yellow`.
-- Las 24 réplicas aparecen como `UNASSIGNED`.
-
-**Verificación:**
-
-```bash
-curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-  'http://localhost:9200/_cat/indices/logs-app-lab-v1?v&h=health,status,index,pri,rep,docs.count,store.size'
+```http
+GET servicios-logs-lab/_search
+{
+  "size": 0,
+  "aggs": {
+    "latencia_promedio": { "avg": { "field": "event.duration_ms" } },
+    "latencia_min":      { "min": { "field": "event.duration_ms" } },
+    "latencia_max":      { "max": { "field": "event.duration_ms" } },
+    "bytes_enviados":    { "sum": { "field": "http.response.body.bytes" } },
+    "latencia_stats":    { "stats": { "field": "event.duration_ms" } }
+  }
+}
 ```
 
-> **Interpretación:** El estado `yellow` no significa pérdida de datos en este momento: los shards primarios están activos. Sin embargo, en un único nodo las réplicas no pueden asignarse porque Elasticsearch no coloca un primario y su réplica en el mismo nodo. La configuración no proporciona redundancia y añade complejidad operativa innecesaria.
+**Qué hace y por qué:** las agregaciones de **métricas** calculan un valor sobre el conjunto de documentos que cumplen la consulta. `stats` devuelve `count`, `min`, `max`, `avg` y `sum` en una sola pasada. Resultado: promedio ≈ **397.2 ms**, mínimo 12 ms, máximo 5,200 ms. El promedio está inflado por unos pocos eventos muy lentos, como verás en el paso siguiente.
+
+#### Paso 4. Usa percentiles en lugar del promedio
+
+```http
+GET servicios-logs-lab/_search
+{
+  "size": 0,
+  "aggs": {
+    "latencia_percentiles": {
+      "percentiles": { "field": "event.duration_ms", "percents": [50, 90, 95, 99] }
+    }
+  }
+}
+```
+
+**Qué hace y por qué:** el **p50** (mediana) es ≈ **94 ms**, mientras que el promedio es 397 ms: la mayoría de las peticiones son rápidas y un grupo pequeño es muy lento. El **p95** (≈ 4,800 ms) indica que el 5 % de las peticiones tardó casi 5 segundos. Para medir la experiencia de usuario se usan percentiles, no promedios: un promedio "aceptable" puede ocultar a miles de usuarios con mal servicio. Los percentiles se calculan con el algoritmo TDigest, son **aproximados** y su precisión se ajusta con `tdigest.compression`.
+
+#### Paso 5. Cuenta valores únicos con `cardinality`
+
+```http
+GET servicios-logs-lab/_search
+{
+  "size": 0,
+  "aggs": {
+    "usuarios_unicos": { "cardinality": { "field": "user.name" } },
+    "ips_unicas":      { "cardinality": { "field": "source.ip", "precision_threshold": 3000 } }
+  }
+}
+```
+
+**Qué hace y por qué:** `cardinality` cuenta valores distintos (un `COUNT(DISTINCT)`) con el algoritmo HyperLogLog++, que usa poca memoria a cambio de ser aproximado. Hasta `precision_threshold` (máximo 40,000) el resultado es prácticamente exacto. Resultado: **159** usuarios únicos.
 
 ---
 
-### Paso 4. Recopilar la evidencia operativa previa a la carga
+### Tarea 3. Agregaciones de buckets
 
-**Objetivo:** Capturar métricas de salud, shards, asignación, memoria, almacenamiento, pools de hilos, segmentos y presión de indexación antes de ejecutar la carga.
+Una agregación de **buckets** reparte los documentos en grupos. Cada bucket tiene un `doc_count` y puede contener subagregaciones.
 
-**Instrucciones:**
+#### Paso 6. Agrupa por servicio con `terms`
 
-1. Cree el directorio de evidencia de línea base.
-
-   ```bash
-   cd /opt/elastic-labs/work
-   mkdir -p evidence/baseline-before
-   source /opt/elastic-labs/.env
-   ```
-
-2. Ejecute las consultas de diagnóstico y guarde cada respuesta.
-
-   ```bash
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/_cluster/health?pretty' \
-     > evidence/baseline-before/cluster-health.json
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/_cat/nodes?v&h=name,roles,master,heap.percent,ram.percent,cpu,load_1m,disk.used_percent,node.role' \
-     > evidence/baseline-before/cat-nodes.txt
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/_cat/allocation?v&bytes=mb' \
-     > evidence/baseline-before/cat-allocation.txt
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/_cat/shards/logs-app-lab-v1?v&bytes=mb' \
-     > evidence/baseline-before/cat-shards-v1.txt
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/_nodes/stats/jvm,fs,indices,thread_pool,indexing_pressure?pretty' \
-     > evidence/baseline-before/nodes-stats.json
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/logs-app-lab-v1/_stats?pretty' \
-     > evidence/baseline-before/index-stats-v1.json
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/_cat/thread_pool?v&h=node_name,name,active,queue,rejected,completed' \
-     > evidence/baseline-before/thread-pools.txt
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/_nodes/hot_threads?threads=3&type=cpu' \
-     > evidence/baseline-before/hot-threads.txt
-   ```
-
-3. Revise los datos más relevantes.
-
-   ```bash
-   cat evidence/baseline-before/cat-nodes.txt
-   cat evidence/baseline-before/cat-allocation.txt
-   cat evidence/baseline-before/cat-shards-v1.txt
-
-   jq '
-     .nodes[] |
-     {
-       node: .name,
-       heap_used_percent: .jvm.mem.heap_used_percent,
-       gc_young_collections: .jvm.gc.collectors.young.collection_count,
-       gc_old_collections: .jvm.gc.collectors.old.collection_count,
-       fs_available_bytes: .fs.total.available_in_bytes,
-       indexing_pressure_current_bytes: .indexing_pressure.memory.current.combined_coordinating_and_primary_in_bytes
-     }
-   ' evidence/baseline-before/nodes-stats.json
-   ```
-
-**Resultado esperado:**
-
-- Las evidencias quedan almacenadas bajo `work/evidence/baseline-before`.
-- El estado es `yellow` por réplicas no asignadas.
-- `cat-shards-v1.txt` muestra 24 primarios iniciados y 24 réplicas no asignadas.
-- Los contadores de `rejected` normalmente comienzan en cero.
-
-**Verificación:**
-
-```bash
-find /opt/elastic-labs/work/evidence/baseline-before -type f | sort
+```http
+GET servicios-logs-lab/_search
+{
+  "size": 0,
+  "aggs": {
+    "por_servicio": {
+      "terms": { "field": "service.name", "size": 10 },
+      "aggs": {
+        "latencia_p95": { "percentiles": { "field": "event.duration_ms", "percents": [95] } }
+      }
+    }
+  }
+}
 ```
 
-Debe listar al menos ocho archivos de evidencia.
+**Qué hace y por qué:** `terms` crea un bucket por valor, ordenado por `doc_count` descendente. Resultado: catalog (1,318), cart (563), auth (518), payment (457), checkout (362) e inventory (271). La subagregación calcula el p95 **por servicio** y muestra que `payment-service` tiene la latencia más alta, con mucha diferencia.
+
+#### Paso 7. Ordena los buckets por una métrica
+
+```http
+GET servicios-logs-lab/_search
+{
+  "size": 0,
+  "aggs": {
+    "servicios_mas_lentos": {
+      "terms": { "field": "service.name", "size": 3, "order": { "latencia_media": "desc" } },
+      "aggs": { "latencia_media": { "avg": { "field": "event.duration_ms" } } }
+    }
+  }
+}
+```
+
+**Qué hace y por qué:** `order` acepta el nombre de una subagregación de métrica, lo que equivale a un "top N servicios más lentos". Resultado: payment (≈ 2,258 ms), checkout (≈ 331 ms) y auth (≈ 129 ms).
+
+#### Paso 8. Construye una serie de tiempo con `date_histogram`
+
+```http
+GET servicios-logs-lab/_search
+{
+  "size": 0,
+  "aggs": {
+    "por_dia": {
+      "date_histogram": {
+        "field": "@timestamp",
+        "calendar_interval": "1d",
+        "time_zone": "America/Mexico_City",
+        "format": "yyyy-MM-dd"
+      },
+      "aggs": {
+        "errores_5xx": { "filter": { "range": { "http.response.status_code": { "gte": 500 } } } }
+      }
+    }
+  }
+}
+```
+
+**Qué hace y por qué:** `date_histogram` crea un bucket por intervalo de tiempo y es la base de casi cualquier gráfica de logs. `calendar_interval` respeta el calendario (días, semanas o meses de duración variable); `fixed_interval` usa duraciones exactas (`30m`, `1h`). **`time_zone` es indispensable**: sin ella, los días se cortan a medianoche UTC (18:00 en la Ciudad de México) y los conteos diarios no coinciden con lo que ve el negocio. Resultado: el día **2026-10-17** tiene **182** errores 5xx, contra menos de 12 en los demás días. El 18 (domingo) tiene menos tráfico (315 eventos).
+
+#### Paso 9. Haz un acercamiento por hora al día del incidente
+
+```http
+GET servicios-logs-lab/_search
+{
+  "size": 0,
+  "query": {
+    "range": { "@timestamp": { "gte": "2026-10-17", "lt": "2026-10-18", "time_zone": "America/Mexico_City" } }
+  },
+  "aggs": {
+    "por_hora": {
+      "date_histogram": { "field": "@timestamp", "fixed_interval": "1h", "time_zone": "America/Mexico_City", "format": "HH:mm",
+                          "min_doc_count": 0 },
+      "aggs": {
+        "errores_5xx": { "filter": { "range": { "http.response.status_code": { "gte": 500 } } } }
+      }
+    }
+  }
+}
+```
+
+**Qué hace y por qué:** la consulta reduce los documentos a ese día y la agregación los reparte por hora. `min_doc_count: 0` muestra también las horas sin eventos, necesario para gráficas continuas. Los errores se concentran entre las **15:00 y las 16:30**.
+
+#### Paso 10. Agrupa por rangos de latencia
+
+```http
+GET servicios-logs-lab/_search
+{
+  "size": 0,
+  "aggs": {
+    "rangos_latencia": {
+      "range": {
+        "field": "event.duration_ms",
+        "ranges": [
+          { "key": "rapido (<100 ms)",    "to": 100 },
+          { "key": "normal (100-500 ms)", "from": 100, "to": 500 },
+          { "key": "lento (500 ms-2 s)",  "from": 500, "to": 2000 },
+          { "key": "critico (>=2 s)",     "from": 2000 }
+        ]
+      }
+    }
+  }
+}
+```
+
+**Qué hace y por qué:** `range` crea buckets por intervalos definidos por ti (`from` incluido, `to` excluido). Es útil para expresar SLOs, por ejemplo, "el 95 % de las peticiones por debajo de 500 ms". Resultado: 1,844 / 1,326 / 138 / 181.
+
+#### Paso 11. Clasifica con `filters`
+
+```http
+GET servicios-logs-lab/_search
+{
+  "size": 0,
+  "aggs": {
+    "clase_respuesta": {
+      "filters": {
+        "filters": {
+          "exito":         { "range": { "http.response.status_code": { "lt": 400 } } },
+          "error_cliente": { "range": { "http.response.status_code": { "gte": 400, "lt": 500 } } },
+          "error_servidor":{ "range": { "http.response.status_code": { "gte": 500 } } }
+        }
+      }
+    }
+  }
+}
+```
+
+**Qué hace y por qué:** `filters` crea un bucket por cada consulta que defines, con cualquier condición de Query DSL. Resultado: éxito 3,222, error de cliente 53 y error de servidor 214. Distinguir 4xx de 5xx es clave: los 4xx suelen ser problemas del cliente (credenciales, rutas inexistentes); los 5xx son fallas del servicio.
+
+#### Paso 12. Encuentra lo inusual con `significant_terms`
+
+```http
+GET servicios-logs-lab/_search
+{
+  "size": 0,
+  "query": { "range": { "http.response.status_code": { "gte": 500 } } },
+  "aggs": {
+    "host_significativo": { "significant_terms": { "field": "host.name" } },
+    "ruta_significativa": { "significant_terms": { "field": "url.path" } }
+  }
+}
+```
+
+**Qué hace y por qué:** `significant_terms` no busca lo más **frecuente**, sino lo que es **desproporcionadamente** frecuente en el subconjunto (los errores 5xx) comparado con el total. `srv-app03` atiende un tercio del tráfico, pero aparece en el 90 % de los errores (193 de 214); `/api/payment/confirm` concentra 181 de 214. La agregación los devuelve con un `score` alto. Es una herramienta poderosa para explicar un incidente: "¿qué tienen en común los eventos con error?".
 
 ---
 
-### Paso 5. Ejecutar la carga de línea base con Apache JMeter
+### Tarea 4. Subagregaciones y agregaciones de pipeline
 
-**Objetivo:** Medir rendimiento de bulk indexing sobre el índice subóptimo usando una carga reproducible.
+#### Paso 13. Anida varios niveles de buckets
 
-**Instrucciones:**
-
-1. Cree el plan de prueba JMeter. La prueba ejecutará 16 hilos, 25 iteraciones por hilo y un bulk de 200 documentos por solicitud.
-
-   ```bash
-   cat > /opt/elastic-labs/work/jmeter/bulk-load.jmx <<'EOF'
-   <?xml version="1.0" encoding="UTF-8"?>
-   <jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
-     <hashTree>
-       <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="Bulk indexing performance test" enabled="true">
-         <stringProp name="TestPlan.comments">Carga reproducible para Elasticsearch Bulk API</stringProp>
-         <boolProp name="TestPlan.functional_mode">false</boolProp>
-         <boolProp name="TestPlan.tearDown_on_shutdown">true</boolProp>
-       </TestPlan>
-       <hashTree>
-         <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="Bulk clients" enabled="true">
-           <stringProp name="ThreadGroup.on_sample_error">CONTINUE</stringProp>
-           <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="Loop Controller" enabled="true">
-             <boolProp name="LoopController.continue_forever">false</boolProp>
-             <stringProp name="LoopController.loops">${__P(loops,25)}</stringProp>
-           </elementProp>
-           <stringProp name="ThreadGroup.num_threads">${__P(threads,16)}</stringProp>
-           <stringProp name="ThreadGroup.ramp_time">5</stringProp>
-           <boolProp name="ThreadGroup.scheduler">false</boolProp>
-         </ThreadGroup>
-         <hashTree>
-           <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="POST _bulk" enabled="true">
-             <stringProp name="HTTPSampler.domain">localhost</stringProp>
-             <stringProp name="HTTPSampler.port">9200</stringProp>
-             <stringProp name="HTTPSampler.protocol">http</stringProp>
-             <stringProp name="HTTPSampler.path">/${__P(index,logs-app-lab-v1)}/_bulk</stringProp>
-             <stringProp name="HTTPSampler.method">POST</stringProp>
-             <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
-             <boolProp name="HTTPSampler.auto_redirects">false</boolProp>
-             <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
-             <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
-             <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
-               <collectionProp name="Arguments.arguments">
-                 <elementProp name="" elementType="HTTPArgument">
-                   <boolProp name="HTTPArgument.always_encode">false</boolProp>
-                   <stringProp name="Argument.value">${__FileToString(${__P(bulkfile)})}</stringProp>
-                   <stringProp name="Argument.metadata">=</stringProp>
-                 </elementProp>
-               </collectionProp>
-             </elementProp>
-           </HTTPSamplerProxy>
-           <hashTree>
-             <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="Headers" enabled="true">
-               <collectionProp name="HeaderManager.headers">
-                 <elementProp name="Content-Type" elementType="Header">
-                   <stringProp name="Header.name">Content-Type</stringProp>
-                   <stringProp name="Header.value">application/x-ndjson</stringProp>
-                 </elementProp>
-                 <elementProp name="Authorization" elementType="Header">
-                   <stringProp name="Header.name">Authorization</stringProp>
-                   <stringProp name="Header.value">${__P(auth)}</stringProp>
-                 </elementProp>
-               </collectionProp>
-             </HeaderManager>
-             <hashTree/>
-             <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="Bulk sin errores parciales" enabled="true">
-               <collectionProp name="Asserion.test_strings">
-                 <stringProp name="49586">"errors":false</stringProp>
-               </collectionProp>
-               <stringProp name="Assertion.custom_message">La respuesta Bulk contiene errores parciales</stringProp>
-               <stringProp name="Assertion.test_field">Assertion.response_data</stringProp>
-               <boolProp name="Assertion.assume_success">false</boolProp>
-               <intProp name="Assertion.test_type">2</intProp>
-             </ResponseAssertion>
-             <hashTree/>
-           </hashTree>
-         </hashTree>
-       </hashTree>
-     </hashTree>
-   </jmeterTestPlan>
-   EOF
-   ```
-
-2. Calcule el encabezado HTTP Basic sin escribir la contraseña directamente en el plan de prueba.
-
-   ```bash
-   source /opt/elastic-labs/.env
-   AUTH_HEADER="Basic $(printf 'elastic:%s' "${ELASTIC_PASSWORD}" | base64 -w 0)"
-   ```
-
-3. Ejecute la carga de línea base y guarde el resultado CSV.
-
-   ```bash
-   cd /opt/elastic-labs/work
-
-   jmeter -n \
-     -t jmeter/bulk-load.jmx \
-     -l results/baseline-v1.jtl \
-     -Jthreads=16 \
-     -Jloops=25 \
-     -Jindex=logs-app-lab-v1 \
-     -Jbulkfile=/opt/elastic-labs/work/bulk-200.ndjson \
-     -Jauth="${AUTH_HEADER}"
-   ```
-
-4. Calcule métricas de rendimiento desde el archivo JTL. Cada solicitud exitosa representa 200 documentos.
-
-   ```bash
-   awk -F, '
-   NR == 1 { next }
-   {
-     if (NR == 2 || $1 < min) min=$1
-     if ($1 > max) max=$1
-     total++
-     if ($8 == "true") ok++
-     else fail++
-     elapsed_sum += $2
-     if ($2 > elapsed_max) elapsed_max=$2
-   }
-   END {
-     duration=(max-min)/1000
-     if (duration <= 0) duration=1
-     docs=ok*200
-     printf "Solicitudes totales: %d\n", total
-     printf "Solicitudes exitosas: %d\n", ok
-     printf "Solicitudes fallidas: %d\n", fail
-     printf "Documentos indexados estimados: %d\n", docs
-     printf "Duracion observada: %.2f s\n", duration
-     printf "Tasa estimada: %.2f documentos/s\n", docs/duration
-     printf "Latencia media bulk: %.2f ms\n", elapsed_sum/total
-     printf "Latencia maxima bulk: %d ms\n", elapsed_max
-   }' results/baseline-v1.jtl | tee results/baseline-v1-summary.txt
-   ```
-
-5. Capture las métricas posteriores a la carga.
-
-   ```bash
-   mkdir -p evidence/baseline-after
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/_cluster/health?pretty' \
-     > evidence/baseline-after/cluster-health.json
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/logs-app-lab-v1/_stats?pretty' \
-     > evidence/baseline-after/index-stats-v1.json
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/_nodes/stats/jvm,fs,indices,thread_pool,indexing_pressure?pretty' \
-     > evidence/baseline-after/nodes-stats.json
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/_cat/thread_pool?v&h=node_name,name,active,queue,rejected,completed' \
-     > evidence/baseline-after/thread-pools.txt
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/_cat/shards/logs-app-lab-v1?v&bytes=mb' \
-     > evidence/baseline-after/cat-shards-v1.txt
-   ```
-
-**Resultado esperado:**
-
-- JMeter genera `results/baseline-v1.jtl`.
-- Se ejecutan hasta 400 solicitudes bulk: `16 × 25`.
-- Si no hay fallos, se indexan aproximadamente 80 000 documentos.
-- El índice acumula segmentos distribuidos entre 24 primarios.
-- El clúster continúa en estado `yellow` por las réplicas no asignadas.
-
-**Verificación:**
-
-```bash
-cat /opt/elastic-labs/work/results/baseline-v1-summary.txt
-
-curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-  'http://localhost:9200/logs-app-lab-v1/_count' | jq
+```http
+GET servicios-logs-lab/_search
+{
+  "size": 0,
+  "aggs": {
+    "por_servicio": {
+      "terms": { "field": "service.name", "size": 10 },
+      "aggs": {
+        "por_severidad": { "terms": { "field": "log.level", "size": 3 } },
+        "por_host": {
+          "terms": { "field": "host.name", "size": 3 },
+          "aggs": { "latencia_media": { "avg": { "field": "event.duration_ms" } } }
+        }
+      }
+    }
+  }
+}
 ```
 
-El conteo debe ser cercano a `80000`. Puede variar si se produjo alguna solicitud fallida.
+**Qué hace y por qué:** cada bucket de servicio se subdivide en severidad y en host, y cada host calcula su latencia media. Así se responde en una sola petición "¿cómo se distribuye la severidad y la latencia de cada servicio en cada servidor?". Observa que en `payment-service` el host `srv-app03` tiene una latencia media muy superior a la de los otros dos.
+
+#### Paso 14. Calcula la variación hora a hora con `derivative`
+
+```http
+GET servicios-logs-lab/_search
+{
+  "size": 0,
+  "query": {
+    "range": { "@timestamp": { "gte": "2026-10-17T12:00:00", "lt": "2026-10-17T19:00:00", "time_zone": "America/Mexico_City" } }
+  },
+  "aggs": {
+    "por_hora": {
+      "date_histogram": { "field": "@timestamp", "fixed_interval": "1h", "time_zone": "America/Mexico_City", "format": "HH:mm" },
+      "aggs": {
+        "errores": { "filter": { "range": { "http.response.status_code": { "gte": 500 } } } },
+        "cambio_errores": { "derivative": { "buckets_path": "errores>_count" } }
+      }
+    }
+  }
+}
+```
+
+**Qué hace y por qué:** las **agregaciones de pipeline** no leen documentos, sino los **resultados** de otras agregaciones (indicados con `buckets_path`). `derivative` calcula la diferencia con el bucket anterior: un salto grande y positivo señala el **inicio** de un incidente y uno negativo, la recuperación. La sintaxis `errores>_count` toma el `doc_count` de la subagregación `errores`. El primer bucket no tiene derivada porque no hay bucket anterior.
+
+#### Paso 15. Suaviza la serie con `moving_fn`
+
+```http
+GET servicios-logs-lab/_search
+{
+  "size": 0,
+  "query": { "term": { "service.name": "checkout-service" } },
+  "aggs": {
+    "por_hora": {
+      "date_histogram": { "field": "@timestamp", "fixed_interval": "1h", "time_zone": "America/Mexico_City", "min_doc_count": 0 },
+      "aggs": {
+        "latencia": { "avg": { "field": "event.duration_ms" } },
+        "latencia_movil_6h": {
+          "moving_fn": { "buckets_path": "latencia", "window": 6, "script": "MovingFunctions.unweightedAvg(values)" }
+        }
+      }
+    }
+  }
+}
+```
+
+**Qué hace y por qué:** `moving_fn` aplica una función sobre una ventana deslizante de buckets, aquí un promedio móvil de 6 horas. Suaviza el ruido de las horas con poco tráfico y deja ver tendencias. Busca el **15 de octubre a las 19:00**: la latencia horaria de checkout salta por encima de 1,500 ms, mientras que la media móvil apenas se mueve. Comparar el valor contra su media móvil es una técnica simple de detección de anomalías.
+
+#### Paso 16. Calcula la tasa de error y filtra con `bucket_script` y `bucket_selector`
+
+```http
+GET servicios-logs-lab/_search
+{
+  "size": 0,
+  "aggs": {
+    "por_dia": {
+      "date_histogram": { "field": "@timestamp", "calendar_interval": "1d", "time_zone": "America/Mexico_City", "format": "yyyy-MM-dd" },
+      "aggs": {
+        "por_host": {
+          "terms": { "field": "host.name", "size": 5 },
+          "aggs": {
+            "errores": { "filter": { "range": { "http.response.status_code": { "gte": 500 } } } },
+            "tasa_error_pct": {
+              "bucket_script": {
+                "buckets_path": { "err": "errores>_count", "total": "_count" },
+                "script": "params.total > 0 ? Math.round(params.err * 10000.0 / params.total) / 100.0 : 0"
+              }
+            },
+            "solo_criticos": {
+              "bucket_selector": {
+                "buckets_path": { "tasa": "tasa_error_pct" },
+                "script": "params.tasa > 5"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+**Qué hace y por qué:** `bucket_script` calcula una métrica nueva por bucket (la tasa de error en porcentaje) y `bucket_selector` **descarta** los buckets que no cumplen una condición, como un `HAVING` de SQL. El resultado deja un único bucket con contenido: **2026-10-17 → srv-app03 con ≈ 66 % de error** (181 de 273). Combinado con el Paso 12 (`/api/payment/confirm`), ya puedes redactar el hallazgo: *"El sábado 17 de octubre, entre las 15:00 y las 16:30, `payment-service` en `srv-app03` respondió con 503 en la confirmación de pagos."*
 
 ---
 
-### Paso 6. Diagnosticar el cuello de botella y aplicar el ajuste operativo
+### Tarea 5. Rendimiento y precisión
 
-**Objetivo:** Relacionar la evidencia obtenida con una causa dominante y crear un índice optimizado para el mismo patrón de carga.
+#### Paso 17. Observa la precisión de `terms`
 
-**Instrucciones:**
-
-1. Compare el número de shards, el estado de las réplicas y las métricas de segmentos.
-
-   ```bash
-   cd /opt/elastic-labs/work
-
-   echo "===== Shards de linea base ====="
-   cat evidence/baseline-after/cat-shards-v1.txt
-
-   echo "===== Estadisticas de indexacion y segmentos ====="
-   jq '
-     ._all.primaries |
-     {
-       documentos: .docs.count,
-       tiempo_indexacion_ms: .indexing.index_time_in_millis,
-       operaciones_indexacion: .indexing.index_total,
-       refresh_total: .refresh.total,
-       refresh_tiempo_ms: .refresh.total_time_in_millis,
-       segmentos: .segments.count,
-       almacenamiento_bytes: .store.size_in_bytes
-     }
-   ' evidence/baseline-after/index-stats-v1.json
-
-   echo "===== Pools de hilos ====="
-   cat evidence/baseline-after/thread-pools.txt
-   ```
-
-2. Registre el diagnóstico técnico inicial:
-
-   - `logs-app-lab-v1` usa 24 shards primarios para un único nodo y un volumen moderado de datos.
-   - Las 24 réplicas permanecen sin asignar y mantienen el clúster en estado `yellow`.
-   - El `refresh_interval` de `1s` obliga a publicar segmentos con alta frecuencia durante una carga sostenida.
-   - Un número elevado de shards pequeños incrementa metadatos, archivos, segmentos y trabajo de coordinación.
-   - Los contadores `rejected` o los errores HTTP `429`, si existen, indican que la tasa del cliente supera temporalmente la capacidad del nodo.
-
-3. Cree el índice optimizado. El ajuste combina un shard primario, cero réplicas para un único nodo y un intervalo de refresh de 30 segundos.
-
-   ```bash
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     -X PUT http://localhost:9200/logs-app-lab-v2 \
-     -H 'Content-Type: application/json' \
-     -d '{
-       "settings": {
-         "number_of_shards": 1,
-         "number_of_replicas": 0,
-         "refresh_interval": "30s"
-       },
-       "mappings": {
-         "dynamic": false,
-         "properties": {
-           "@timestamp": { "type": "date" },
-           "service": {
-             "properties": {
-               "name": { "type": "keyword" }
-             }
-           },
-           "host": {
-             "properties": {
-               "name": { "type": "keyword" }
-             }
-           },
-           "log": {
-             "properties": {
-               "level": { "type": "keyword" }
-             }
-           },
-           "event": {
-             "properties": {
-               "dataset": { "type": "keyword" },
-               "category": { "type": "keyword" }
-             }
-           },
-           "message": { "type": "text" },
-           "http": {
-             "properties": {
-               "response": {
-                 "properties": {
-                   "status_code": { "type": "integer" }
-                 }
-               }
-             }
-           },
-           "labels": {
-             "properties": {
-               "environment": { "type": "keyword" },
-               "test_run": { "type": "keyword" }
-             }
-           }
-         }
-       }
-     }' | jq
-   ```
-
-4. Verifique que el índice optimizado tiene una configuración adecuada para el laboratorio.
-
-   ```bash
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/logs-app-lab-v2/_settings?pretty'
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/_cluster/health?pretty'
-   ```
-
-5. Capture un punto de evidencia previo a la segunda prueba.
-
-   ```bash
-   mkdir -p evidence/optimized-before
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/logs-app-lab-v2/_stats?pretty' \
-     > evidence/optimized-before/index-stats-v2.json
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/_nodes/stats/jvm,fs,indices,thread_pool,indexing_pressure?pretty' \
-     > evidence/optimized-before/nodes-stats.json
-   ```
-
-**Resultado esperado:**
-
-- `logs-app-lab-v2` tiene un shard primario y cero réplicas.
-- El estado general del clúster pasa a `green`, porque no existen réplicas pendientes en `v2`.
-- El refresh más espaciado reduce el trabajo de publicación de segmentos durante la carga.
-
-**Verificación:**
-
-```bash
-curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-  'http://localhost:9200/_cat/indices/logs-app-lab-v*?v&h=health,status,index,pri,rep,docs.count,store.size'
+```http
+GET servicios-logs-lab/_search
+{
+  "size": 0,
+  "aggs": {
+    "top_usuarios": {
+      "terms": { "field": "user.name", "size": 5, "shard_size": 50, "show_term_doc_count_error": true }
+    }
+  }
+}
 ```
 
-Debe observar `v1` en amarillo y `v2` inicialmente en verde.
+**Qué hace y por qué:** en un índice con varios shards, cada shard calcula su propio top (`shard_size`, por defecto `size × 1.5 + 10`) y el nodo coordinador combina los resultados. Un término que no entra al top de algún shard puede quedar subestimado. `doc_count_error_upper_bound` y `show_term_doc_count_error` informan el error máximo posible. Aquí el índice tiene 1 shard, así que el error es 0. En clústeres reales, aumentar `shard_size` mejora la precisión a cambio de más memoria.
+
+#### Paso 18. Pagina todas las combinaciones con `composite`
+
+```http
+GET servicios-logs-lab/_search
+{
+  "size": 0,
+  "aggs": {
+    "servicio_host": {
+      "composite": {
+        "size": 5,
+        "sources": [
+          { "servicio": { "terms": { "field": "service.name" } } },
+          { "host":     { "terms": { "field": "host.name" } } }
+        ]
+      },
+      "aggs": { "latencia_media": { "avg": { "field": "event.duration_ms" } } }
+    }
+  }
+}
+```
+
+Copia el objeto `after_key` de la respuesta y pide la página siguiente:
+
+```http
+GET servicios-logs-lab/_search
+{
+  "size": 0,
+  "aggs": {
+    "servicio_host": {
+      "composite": {
+        "size": 5,
+        "sources": [
+          { "servicio": { "terms": { "field": "service.name" } } },
+          { "host":     { "terms": { "field": "host.name" } } }
+        ],
+        "after": { "servicio": "cart-service", "host": "srv-app02" }
+      },
+      "aggs": { "latencia_media": { "avg": { "field": "event.duration_ms" } } }
+    }
+  }
+}
+```
+
+**Qué hace y por qué:** `composite` recorre **todas** las combinaciones de valores de forma ordenada y paginada (aquí 18 = 6 servicios × 3 hosts), con resultados **exactos**. Es la opción correcta para exportar agregaciones completas, mientras que `terms` es para obtener un top N. Repite con el `after_key` de cada respuesta hasta que no haya más buckets.
+
+#### Paso 19. Revisa el uso de doc_values
+
+```http
+GET _nodes/stats/indices/fielddata?fields=*&filter_path=nodes.*.indices.fielddata
+```
+
+**Qué hace y por qué:** la memoria de `fielddata` debe ser 0, lo que confirma que todas las agregaciones usaron doc_values en disco y no memoria del heap. Si un día ves memoria de fielddata alta, alguien activó `fielddata` en un campo `text`: es una causa frecuente de problemas de memoria.
 
 ---
 
-### Paso 7. Ejecutar la carga optimizada y documentar la comparación
-
-**Objetivo:** Repetir exactamente la misma carga sobre el índice optimizado y construir el informe técnico de rendimiento.
-
-**Instrucciones:**
-
-1. Ejecute JMeter con los mismos valores de hilos, iteraciones y archivo bulk, cambiando únicamente el índice de destino.
-
-   ```bash
-   cd /opt/elastic-labs/work
-   source /opt/elastic-labs/.env
-
-   AUTH_HEADER="Basic $(printf 'elastic:%s' "${ELASTIC_PASSWORD}" | base64 -w 0)"
-
-   jmeter -n \
-     -t jmeter/bulk-load.jmx \
-     -l results/optimized-v2.jtl \
-     -Jthreads=16 \
-     -Jloops=25 \
-     -Jindex=logs-app-lab-v2 \
-     -Jbulkfile=/opt/elastic-labs/work/bulk-200.ndjson \
-     -Jauth="${AUTH_HEADER}"
-   ```
-
-2. Calcule el resumen de la prueba optimizada.
-
-   ```bash
-   awk -F, '
-   NR == 1 { next }
-   {
-     if (NR == 2 || $1 < min) min=$1
-     if ($1 > max) max=$1
-     total++
-     if ($8 == "true") ok++
-     else fail++
-     elapsed_sum += $2
-     if ($2 > elapsed_max) elapsed_max=$2
-   }
-   END {
-     duration=(max-min)/1000
-     if (duration <= 0) duration=1
-     docs=ok*200
-     printf "Solicitudes totales: %d\n", total
-     printf "Solicitudes exitosas: %d\n", ok
-     printf "Solicitudes fallidas: %d\n", fail
-     printf "Documentos indexados estimados: %d\n", docs
-     printf "Duracion observada: %.2f s\n", duration
-     printf "Tasa estimada: %.2f documentos/s\n", docs/duration
-     printf "Latencia media bulk: %.2f ms\n", elapsed_sum/total
-     printf "Latencia maxima bulk: %d ms\n", elapsed_max
-   }' results/optimized-v2.jtl | tee results/optimized-v2-summary.txt
-   ```
-
-3. Capture las evidencias posteriores a la prueba optimizada.
-
-   ```bash
-   mkdir -p evidence/optimized-after
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/_cluster/health?pretty' \
-     > evidence/optimized-after/cluster-health.json
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/logs-app-lab-v2/_stats?pretty' \
-     > evidence/optimized-after/index-stats-v2.json
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/_nodes/stats/jvm,fs,indices,thread_pool,indexing_pressure?pretty' \
-     > evidence/optimized-after/nodes-stats.json
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/_cat/thread_pool?v&h=node_name,name,active,queue,rejected,completed' \
-     > evidence/optimized-after/thread-pools.txt
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/_cat/shards/logs-app-lab-v2?v&bytes=mb' \
-     > evidence/optimized-after/cat-shards-v2.txt
-   ```
-
-4. Obtenga las métricas de índice del escenario optimizado.
-
-   ```bash
-   jq '
-     ._all.primaries |
-     {
-       documentos: .docs.count,
-       tiempo_indexacion_ms: .indexing.index_time_in_millis,
-       operaciones_indexacion: .indexing.index_total,
-       refresh_total: .refresh.total,
-       refresh_tiempo_ms: .refresh.total_time_in_millis,
-       segmentos: .segments.count,
-       almacenamiento_bytes: .store.size_in_bytes
-     }
-   ' evidence/optimized-after/index-stats-v2.json
-   ```
-
-5. Cree el informe técnico requerido.
-
-   ```bash
-   cat > baseline-performance.md <<'EOF'
-   # Informe técnico: validación de ajuste operativo
-
-   ## Contexto
-
-   - Clúster: `es717-lab-cluster`
-   - Nodo: `es717-node-1`
-   - Versión: Elasticsearch 7.17.29
-   - Carga: Apache JMeter, 16 hilos, 25 iteraciones, 200 documentos por Bulk.
-   - Volumen teórico por prueba: 80 000 documentos.
-
-   ## Hipótesis
-
-   La configuración inicial con 24 shards primarios y `refresh_interval=1s` genera sobrecarga de coordinación, administración de segmentos y refresh en un clúster de un solo nodo. La réplica configurada no aporta resiliencia porque no puede asignarse en el único nodo y deja el clúster en estado `yellow`.
-
-   ## Evidencia de línea base
-
-   Adjunte o transcriba aquí los valores de:
-   - `results/baseline-v1-summary.txt`
-   - `evidence/baseline-after/cat-shards-v1.txt`
-   - `evidence/baseline-after/thread-pools.txt`
-   - `evidence/baseline-after/index-stats-v1.json`
-
-   ## Diagnóstico
-
-   Factor dominante identificado: exceso de shards primarios pequeños y refresh frecuente durante bulk indexing.
-
-   Señales observadas:
-   - Número de shards primarios: 24 en `logs-app-lab-v1`.
-   - Réplicas no asignadas: 24.
-   - Estado del clúster: `yellow`.
-   - Número de segmentos y tiempo de refresh: registrar valores observados.
-   - Rechazos de pools o errores JMeter: registrar valores observados.
-
-   ## Mitigación aplicada
-
-   Se creó `logs-app-lab-v2` con:
-
-   ```json
-   {
-     "number_of_shards": 1,
-     "number_of_replicas": 0,
-     "refresh_interval": "30s"
-   }
-   ```
-
-   El tamaño del lote se mantuvo constante en 200 documentos para preservar la comparabilidad.
-
-   ## Comparación cuantitativa
-
-   | Métrica | Línea base: v1 | Optimizado: v2 | Interpretación |
-   |---|---:|---:|---|
-   | Shards primarios | 24 | 1 | Menor sobrecarga administrativa |
-   | Réplicas | 1 no asignada | 0 | Estado verde en un solo nodo |
-   | Refresh interval | 1 s | 30 s | Menor frecuencia de publicación |
-   | Documentos/s | Completar | Completar | Comparar rendimiento |
-   | Latencia media bulk | Completar | Completar | Comparar latencia |
-   | Latencia máxima bulk | Completar | Completar | Evaluar picos |
-   | Solicitudes fallidas | Completar | Completar | Validar estabilidad |
-   | Rechazos thread pool | Completar | Completar | Validar saturación |
-   | Segmentos | Completar | Completar | Evaluar coste de búsqueda y merge |
-
-   ## Conclusión
-
-   Complete una conclusión basada en los valores observados. Indique si el índice optimizado mejoró la tasa de indexación, redujo la latencia o disminuyó los errores. Si la mejora fue limitada, explique qué recurso adicional podría ser el siguiente factor limitante: CPU, disco, heap, tamaño del heap, tasa de clientes o tamaño de lotes.
-   EOF
-   ```
-
-6. Edite el informe e incorpore los valores reales obtenidos.
-
-   ```bash
-   nano /opt/elastic-labs/work/baseline-performance.md
-   ```
-
-**Resultado esperado:**
-
-- La prueba `v2` tiene el mismo volumen teórico que la prueba `v1`.
-- El índice `v2` se mantiene `green`.
-- La tasa de documentos por segundo normalmente mejora o la latencia media se reduce.
-- El número de segmentos y el trabajo de refresh suelen ser inferiores o más eficientes en `v2`.
-- El informe `baseline-performance.md` documenta hipótesis, evidencia, diagnóstico, mitigación y resultados.
-
-**Verificación:**
-
-```bash
-cd /opt/elastic-labs/work
-
-cat results/baseline-v1-summary.txt
-cat results/optimized-v2-summary.txt
-
-curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-  'http://localhost:9200/_cat/indices/logs-app-lab-v*?v&h=health,status,index,pri,rep,docs.count,store.size'
-```
-
----
-
-## Validación y pruebas
-
-Ejecute las siguientes comprobaciones finales.
-
-1. Valide la salud del clúster.
-
-   ```bash
-   source /opt/elastic-labs/.env
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/_cluster/health?pretty'
-   ```
-
-   Criterio esperado:
-
-   - El estado global puede aparecer `yellow` mientras exista `logs-app-lab-v1`.
-   - `logs-app-lab-v2` debe tener todos sus shards asignados.
-
-2. Valide la configuración de ambos índices.
-
-   ```bash
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/logs-app-lab-v1,logs-app-lab-v2/_settings?pretty'
-   ```
-
-   Criterio esperado:
-
-   | Índice | Primarios | Réplicas | Refresh |
-   |---|---:|---:|---|
-   | `logs-app-lab-v1` | 24 | 1 | 1 s |
-   | `logs-app-lab-v2` | 1 | 0 | 30 s |
-
-3. Valide el volumen de documentos en ambos índices.
-
-   ```bash
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/logs-app-lab-v1/_count' | jq
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/logs-app-lab-v2/_count' | jq
-   ```
-
-4. Valide que JMeter no registró fallos inesperados.
-
-   ```bash
-   awk -F, 'NR > 1 && $8 != "true" { failures++ } END { print "Fallos:", failures+0 }' \
-     /opt/elastic-labs/work/results/baseline-v1.jtl
-
-   awk -F, 'NR > 1 && $8 != "true" { failures++ } END { print "Fallos:", failures+0 }' \
-     /opt/elastic-labs/work/results/optimized-v2.jtl
-   ```
-
-5. Valide la existencia de las evidencias y del informe.
-
-   ```bash
-   test -f /opt/elastic-labs/work/baseline-performance.md && echo "Informe presente"
-
-   find /opt/elastic-labs/work/evidence -type f | sort
-   ```
-
-La práctica se considera completada cuando el informe contiene datos reales de ambas ejecuciones y una conclusión técnica justificada por las métricas recopiladas.
-
-## Solución de problemas
-
-### Problema 1: Elasticsearch no inicia o muestra error relacionado con `vm.max_map_count`
-
-**Síntomas:**
-
-- El contenedor `es717-lab` termina inmediatamente.
-- `docker logs es717-lab` muestra un error de bootstrap checks.
-- El log contiene referencias a `vm.max_map_count`.
-
-**Causa:**
-
-El host Linux no tiene configurado `vm.max_map_count=262144`, requisito necesario para Elasticsearch.
-
-**Corrección:**
-
-```bash
-sudo sysctl -w vm.max_map_count=262144
-echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-elastic-labs.conf
-sudo sysctl --system
-
-cd /opt/elastic-labs
-docker compose up -d es717-lab
-docker logs --tail 50 es717-lab
-```
-
-Verifique nuevamente:
-
-```bash
-sysctl vm.max_map_count
-```
-
----
-
-### Problema 2: JMeter registra respuestas `401`, `429` o fallos por aserción Bulk
-
-**Síntomas:**
-
-- El archivo `.jtl` contiene solicitudes fallidas.
-- JMeter informa `401 Unauthorized`, `429 Too Many Requests` o errores parciales de Bulk.
-- La aserción indica que la respuesta no contiene `"errors":false`.
-
-**Causa:**
-
-- Un error `401` normalmente indica credenciales o encabezado `Authorization` incorrecto.
-- Un error `429` indica que la carga excede temporalmente la capacidad de indexación del nodo.
-- Los errores parciales pueden surgir por saturación, falta de recursos o un archivo NDJSON mal formado.
-
-**Corrección:**
-
-1. Valide credenciales y endpoint.
-
-   ```bash
-   source /opt/elastic-labs/.env
-
-   curl -u "elastic:${ELASTIC_PASSWORD}" \
-     http://localhost:9200/_cluster/health?pretty
-   ```
-
-2. Valide que el NDJSON contiene 400 líneas y termina con salto de línea.
-
-   ```bash
-   wc -l /opt/elastic-labs/work/bulk-200.ndjson
-   tail -c 1 /opt/elastic-labs/work/bulk-200.ndjson | od -An -t x1
-   ```
-
-3. Si aparecen `429`, reduzca la presión del cliente y repita la ejecución con menos hilos, conservando la misma configuración en ambos escenarios comparados.
-
-   ```bash
-   jmeter -n \
-     -t /opt/elastic-labs/work/jmeter/bulk-load.jmx \
-     -l /opt/elastic-labs/work/results/retry-v2.jtl \
-     -Jthreads=8 \
-     -Jloops=25 \
-     -Jindex=logs-app-lab-v2 \
-     -Jbulkfile=/opt/elastic-labs/work/bulk-200.ndjson \
-     -Jauth="${AUTH_HEADER}"
-   ```
-
-4. Consulte pools de hilos y presión de indexación.
-
-   ```bash
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/_cat/thread_pool?v&h=node_name,name,active,queue,rejected,completed'
-
-   curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-     'http://localhost:9200/_nodes/stats/indexing_pressure?pretty'
-   ```
-
-## Limpieza
-
-Esta práctica crea evidencias e índices que serán reutilizados posteriormente. No elimine volúmenes ni ejecute `docker compose down -v`.
-
-Si necesita detener temporalmente los servicios para liberar memoria, use:
-
-```bash
-cd /opt/elastic-labs
-docker compose stop es717-lab kibana717-lab
-```
-
-Para reanudar el laboratorio manteniendo datos, índices, evidencias y configuración:
-
-```bash
-cd /opt/elastic-labs
-docker compose start es717-lab kibana717-lab
-```
-
-Conserve especialmente:
-
-```text
-/opt/elastic-labs/work/baseline-performance.md
-/opt/elastic-labs/work/bulk-200.ndjson
-/opt/elastic-labs/work/evidence/
-/opt/elastic-labs/work/results/
-```
-
-## Resumen
-
-En esta práctica desplegó Elasticsearch 7.17.29 y Kibana 7.17.29 en un entorno persistente de un solo nodo. Creó un índice de línea base con 24 shards primarios, una réplica no asignable y refresh frecuente; posteriormente midió su comportamiento bajo carga bulk con Apache JMeter.
-
-El diagnóstico se fundamentó en evidencia obtenida desde `_cluster/health`, `_cat/nodes`, `_cat/allocation`, `_cat/shards`, `_nodes/stats`, `_nodes/hot_threads`, `_stats` y `_cat/thread_pool`. Finalmente, aplicó un ajuste operativo de bajo riesgo mediante un índice con un shard primario, cero réplicas y `refresh_interval` de 30 segundos, comparando rendimiento, latencia, fallos y métricas de segmentos.
-
-Los índices y evidencias generados constituyen el estado compartido para la siguiente práctica, donde se aplicarán políticas ILM y un data stream gobernado para logs.
+### Resultado esperado
+
+| Pregunta del informe | Agregación | Respuesta |
+|---|---|---|
+| Volumen total | `_count` | 3,489 eventos |
+| Latencia típica y cola | `percentiles` | p50 ≈ 94 ms, p95 ≈ 4,800 ms |
+| Usuarios únicos | `cardinality` | 159 |
+| Servicio con más tráfico | `terms` | catalog-service (1,318) |
+| Servicio más lento | `terms` + `order` | payment-service (≈ 2,258 ms) |
+| Día con más errores 5xx | `date_histogram` + `filter` | 2026-10-17 (182) |
+| Ventana del incidente | `date_histogram` 1h | 15:00–16:30 |
+| ¿Qué tienen en común los 5xx? | `significant_terms` | `srv-app03` y `/api/payment/confirm` |
+| Host/día con tasa de error > 5 % | `bucket_script` + `bucket_selector` | 2026-10-17 / srv-app03 (≈ 66 %) |
+| Combinaciones servicio × host | `composite` | 18 |
+
+### Referencias
+
+- Elastic. *Aggregations [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/search-aggregations.html
+- Elastic. *Percentiles aggregation [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/search-aggregations-metrics-percentile-aggregation.html
+- Elastic. *Significant terms aggregation [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/search-aggregations-bucket-significantterms-aggregation.html
+- Elastic. *Pipeline aggregations [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/search-aggregations-pipeline.html
+- Elastic. *Composite aggregation [8.19].* https://www.elastic.co/guide/en/elasticsearch/reference/8.19/search-aggregations-bucket-composite-aggregation.html
